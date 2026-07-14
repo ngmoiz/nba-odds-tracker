@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────
+# Configuration — NBA Odds Tracker
+#
+# Source de vérité de tous les seuils de détection et paramètres de planning.
+# Règle 0.4.7 : rien ne doit être codé en dur dans le code Python.
+# ─────────────────────────────────────────────────────────────
+
+# --- Source de données : The Odds API (section 4.1) ---
+api:
+  sport: basketball_nba       # sport suivi (paramétrable pour V2, pas une constante)
+  region: us                  # région des bookmakers
+  markets:                    # marchés collectés (coût quota = nb marchés × nb régions)
+    - h2h                     # moneyline (vainqueur sec)
+    - spreads                 # handicap
+    - totals                  # over / under
+  odds_format: decimal        # format des cotes
+
+# --- Affichage (section 5) ---
+display:
+  timezone: Europe/Paris      # fuseau d'affichage ; la base stocke toujours en UTC
+
+# --- Budget quota API (section 4.3) ---
+quota:
+  monthly_credits: 500        # plafond du plan gratuit
+  cost_per_collection: 3      # 3 marchés × 1 région
+  target_collections_per_day: 5
+
+# --- Planning de collecte (section 4.3) ---
+# Les fenêtres H-x sont calées sur l'heure de tip-off, pas sur des heures fixes.
+# La logique de calcul des fenêtres sera implémentée dans le collecteur (étape 1.2).
+schedule:
+  morning: true               # découverte des nouveaux matchs + cotes d'ouverture
+  afternoon: true             # relevé intermédiaire
+  hours_before_tipoff:        # collectes rapprochées avant le premier bloc de matchs
+    - 6
+    - 3
+    - 1
+
+# --- Moteur de règles de détection (section 6.2) ---
+# Chaque règle déclenchée ajoute des points au score de signal du match/sélection.
+# Les seuils chiffrés de R5 et R7 seront formalisés à l'étape 1.3 (analyseur).
+rules:
+  R1_spread_line_move:
+    threshold_points: 2.0     # |ligne actuelle − ligne d'ouverture| ≥ 2.0 points
+    score: 3
+  R2_steam_move:
+    threshold_prob_pct: 5.0   # variation de probabilité implicite ≥ 5 %
+    window_hours: 3           # sur une fenêtre ≤ 3 h
+    score: 3
+  R3_sustained_trend:
+    min_consecutive_snapshots: 3  # même direction sur ≥ 3 relevés consécutifs
+    score: 2
+  R4_multi_bookmaker_sync:
+    min_bookmakers: 4         # ≥ 4 bookmakers sur 5 dans le même sens
+    score: 3
+  R5_cross_market_coherence:  # spread ET moneyline/total bougent de façon cohérente
+    score: 2
+  R6_bookmaker_divergence:
+    threshold_prob_pct: 7.0   # un book s'écarte de ≥ 7 % (proba) du consensus → ANOMALIE
+    score: 2
+  R7_spread_moneyline_inconsistency:  # spread et moneyline incohérents chez un même book
+    score: 2                  # → oriente vers ANOMALIE
+
+# --- Décision finale à H-1 (section 6.4) ---
+decision:
+  signal_score_threshold: 6   # score ≥ 6 ET cohérence globale → SIGNAL

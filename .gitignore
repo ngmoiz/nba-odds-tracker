@@ -1,1 +1,27 @@
-CLAUDE.md
+# Secrets — ne JAMAIS commiter (règle 0.4.1)
+.env
+
+# Base de données SQLite (données locales, jamais versionnées)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Environnement virtuel Python / uv
+.venv/
+uv.lock
+
+# Caches Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches outils
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Divers IDE / OS
+.vscode/
+.idea/
+.DS_Store
