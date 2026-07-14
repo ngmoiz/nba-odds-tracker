@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pyyaml>=6.0",        # lecture de config.yaml
     "python-dotenv>=1.0", # chargement du fichier .env
+    "httpx>=0.28.1",
 ]
 
 # Outils de développement : groupe installé par défaut par `uv sync` / `uv run`.

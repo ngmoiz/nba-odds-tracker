@@ -21,6 +21,9 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
+# Réglages locaux Claude Code (permissions propres à la machine)
+.claude/settings.local.json
+
 # Divers IDE / OS
 .vscode/
 .idea/

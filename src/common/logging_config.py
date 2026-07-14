@@ -42,6 +42,11 @@ def configure_logging(level: str = "INFO") -> None:
     root.setLevel(level.upper())
     root.addHandler(handler)
 
+    # httpx logge chaque requête avec l'URL COMPLÈTE, clé API comprise.
+    # On réduit son niveau à WARNING pour ne jamais exposer de secret dans les logs.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     _CONFIGURED = True
 
 
