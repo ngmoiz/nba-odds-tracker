@@ -10,6 +10,7 @@ imposée au niveau de la base par des triggers qui rejettent tout UPDATE/DELETE.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 from common.logging_config import get_logger
@@ -135,3 +136,88 @@ def init_db(db_path: Path) -> None:
         logger.info("Base prête : tables, index et triggers append-only en place.")
     finally:
         conn.close()
+
+
+# ─────────────────── Accès aux matchs et relevés ───────────────────
+# Fonctions utilisées par le collecteur (et plus tard les autres composants).
+# Elles reçoivent une connexion ouverte et ne committent PAS : l'appelant
+# décide quand valider la transaction (une collecte = une transaction).
+
+# Statuts « actifs » : un match dans l'un de ces états est encore suivi.
+ACTIVE_STATUSES = ("DECOUVERT", "SUIVI", "DECIDE")
+
+
+def get_match(conn: sqlite3.Connection, match_id: str) -> sqlite3.Row | None:
+    """Renvoie la ligne du match, ou None s'il est inconnu."""
+    return conn.execute(
+        "SELECT * FROM matches WHERE match_id = ?", (match_id,)
+    ).fetchone()
+
+
+def insert_match(
+    conn: sqlite3.Connection,
+    *,
+    match_id: str,
+    sport: str,
+    home_team: str,
+    away_team: str,
+    tipoff_utc: str,
+    status: str,
+    created_at: str,
+) -> None:
+    """Insère un nouveau match dans la table `matches`."""
+    conn.execute(
+        "INSERT INTO matches "
+        "(match_id, sport, home_team, away_team, tipoff_utc, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (match_id, sport, home_team, away_team, tipoff_utc, status, created_at),
+    )
+
+
+def update_match_status(conn: sqlite3.Connection, match_id: str, status: str) -> None:
+    """Met à jour le statut d'un match (machine à états)."""
+    conn.execute(
+        "UPDATE matches SET status = ? WHERE match_id = ?", (status, match_id)
+    )
+
+
+def insert_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    match_id: str,
+    bookmaker: str,
+    market: str,
+    selection: str,
+    line: float | None,
+    odds: float,
+    snapshot_at: str,
+) -> None:
+    """Ajoute un relevé de cote (append-only : uniquement des INSERT)."""
+    conn.execute(
+        "INSERT INTO odds_snapshots "
+        "(match_id, bookmaker, market, selection, line, odds, snapshot_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (match_id, bookmaker, market, selection, line, odds, snapshot_at),
+    )
+
+
+def close_finished_matches(conn: sqlite3.Connection, now_utc: datetime) -> int:
+    """Passe en CLOS les matchs actifs dont l'heure de tip-off est dépassée.
+
+    La comparaison se fait sur des datetimes (et non des chaînes) pour gérer sans
+    ambiguïté les deux formats UTC ISO ('...Z' de l'API et '+00:00' de Python).
+    Renvoie le nombre de matchs clôturés.
+    """
+    placeholders = ",".join("?" * len(ACTIVE_STATUSES))
+    rows = conn.execute(
+        f"SELECT match_id, tipoff_utc FROM matches WHERE status IN ({placeholders})",
+        ACTIVE_STATUSES,
+    ).fetchall()
+
+    closed = 0
+    for row in rows:
+        tipoff = datetime.fromisoformat(row["tipoff_utc"].replace("Z", "+00:00"))
+        if tipoff <= now_utc:
+            update_match_status(conn, row["match_id"], "CLOS")
+            closed += 1
+    return closed
