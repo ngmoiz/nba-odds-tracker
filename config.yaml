@@ -53,13 +53,19 @@ rules:
   R4_multi_bookmaker_sync:
     min_bookmakers: 4         # ≥ 4 bookmakers sur 5 dans le même sens
     score: 3
-  R5_cross_market_coherence:  # spread ET moneyline/total bougent de façon cohérente
+  R5_cross_market_coherence:  # confirmation : spread ET moneyline bougent dans le même sens
+    min_spread_move_points: 1.0  # mouvement du spread consensus depuis l'ouverture ≥ 1.0 pt
+    min_prob_move_pct: 3.0       # variation de proba moneyline dé-margée du consensus ≥ 3 %
     score: 2
   R6_bookmaker_divergence:
     threshold_prob_pct: 7.0   # un book s'écarte de ≥ 7 % (proba) du consensus → ANOMALIE
     score: 2
-  R7_spread_moneyline_inconsistency:  # spread et moneyline incohérents chez un même book
+  R7_spread_moneyline_inconsistency:  # V1 : contradiction de favori chez un même book
+    min_prob_gap_pct: 3.0     # écart de proba moneyline entre les deux issues ≥ 3 %
+    min_abs_spread: 1.5       # |spread| ≥ 1.5 (exclut les pick'em)
     score: 2                  # → oriente vers ANOMALIE
+    # Évolution V1.1 (voir journal) : comparer la proba moneyline à la proba implicite
+    # du spread via Φ(spread/σ), σ configurable par ligue (~11.5 NBA).
 
 # --- Décision finale à H-1 (section 6.4) ---
 decision:

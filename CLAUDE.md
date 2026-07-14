@@ -259,9 +259,11 @@ Toutes les valeurs ci-dessous sont des **défauts configurables** dans `config.y
 | R2 | **Steam move** | variation de probabilité implicite ≥ 5 % en ≤ 3 h sur un marché | +3 |
 | R3 | **Tendance soutenue** | mouvement dans la même direction sur ≥ 3 relevés consécutifs | +2 |
 | R4 | **Synchronisation multi-bookmakers** | ≥ 4 bookmakers sur 5 bougent dans le même sens sur la même fenêtre | +3 |
-| R5 | **Cohérence croisée** | spread ET moneyline ET/OU total bougent de façon cohérente simultanément | +2 |
+| R5 | **Cohérence croisée** (confirmation) | depuis l'ouverture, le spread du consensus bouge de ≥ 1.0 pt **et** la proba moneyline dé-margée du consensus varie de ≥ 3 %, **dans le même sens** | +2 |
 | R6 | **Divergence bookmaker** | un bookmaker s'écarte de ≥ 7 % (en probabilité) du consensus des autres | +2 → oriente vers `ANOMALIE` |
-| R7 | **Incohérence spread/moneyline** | chez un même bookmaker, spread et moneyline racontent des histoires différentes | +2 → oriente vers `ANOMALIE` |
+| R7 | **Incohérence spread/moneyline** (V1 : contradiction de favori) | chez un même bookmaker, le favori selon le spread contredit le favori selon le moneyline, avec écart de proba moneyline ≥ 3 % **et** \|spread\| ≥ 1.5 | +2 → oriente vers `ANOMALIE` |
+
+> **Notes de formalisation (R5, R7).** R5 est une règle de *confirmation* : ses seuils sont volontairement plus hauts que le bruit d'équilibrage des books (0.5 pt / 2 % déclencheraient presque partout et videraient de son sens le seuil de verdict). R1 et R5 partagent le même calcul « mouvement du spread consensus depuis l'ouverture » (R1 seul dès 2.0 pt ; R5 dès 1.0 pt **si** le moneyline confirme). R7 en V1 ne détecte que les contradictions autour d'un spread proche de zéro ; l'évolution V1.1 (comparaison de la proba moneyline à la proba implicite du spread via Φ(spread/σ), σ configurable par ligue) est notée au journal des décisions.
 
 ### 6.3 Alertes temps réel
 
@@ -379,4 +381,7 @@ Une fonctionnalité est terminée quand : le code est testé (pytest vert), logg
 | 2026-07-15 | Règle 0.4.2 clarifiée : append-only limité à `odds_snapshots` | Lever l'ambiguïté ; `matches`/`verdicts`/`evaluations`/`positions` ont un cycle de vie normal. |
 | 2026-07-15 | Convention de modélisation `odds_snapshots` documentée (section 5) | `selection` = équipe ou `Over`/`Under` ; `line` = valeur de ligne pour `spreads`/`totals`, `NULL` pour `h2h`. |
 | 2026-07-15 | **À TRANCHER (étape évaluateur)** : source des scores finaux | Le budget quota de The Odds API est serré (≈450/500 crédits pour les seules cotes) et l'endpoint `scores` consommerait la marge. Piste privilégiée : réserver The Odds API aux cotes et récupérer les résultats via une API NBA/WNBA gratuite dédiée. Options chiffrées à présenter à l'étape évaluateur. |
+| 2026-07-15 | R5 formalisée : spread consensus ≥ 1.0 pt **et** Δproba moneyline dé-margée consensus ≥ 3 %, même sens, depuis l'ouverture | Règle de confirmation : des seuils bas (0.5 pt / 2 %) se déclencheraient sur le bruit d'équilibrage des books et gonfleraient tous les scores, vidant de son sens le seuil de verdict à 6. |
+| 2026-07-15 | R7 V1 = contradiction de favori + garde-fous (écart proba ≥ 3 % **et** \|spread\| ≥ 1.5) | Peu de faux positifs, adapté à un déclencheur d'ANOMALIE. **Limite connue** : aveugle hors des matchs serrés. **Évolution V1.1** : comparer la proba moneyline à la proba implicite du spread via Φ(spread/σ), σ configurable par ligue (~11.5 NBA, à ajuster WNBA). |
+| 2026-07-15 | Consensus = **médiane** entre bookmakers | Robuste aux cotes aberrantes/périmées, contrairement à la moyenne. **Piste V2** : consensus pondéré par les *sharp books* (Pinnacle/Circa) qui mènent le marché — Pinnacle est en région `eu` (coût quota supplémentaire à arbitrer) ; le schéma stocke déjà le `bookmaker` par relevé, donc rien n'est perdu. |
 | 2026-07-14 | Création du document (V1) | — |
