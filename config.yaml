@@ -84,3 +84,17 @@ notifier:
   verdicts_with_buttons:      # verdicts recevant les boutons de position (traités en 1.5)
     - SIGNAL
     - ANOMALIE
+
+# --- Source des résultats finaux : balldontlie (section 12, journal) ---
+# Réservée aux scores officiels (l'évaluateur), jamais aux cotes.
+results:
+  provider: balldontlie
+  base_url: https://api.balldontlie.io
+  games_path: /v1/games       # NBA en V1 ; WNBA = chemin dédié (à confirmer le moment venu)
+  # Fuseau de référence des dates de match côté balldontlie (calendrier US).
+  calendar_timezone: America/New_York
+
+# --- Évaluateur (étape 1.6) ---
+evaluator:
+  lookback_days: 3            # fenêtre de rattrapage des matchs clos non encore évalués
+  weekly_report_weekday: 0   # jour du rapport hebdo (0 = lundi) — implémenté après le bilan quotidien

@@ -1,0 +1,100 @@
+"""Composition du bilan quotidien (section 7.2 §3).
+
+Fonctions **pures** : à partir des lignes évaluées lors du run, produit le texte
+Telegram (français, HTML léger). Le rapport hebdomadaire (§4) viendra ensuite.
+
+Le taux de réussite exclut explicitement les **pushes** du dénominateur :
+`taux = won / (won + lost)`. Rappelle le garde-fou des 50–100 évaluations (section 11)
+tant que le seuil n'est pas atteint.
+"""
+from __future__ import annotations
+
+import html
+from dataclasses import dataclass
+
+from evaluator.grading import LOST, PUSH, WON
+
+# En dessous de ce nombre d'évaluations cumulées, les taux sont du bruit (section 11).
+_MIN_EVALS_FOR_TRUST = 50
+
+_OUTCOME_LABELS = {WON: "✅ gagné", LOST: "❌ perdu", PUSH: "➖ push"}
+
+
+@dataclass(frozen=True)
+class EvalLine:
+    """Une ligne du bilan : le verdict évalué et son issue."""
+
+    home_team: str
+    away_team: str
+    verdict: str                 # SIGNAL / ANOMALIE / NO_BET
+    selection: str | None
+    home_score: int
+    away_score: int
+    outcome: str                 # 'won' / 'lost' / 'push' (état explicite)
+    clv: float | None
+    position_action: str | None  # 'take' / 'pass' / None (pas de clic)
+
+
+def success_rate(outcomes: list[str]) -> float | None:
+    """Taux de réussite = won / (won + lost). Les pushes sont **hors dénominateur**.
+
+    Renvoie None s'il n'y a aucune issue décisive (que des pushes, ou liste vide).
+    """
+    decisive = [o for o in outcomes if o in (WON, LOST)]
+    if not decisive:
+        return None
+    return sum(o == WON for o in decisive) / len(decisive)
+
+
+def _clv_label(clv: float | None) -> str:
+    if clv is None:
+        return "CLV n/d"
+    signe = "+" if clv >= 0 else ""
+    return f"CLV {signe}{clv * 100:.1f} pts".replace(".", ",")
+
+
+def _position_label(action: str | None, outcome: str) -> str:
+    if action is None:
+        return ""
+    if action == "take":
+        return " — 👉 ta prise : " + _OUTCOME_LABELS[outcome]
+    aurait = {WON: "aurait gagné", LOST: "aurait perdu", PUSH: "aurait fait push"}[outcome]
+    return f" — 🙅 tu as passé (le pari {aurait})"
+
+
+def _summary_line(outcomes: list[str]) -> str:
+    """Ligne de synthèse : décompte par issue + taux hors push."""
+    won = outcomes.count(WON)
+    lost = outcomes.count(LOST)
+    push = outcomes.count(PUSH)
+    rate = success_rate(outcomes)
+    taux = "n/d" if rate is None else f"{rate * 100:.0f} %"
+    return f"Bilan : {won} gagné(s), {lost} perdu(s), {push} push — taux {taux} (hors push)"
+
+
+def format_daily_report(day_label: str, lines: list[EvalLine], total_evals: int) -> str:
+    """Compose le bilan du matin pour les verdicts évalués."""
+    header = f"📊 <b>Bilan du {html.escape(day_label)}</b>"
+    if not lines:
+        return f"{header}\nAucun verdict à évaluer pour cette date."
+
+    body = []
+    for ln in lines:
+        match = f"{html.escape(ln.away_team)} @ {html.escape(ln.home_team)}"
+        score = f"{ln.away_score}-{ln.home_score}"
+        cible = f" [{html.escape(ln.selection)}]" if ln.selection else ""
+        body.append(
+            f"• {match} ({score}) — {html.escape(ln.verdict)}{cible} : "
+            f"{_OUTCOME_LABELS[ln.outcome]}, {_clv_label(ln.clv)}"
+            f"{_position_label(ln.position_action, ln.outcome)}"
+        )
+
+    summary = _summary_line([ln.outcome for ln in lines])
+    footer = f"{total_evals} évaluations cumulées."
+    if total_evals < _MIN_EVALS_FOR_TRUST:
+        footer += (
+            f" ⚠️ En dessous de {_MIN_EVALS_FOR_TRUST}, les taux restent du bruit "
+            "statistique — aucun seuil ne doit être modifié (règle 11)."
+        )
+
+    return header + "\n" + "\n".join(body) + "\n\n" + summary + "\n" + footer

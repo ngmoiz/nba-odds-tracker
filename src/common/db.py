@@ -82,12 +82,15 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 
 -- Évaluations du lendemain.
+-- `outcome` est un état métier EXPLICITE (jamais porté par un NULL) : 'push' =
+-- remboursement, exclu du dénominateur du taux de réussite (won / (won + lost)).
+-- Pour un NO_BET : issue qu'aurait eue la sélection pressentie (mesure des faux négatifs).
 CREATE TABLE IF NOT EXISTS evaluations (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     verdict_id   INTEGER NOT NULL REFERENCES verdicts(id),
     home_score   INTEGER,
     away_score   INTEGER,
-    verdict_won  INTEGER,                  -- 1/0 ; pour NO_BET : la sélection pressentie serait-elle passée ?
+    outcome      TEXT CHECK (outcome IN ('won', 'lost', 'push')),
     closing_odds REAL,                     -- cote de clôture (dernier snapshot avant tip-off)
     clv          REAL,                     -- Closing Line Value : odds_at_verdict vs closing_odds
     evaluated_at TEXT NOT NULL
@@ -145,6 +148,42 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: s
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
+def _migrate_evaluations_outcome(conn: sqlite3.Connection) -> None:
+    """Migre `evaluations.verdict_won` (1/0/NULL) vers `outcome` ('won'/'lost'/'push').
+
+    SQLite < 3.35 ne sait pas `DROP COLUMN` : on reconstruit la table (vide à ce stade)
+    plutôt que de laisser une colonne morte. Idempotent : ne fait rien si `outcome`
+    existe déjà ou si l'ancienne colonne est absente.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(evaluations)")}
+    if not cols or "outcome" in cols or "verdict_won" not in cols:
+        return
+    logger.info("Migration : evaluations.verdict_won → outcome (reconstruction de table).")
+    conn.executescript(
+        """
+        ALTER TABLE evaluations RENAME TO _evaluations_old;
+        CREATE TABLE evaluations (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            verdict_id   INTEGER NOT NULL REFERENCES verdicts(id),
+            home_score   INTEGER,
+            away_score   INTEGER,
+            outcome      TEXT CHECK (outcome IN ('won', 'lost', 'push')),
+            closing_odds REAL,
+            clv          REAL,
+            evaluated_at TEXT NOT NULL
+        );
+        INSERT INTO evaluations
+            (id, verdict_id, home_score, away_score, outcome, closing_odds, clv, evaluated_at)
+        SELECT id, verdict_id, home_score, away_score,
+               CASE verdict_won WHEN 1 THEN 'won' WHEN 0 THEN 'lost' ELSE 'push' END,
+               closing_odds, clv, evaluated_at
+        FROM _evaluations_old;
+        DROP TABLE _evaluations_old;
+        CREATE INDEX IF NOT EXISTS idx_evaluations_verdict ON evaluations(verdict_id);
+        """
+    )
+
+
 def init_db(db_path: Path) -> None:
     """Crée (si absentes) toutes les tables, index et triggers de la base."""
     logger.info("Initialisation de la base : %s", db_path)
@@ -158,6 +197,8 @@ def init_db(db_path: Path) -> None:
         # DEFAULT 'take' uniquement pour d'éventuelles lignes préexistantes (aucune en
         # pratique) ; l'application fournit toujours l'action explicitement.
         _ensure_column(conn, "positions", "action", "TEXT NOT NULL DEFAULT 'take'")
+        # Base créée avant la finalisation de l'étape 1.6 : verdict_won (NULL=push) → outcome.
+        _migrate_evaluations_outcome(conn)
         conn.commit()
         logger.info("Base prête : tables, index et triggers append-only en place.")
     finally:
@@ -375,3 +416,46 @@ def insert_position(
         (verdict_id, action, odds_at_click, clicked_at),
     )
     return cursor.lastrowid
+
+
+# ─────────────────── Évaluation du lendemain (évaluateur, étape 1.6) ───────────────────
+
+
+def get_matches_to_evaluate(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Matchs clos (tip-off passé) pas encore évalués, du plus ancien au plus récent."""
+    return conn.execute(
+        "SELECT * FROM matches WHERE status = 'CLOS' ORDER BY tipoff_utc"
+    ).fetchall()
+
+
+def get_verdicts_for_match(conn: sqlite3.Connection, match_id: str) -> list[sqlite3.Row]:
+    """Verdicts d'un match (en pratique au plus un en V1)."""
+    return conn.execute(
+        "SELECT * FROM verdicts WHERE match_id = ? ORDER BY id", (match_id,)
+    ).fetchall()
+
+
+def insert_evaluation(
+    conn: sqlite3.Connection,
+    *,
+    verdict_id: int,
+    home_score: int,
+    away_score: int,
+    outcome: str,
+    closing_odds: float | None,
+    clv: float | None,
+    evaluated_at: str,
+) -> int:
+    """Enregistre l'évaluation d'un verdict. `outcome` ∈ {'won','lost','push'} (état explicite)."""
+    cursor = conn.execute(
+        "INSERT INTO evaluations "
+        "(verdict_id, home_score, away_score, outcome, closing_odds, clv, evaluated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (verdict_id, home_score, away_score, outcome, closing_odds, clv, evaluated_at),
+    )
+    return cursor.lastrowid
+
+
+def count_evaluations(conn: sqlite3.Connection) -> int:
+    """Nombre total d'évaluations cumulées (garde-fou des 50–100, section 11)."""
+    return conn.execute("SELECT COUNT(*) AS n FROM evaluations").fetchone()["n"]

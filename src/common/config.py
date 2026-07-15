@@ -30,6 +30,7 @@ class Settings:
     """
 
     odds_api_key: str
+    balldontlie_api_key: str
     telegram_bot_token: str
     telegram_chat_id: str
     database_path: Path
@@ -42,6 +43,7 @@ def load_settings() -> Settings:
     database_path = os.getenv("DATABASE_PATH") or str(DEFAULT_DATABASE_PATH)
     return Settings(
         odds_api_key=os.getenv("ODDS_API_KEY", ""),
+        balldontlie_api_key=os.getenv("BALLDONTLIE_API_KEY", ""),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         database_path=Path(database_path),

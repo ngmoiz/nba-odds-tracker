@@ -39,6 +39,7 @@ CONFIG = {
 
 SETTINGS = Settings(
     odds_api_key="",
+    balldontlie_api_key="",
     telegram_bot_token="tok",
     telegram_chat_id="chat",
     database_path=Path("unused.db"),

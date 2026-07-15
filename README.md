@@ -23,8 +23,8 @@ dans [CLAUDE.md](CLAUDE.md).
 | 1.3 | Analyseur : moteur de règles R1–R7 + verdict | ✅ |
 | 1.4 | Notificateur Telegram (envoi alertes + verdicts) | ✅ |
 | 1.5 | Bot d'écoute (boutons Telegram → positions) | ✅ |
-| 1.6 | Évaluateur (résultats, CLV, bilans) | ⏳ à venir |
-| 1.7 | docker-compose + cron | ⏳ |
+| 1.6 | Évaluateur (résultats, CLV, bilan quotidien) | ✅ (rapport hebdo à venir) |
+| 1.7 | docker-compose + cron | ⏳ à venir |
 
 Aujourd'hui, le collecteur interroge l'API, enregistre les relevés, l'analyseur
 écrit **alertes** et **verdicts** en base, le notificateur les **envoie sur
@@ -75,7 +75,8 @@ Deux fichiers, deux rôles :
 
   | Variable | Rôle |
   |---|---|
-  | `ODDS_API_KEY` | Clé The Odds API (obligatoire) |
+  | `ODDS_API_KEY` | Clé The Odds API — cotes (obligatoire) |
+  | `BALLDONTLIE_API_KEY` | Clé balldontlie — scores finaux (évaluateur) |
   | `TELEGRAM_BOT_TOKEN` | Token du bot (fourni par @BotFather) |
   | `TELEGRAM_CHAT_ID` | Conversation cible des messages |
   | `DATABASE_PATH` | Chemin du fichier SQLite (défaut `./data/nba_odds.db`) |
@@ -99,6 +100,10 @@ uv run python -m notifier
 # Démarrer le bot d'écoute (processus qui tourne en continu) : il enregistre
 # tes clics sur les boutons des verdicts. À laisser tourner en fond.
 uv run python -m listener
+
+# Évaluer les matchs clos de la veille (scores balldontlie, CLV) + bilan Telegram.
+# À lancer chaque matin (cron).
+uv run python -m evaluator
 
 # Initialiser / réinitialiser la base (idempotent)
 uv run python scripts/init_db.py
@@ -186,9 +191,25 @@ les boutons d'un verdict :
 - Seuls les clics venant de ta conversation (`TELEGRAM_CHAT_ID`) sont acceptés.
 
 Ces décisions personnelles sont **indépendantes** de l'auto-évaluation du modèle :
-l'évaluateur (étape 1.6) note **tous** les verdicts contre les résultats réels — y
-compris les `NO_BET` et même si tu ne cliques jamais — pour mesurer la performance du
-modèle. Les deux axes se rejoignent seulement dans les bilans.
+l'évaluateur note **tous** les verdicts contre les résultats réels — y compris les
+`NO_BET` et même si tu ne cliques jamais — pour mesurer la performance du modèle. Les
+deux axes se rejoignent seulement dans les bilans.
+
+### Évaluation et CLV (bilan du matin)
+
+Chaque matin, l'évaluateur (`python -m evaluator`) :
+
+- récupère les **scores officiels** de la veille via [balldontlie](https://www.balldontlie.io)
+  (gratuit, NBA+WNBA), apparie chaque match par équipes + date (aucun crédit The Odds API) ;
+- calcule pour chaque verdict s'il aurait **gagné / perdu / push** (le push — remboursement —
+  est exclu du taux de réussite), y compris pour les `NO_BET` (faux négatifs) ;
+- calcule le **CLV** (Closing Line Value) = proba dé-marginée de clôture − proba au verdict :
+  positif = on a battu la ligne de clôture ;
+- écrit tout dans `evaluations`, passe le match en `EVALUE`, et envoie le **bilan** Telegram.
+
+⚠️ Garde-fou (règle 11) : tant que **50–100 évaluations** ne sont pas cumulées, les taux
+sont du bruit statistique — aucun seuil ne doit être modifié. Le bilan le rappelle
+explicitement en dessous du seuil.
 
 ---
 
@@ -205,7 +226,7 @@ nba-odds-tracker/
 │   ├── analyzer/          # prétraitement, règles, scoring, verdict
 │   ├── notifier/          # envoi Telegram (client + formatage + file d'attente)
 │   ├── listener/          # bot d'écoute (clics → positions ; polling)
-│   └── evaluator/         # (à venir) évaluation des verdicts
+│   └── evaluator/         # évaluation des verdicts (résultats, grading, CLV, bilan)
 └── tests/                 # pytest (priorité au moteur de règles)
 ```
 
