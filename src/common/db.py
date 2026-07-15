@@ -45,11 +45,12 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
 
 -- Alertes temps réel émises pendant le suivi.
 CREATE TABLE IF NOT EXISTS alerts (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_id   TEXT NOT NULL REFERENCES matches(match_id),
-    rule       TEXT NOT NULL,
-    details    TEXT,
-    created_at TEXT NOT NULL
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id    TEXT NOT NULL REFERENCES matches(match_id),
+    rule        TEXT NOT NULL,
+    details     TEXT,
+    created_at  TEXT NOT NULL,
+    notified_at TEXT                       -- horodatage d'envoi Telegram ; NULL = en attente
 );
 
 -- Verdicts finaux (décision H-1).
@@ -64,7 +65,8 @@ CREATE TABLE IF NOT EXISTS verdicts (
     signal_score    INTEGER,
     rules_triggered TEXT,                  -- liste des règles ayant contribué (JSON)
     rationale       TEXT,                  -- justificatif lisible envoyé sur Telegram
-    decided_at      TEXT NOT NULL
+    decided_at      TEXT NOT NULL,
+    notified_at     TEXT                   -- horodatage d'envoi Telegram ; NULL = en attente
 );
 
 -- Prises de position du développeur (via boutons Telegram).
@@ -126,12 +128,28 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
+    """Ajoute une colonne à une table existante si elle est absente (migration).
+
+    SQLite ne propose pas `ADD COLUMN IF NOT EXISTS` : on interroge d'abord le
+    schéma (`PRAGMA table_info`) pour ne migrer que les bases antérieures à
+    l'ajout de la colonne. Opération idempotente.
+    """
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        logger.info("Migration : ajout de %s.%s (%s).", table, column, coltype)
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
 def init_db(db_path: Path) -> None:
     """Crée (si absentes) toutes les tables, index et triggers de la base."""
     logger.info("Initialisation de la base : %s", db_path)
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA)
+        # Bases créées avant l'étape 1.4 : ajout de la colonne de suivi des envois.
+        _ensure_column(conn, "alerts", "notified_at", "TEXT")
+        _ensure_column(conn, "verdicts", "notified_at", "TEXT")
         conn.commit()
         logger.info("Base prête : tables, index et triggers append-only en place.")
     finally:
@@ -264,3 +282,52 @@ def close_finished_matches(conn: sqlite3.Connection, now_utc: datetime) -> int:
             update_match_status(conn, row["match_id"], "CLOS")
             closed += 1
     return closed
+
+
+# ─────────────────── File d'attente des notifications ───────────────────
+# Le notificateur (étape 1.4) consomme les lignes `notified_at IS NULL` : la base
+# joue le rôle de file d'attente entre l'analyseur (qui écrit) et le notificateur
+# (qui envoie). Chaque lecture joint `matches` pour disposer des noms d'équipes et
+# de l'heure de tip-off nécessaires à la mise en forme du message.
+
+
+def get_pending_alerts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Alertes pas encore envoyées sur Telegram, de la plus ancienne à la plus récente."""
+    return conn.execute(
+        "SELECT a.id, a.match_id, a.rule, a.details, a.created_at, "
+        "       m.home_team, m.away_team, m.tipoff_utc "
+        "FROM alerts a JOIN matches m ON m.match_id = a.match_id "
+        "WHERE a.notified_at IS NULL "
+        "ORDER BY a.created_at, a.id"
+    ).fetchall()
+
+
+def get_pending_verdicts(
+    conn: sqlite3.Connection, verdict_types: list[str]
+) -> list[sqlite3.Row]:
+    """Verdicts pas encore envoyés, restreints aux types notifiables (ex. SIGNAL/ANOMALIE).
+
+    NO_BET n'est jamais dans `verdict_types` : il reste en base (évaluation des faux
+    négatifs) sans jamais être sélectionné ici, donc jamais envoyé — sa colonne
+    `notified_at` conserve ainsi son sens exact (« effectivement poussé sur Telegram »).
+    """
+    if not verdict_types:
+        return []
+    placeholders = ",".join("?" * len(verdict_types))
+    return conn.execute(
+        f"SELECT v.*, m.home_team, m.away_team, m.tipoff_utc "
+        f"FROM verdicts v JOIN matches m ON m.match_id = v.match_id "
+        f"WHERE v.notified_at IS NULL AND v.verdict IN ({placeholders}) "
+        f"ORDER BY v.decided_at, v.id",
+        verdict_types,
+    ).fetchall()
+
+
+def mark_alert_notified(conn: sqlite3.Connection, alert_id: int, notified_at: str) -> None:
+    """Marque une alerte comme envoyée (horodatage UTC de l'envoi)."""
+    conn.execute("UPDATE alerts SET notified_at = ? WHERE id = ?", (notified_at, alert_id))
+
+
+def mark_verdict_notified(conn: sqlite3.Connection, verdict_id: int, notified_at: str) -> None:
+    """Marque un verdict comme envoyé (horodatage UTC de l'envoi)."""
+    conn.execute("UPDATE verdicts SET notified_at = ? WHERE id = ?", (notified_at, verdict_id))

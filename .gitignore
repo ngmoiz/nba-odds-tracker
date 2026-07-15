@@ -9,7 +9,7 @@ data/
 
 # Environnement virtuel Python / uv
 .venv/
-uv.lock
+# uv.lock EST versionné (application → installs reproductibles en CI/Docker/EC2).
 
 # Caches Python
 __pycache__/

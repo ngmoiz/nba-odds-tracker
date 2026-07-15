@@ -21,13 +21,14 @@ dans [CLAUDE.md](CLAUDE.md).
 | 1.1 | Squelette, config, logging, base SQLite | ✅ |
 | 1.2 | Client The Odds API + collecteur + machine à états | ✅ |
 | 1.3 | Analyseur : moteur de règles R1–R7 + verdict | ✅ |
-| 1.4 | Notificateur Telegram | ⏳ à venir |
-| 1.5 | Bot d'écoute (boutons Telegram) | ⏳ |
+| 1.4 | Notificateur Telegram (envoi alertes + verdicts) | ✅ |
+| 1.5 | Bot d'écoute (boutons Telegram) | ⏳ à venir |
 | 1.6 | Évaluateur (résultats, CLV, bilans) | ⏳ |
 | 1.7 | docker-compose + cron | ⏳ |
 
-Aujourd'hui, le collecteur interroge l'API, enregistre les relevés, et l'analyseur
-écrit **alertes** et **verdicts** en base. L'envoi Telegram n'est pas encore branché.
+Aujourd'hui, le collecteur interroge l'API, enregistre les relevés, l'analyseur
+écrit **alertes** et **verdicts** en base, et le notificateur les **envoie sur
+Telegram**. Les clics sur les boutons de position ne sont pas encore traités (étape 1.5).
 
 ---
 
@@ -74,8 +75,8 @@ Deux fichiers, deux rôles :
   | Variable | Rôle |
   |---|---|
   | `ODDS_API_KEY` | Clé The Odds API (obligatoire) |
-  | `TELEGRAM_BOT_TOKEN` | Token du bot (étape 1.4) |
-  | `TELEGRAM_CHAT_ID` | Conversation cible (étape 1.4) |
+  | `TELEGRAM_BOT_TOKEN` | Token du bot (fourni par @BotFather) |
+  | `TELEGRAM_CHAT_ID` | Conversation cible des messages |
   | `DATABASE_PATH` | Chemin du fichier SQLite (défaut `./data/nba_odds.db`) |
   | `LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
@@ -84,11 +85,15 @@ Deux fichiers, deux rôles :
 ## Commandes
 
 ```bash
-# Lancer une collecte + analyse (sport par défaut = NBA, depuis config.yaml)
+# Lancer une collecte + analyse + envoi Telegram (sport par défaut = NBA)
 uv run python -m collector
 
 # Forcer un autre sport SANS toucher config.yaml (utile hors-saison NBA)
 uv run python -m collector --sport basketball_wnba
+
+# Rejouer uniquement l'envoi Telegram des alertes/verdicts en attente
+# (utile après un incident réseau ; sans effet si Telegram n'est pas configuré)
+uv run python -m notifier
 
 # Initialiser / réinitialiser la base (idempotent)
 uv run python scripts/init_db.py
@@ -147,6 +152,22 @@ Les seuils sont configurables dans [config.yaml](config.yaml).
 - **`NO_BET`** : défaut. La sélection « pressentie » est quand même stockée pour
   mesurer les faux négatifs.
 
+### Notifications Telegram
+
+Après chaque collecte, le notificateur pousse sur Telegram ce que l'analyseur vient
+d'écrire en base :
+
+- **alertes temps réel** (R1/R2/R4) : règle déclenchée + détail du mouvement ;
+- **verdicts `SIGNAL` et `ANOMALIE`** : justificatif complet (drapeau R6 inclus s'il
+  s'est déclenché) + boutons `✅ Je me positionne` / `➖ Je passe`.
+
+Les `NO_BET` restent en base (pour l'évaluation des faux négatifs) mais **ne sont pas
+envoyés** — évite un flux quotidien de « rien à signaler ». Les types de verdict
+notifiés sont configurables dans [config.yaml](config.yaml) (`notifier.verdicts_notified`).
+La base sert de file d'attente : chaque ligne envoyée est horodatée (`notified_at`),
+un envoi échoué reste en attente et repart au passage suivant. Le clic sur les boutons
+sera traité par le bot d'écoute (étape 1.5) ; d'ici là les boutons sont inertes.
+
 ---
 
 ## Structure du projet
@@ -160,7 +181,7 @@ nba-odds-tracker/
 │   ├── common/            # config, logging, base SQLite, client API
 │   ├── collector/         # collecte + machine à états
 │   ├── analyzer/          # prétraitement, règles, scoring, verdict
-│   ├── notifier/          # (à venir) envoi Telegram
+│   ├── notifier/          # envoi Telegram (client + formatage + file d'attente)
 │   ├── listener/          # (à venir) bot d'écoute
 │   └── evaluator/         # (à venir) évaluation des verdicts
 └── tests/                 # pytest (priorité au moteur de règles)

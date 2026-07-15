@@ -17,6 +17,7 @@ from common.config import load_config, load_settings
 from common.db import get_connection, init_db
 from common.logging_config import configure_logging, get_logger
 from common.odds_api_client import OddsApiClient
+from notifier.notifier import notify_pending
 
 
 def main() -> None:
@@ -52,6 +53,8 @@ def main() -> None:
             run_collection(conn, client, sport)
         # L'analyseur tourne immédiatement après la collecte (alertes + verdict H-1).
         analyze_open_matches(conn, config)
+        # Puis le notificateur pousse sur Telegram ce que l'analyseur vient d'écrire.
+        notify_pending(conn, settings, config)
     finally:
         conn.close()
 

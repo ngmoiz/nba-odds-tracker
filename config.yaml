@@ -71,3 +71,16 @@ rules:
 decision:
   signal_score_threshold: 6   # score ≥ 6 ET cohérence globale → SIGNAL
   window_hours: 1.5           # verdict produit si le tip-off est dans cette fenêtre
+
+# --- Notificateur Telegram (section 7) ---
+# Le notificateur lit les alertes/verdicts non envoyés en base et les pousse sur
+# Telegram. NO_BET reste enregistré en base pour l'évaluation des faux négatifs,
+# mais n'est pas listé ici : il ne génère donc aucun message (évite le flux
+# quotidien de « rien à signaler »).
+notifier:
+  verdicts_notified:          # types de verdict effectivement envoyés sur Telegram
+    - SIGNAL
+    - ANOMALIE
+  verdicts_with_buttons:      # verdicts recevant les boutons de position (traités en 1.5)
+    - SIGNAL
+    - ANOMALIE
