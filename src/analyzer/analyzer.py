@@ -18,13 +18,13 @@ from datetime import datetime, timedelta, timezone
 from analyzer.preprocessing import preprocess
 from analyzer.rules import ALERT_RULES, ALL_RULES
 from analyzer.scoring import evaluate_rules, movement_score
-from analyzer.verdict import decide
+from analyzer.verdict import DECISION_LOGIC_VERSION, Verdict, decide
 from common import db
 from common.logging_config import get_logger
 
 logger = get_logger("analyzer")
 
-# Statuts pour lesquels un match peut encore être analysé/décidé.
+# Statuts pour lesquels un match n'a pas encore de verdict (première décision possible).
 _DECIDABLE_STATUSES = ("DECOUVERT", "SUIVI")
 
 
@@ -50,26 +50,69 @@ def analyze_match(conn: sqlite3.Connection, match: sqlite3.Row, config: dict, no
             alerts += 1
 
     verdict_type = None
-    if match["status"] in _DECIDABLE_STATUSES and _in_decision_window(match["tipoff_utc"], now, config):
-        verdict = decide(data, results, config)
-        db.insert_verdict(
-            conn,
-            match_id=match_id,
-            verdict=verdict.verdict,
-            selection=verdict.selection,
-            market=verdict.market,
-            line=verdict.line,
-            odds_at_verdict=verdict.odds_at_verdict,
-            signal_score=verdict.signal_score,
-            rules_triggered=json.dumps(verdict.rules_triggered),
-            rationale=verdict.rationale,
-            decided_at=now_iso,
-        )
-        db.update_match_status(conn, match_id, "DECIDE")
-        verdict_type = verdict.verdict
-        logger.info("Verdict %s pour %s (score %d).", verdict_type, match_id, verdict.signal_score)
+    if _in_decision_window(match["tipoff_utc"], now, config):
+        if match["status"] in _DECIDABLE_STATUSES:
+            verdict = decide(data, results, config)
+            db.insert_verdict(
+                conn,
+                match_id=match_id,
+                verdict=verdict.verdict,
+                selection=verdict.selection,
+                market=verdict.market,
+                line=verdict.line,
+                odds_at_verdict=verdict.odds_at_verdict,
+                signal_score=verdict.signal_score,
+                rules_triggered=json.dumps(verdict.rules_triggered),
+                rationale=verdict.rationale,
+                decided_at=now_iso,
+                logic_version=DECISION_LOGIC_VERSION,
+            )
+            db.update_match_status(conn, match_id, "DECIDE")
+            verdict_type = verdict.verdict
+            logger.info("Verdict %s pour %s (score %d).", verdict_type, match_id, verdict.signal_score)
+        elif match["status"] == "DECIDE":
+            verdict_type = _redecide(conn, match_id, decide(data, results, config), now_iso)
 
     return {"alerts": alerts, "verdict": verdict_type, "score": movement_score(results)}
+
+
+def _redecide(conn: sqlite3.Connection, match_id: str, new: Verdict, now_iso: str) -> str | None:
+    """Re-décision à H-1 : met à jour le verdict courant tant que le match est en fenêtre.
+
+    - **Gel** : si une position a déjà été prise sur ce verdict, on n'y touche plus
+      (le développeur s'est engagé sur cette décision).
+    - **Changement matériel** (le type OU la sélection change) → l'ancien message devient
+      obsolète : `supersede_verdict` le marque pour édition et re-met le verdict en file.
+    - Changement non matériel (cote/score/justificatif) → mise à jour silencieuse.
+    """
+    current = db.get_current_verdict(conn, match_id)
+    if current is None:
+        return None
+    if db.get_position(conn, current["id"]) is not None:
+        return current["verdict"]  # gelé : décision engagée
+
+    material = (new.verdict != current["verdict"]) or (new.selection != current["selection"])
+    db.update_verdict_fields(
+        conn,
+        current["id"],
+        verdict=new.verdict,
+        selection=new.selection,
+        market=new.market,
+        line=new.line,
+        odds_at_verdict=new.odds_at_verdict,
+        signal_score=new.signal_score,
+        rules_triggered=json.dumps(new.rules_triggered),
+        rationale=new.rationale,
+        decided_at=now_iso,
+        logic_version=DECISION_LOGIC_VERSION,
+    )
+    if material:
+        db.supersede_verdict(conn, current["id"], current["telegram_message_id"])
+        logger.info(
+            "Re-décision matérielle du verdict %s (%s) : %s → %s.",
+            current["id"], match_id, current["verdict"], new.verdict,
+        )
+    return new.verdict
 
 
 def analyze_open_matches(conn: sqlite3.Connection, config: dict, now: datetime | None = None) -> dict:

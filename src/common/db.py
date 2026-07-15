@@ -66,7 +66,12 @@ CREATE TABLE IF NOT EXISTS verdicts (
     rules_triggered TEXT,                  -- liste des règles ayant contribué (JSON)
     rationale       TEXT,                  -- justificatif lisible envoyé sur Telegram
     decided_at      TEXT NOT NULL,
-    notified_at     TEXT                   -- horodatage d'envoi Telegram ; NULL = en attente
+    notified_at     TEXT,                  -- horodatage d'envoi Telegram ; NULL = en attente
+    -- Re-décision H-1 (étape 1.6bis) : le verdict est ré-évalué à chaque collecte tant
+    -- que le match est dans la fenêtre, jusqu'à gel (position prise) ou tip-off.
+    logic_version         INTEGER NOT NULL DEFAULT 1,  -- 1 = pré-correctif H-1, 2 = décision H-1
+    telegram_message_id   INTEGER,         -- id du message Telegram actuellement affiché
+    superseded_message_id INTEGER          -- id d'un message à éditer/désactiver (supersession en attente)
 );
 
 -- Prises de position du développeur (via boutons Telegram).
@@ -199,6 +204,10 @@ def init_db(db_path: Path) -> None:
         _ensure_column(conn, "positions", "action", "TEXT NOT NULL DEFAULT 'take'")
         # Base créée avant la finalisation de l'étape 1.6 : verdict_won (NULL=push) → outcome.
         _migrate_evaluations_outcome(conn)
+        # Correctif H-1 : re-décision + supersession. Verdicts existants = logique v1.
+        _ensure_column(conn, "verdicts", "logic_version", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "verdicts", "telegram_message_id", "INTEGER")
+        _ensure_column(conn, "verdicts", "superseded_message_id", "INTEGER")
         conn.commit()
         logger.info("Base prête : tables, index et triggers append-only en place.")
     finally:
@@ -296,19 +305,88 @@ def insert_verdict(
     rules_triggered: str,
     rationale: str,
     decided_at: str,
+    logic_version: int = 1,
 ) -> int:
     """Enregistre un verdict final. Renvoie l'identifiant de la ligne créée."""
     cursor = conn.execute(
         "INSERT INTO verdicts "
         "(match_id, verdict, selection, market, line, odds_at_verdict, signal_score, "
-        "rules_triggered, rationale, decided_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "rules_triggered, rationale, decided_at, logic_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             match_id, verdict, selection, market, line, odds_at_verdict,
-            signal_score, rules_triggered, rationale, decided_at,
+            signal_score, rules_triggered, rationale, decided_at, logic_version,
         ),
     )
     return cursor.lastrowid
+
+
+def get_current_verdict(conn: sqlite3.Connection, match_id: str) -> sqlite3.Row | None:
+    """Verdict courant d'un match (un seul, mis à jour en place lors des re-décisions)."""
+    return conn.execute(
+        "SELECT * FROM verdicts WHERE match_id = ? ORDER BY id DESC LIMIT 1", (match_id,)
+    ).fetchone()
+
+
+def update_verdict_fields(
+    conn: sqlite3.Connection,
+    verdict_id: int,
+    *,
+    verdict: str,
+    selection: str | None,
+    market: str | None,
+    line: float | None,
+    odds_at_verdict: float | None,
+    signal_score: int,
+    rules_triggered: str,
+    rationale: str,
+    decided_at: str,
+    logic_version: int,
+) -> None:
+    """Met à jour les champs de décision d'un verdict (re-décision en fenêtre H-1).
+
+    Ne touche PAS aux champs de notification (`notified_at`, `telegram_message_id`,
+    `superseded_message_id`) : ceux-ci sont gérés par `supersede_verdict`.
+    """
+    conn.execute(
+        "UPDATE verdicts SET verdict = ?, selection = ?, market = ?, line = ?, "
+        "odds_at_verdict = ?, signal_score = ?, rules_triggered = ?, rationale = ?, "
+        "decided_at = ?, logic_version = ? WHERE id = ?",
+        (verdict, selection, market, line, odds_at_verdict, signal_score,
+         rules_triggered, rationale, decided_at, logic_version, verdict_id),
+    )
+
+
+def supersede_verdict(conn: sqlite3.Connection, verdict_id: int, prior_message_id: int | None) -> None:
+    """Marque un verdict re-décidé matériellement : l'ancien message devra être édité.
+
+    `superseded_message_id` reçoit `prior_message_id` **uniquement s'il est non-NULL**
+    (COALESCE) : si une supersession est déjà en attente (message pas encore envoyé →
+    `telegram_message_id` NULL), on ne perd pas l'identifiant d'origine. Re-met le
+    verdict en file (`notified_at = NULL`) et efface le message courant.
+    """
+    conn.execute(
+        "UPDATE verdicts SET "
+        "superseded_message_id = COALESCE(?, superseded_message_id), "
+        "telegram_message_id = NULL, notified_at = NULL WHERE id = ?",
+        (prior_message_id, verdict_id),
+    )
+
+
+def set_verdict_notified(
+    conn: sqlite3.Connection, verdict_id: int, message_id: int | None, notified_at: str
+) -> None:
+    """Marque un verdict comme envoyé et mémorise l'id du message (si fourni)."""
+    conn.execute(
+        "UPDATE verdicts SET notified_at = ?, "
+        "telegram_message_id = COALESCE(?, telegram_message_id) WHERE id = ?",
+        (notified_at, message_id, verdict_id),
+    )
+
+
+def clear_superseded(conn: sqlite3.Connection, verdict_id: int) -> None:
+    """Efface la supersession en attente (à appeler UNIQUEMENT après une édition réussie)."""
+    conn.execute("UPDATE verdicts SET superseded_message_id = NULL WHERE id = ?", (verdict_id,))
 
 
 def close_finished_matches(conn: sqlite3.Connection, now_utc: datetime) -> int:
@@ -354,19 +432,21 @@ def get_pending_alerts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def get_pending_verdicts(
     conn: sqlite3.Connection, verdict_types: list[str]
 ) -> list[sqlite3.Row]:
-    """Verdicts pas encore envoyés, restreints aux types notifiables (ex. SIGNAL/ANOMALIE).
+    """Verdicts nécessitant une action du notificateur :
 
-    NO_BET n'est jamais dans `verdict_types` : il reste en base (évaluation des faux
-    négatifs) sans jamais être sélectionné ici, donc jamais envoyé — sa colonne
-    `notified_at` conserve ainsi son sens exact (« effectivement poussé sur Telegram »).
+    - non envoyés et d'un type notifiable (ex. SIGNAL/ANOMALIE), OU
+    - porteurs d'une **supersession en attente** (`superseded_message_id` non-NULL) :
+      l'ancien message doit être édité, quel que soit le type — y compris un NO_BET
+      succédant à un signal (message d'annulation).
+
+    Un NO_BET sans antécédent reste hors sélection (jamais envoyé, comme prévu).
     """
-    if not verdict_types:
-        return []
-    placeholders = ",".join("?" * len(verdict_types))
+    placeholders = ",".join("?" * len(verdict_types)) if verdict_types else "NULL"
     return conn.execute(
         f"SELECT v.*, m.home_team, m.away_team, m.tipoff_utc "
         f"FROM verdicts v JOIN matches m ON m.match_id = v.match_id "
-        f"WHERE v.notified_at IS NULL AND v.verdict IN ({placeholders}) "
+        f"WHERE v.superseded_message_id IS NOT NULL "
+        f"   OR (v.notified_at IS NULL AND v.verdict IN ({placeholders})) "
         f"ORDER BY v.decided_at, v.id",
         verdict_types,
     ).fetchall()
@@ -375,11 +455,6 @@ def get_pending_verdicts(
 def mark_alert_notified(conn: sqlite3.Connection, alert_id: int, notified_at: str) -> None:
     """Marque une alerte comme envoyée (horodatage UTC de l'envoi)."""
     conn.execute("UPDATE alerts SET notified_at = ? WHERE id = ?", (notified_at, alert_id))
-
-
-def mark_verdict_notified(conn: sqlite3.Connection, verdict_id: int, notified_at: str) -> None:
-    """Marque un verdict comme envoyé (horodatage UTC de l'envoi)."""
-    conn.execute("UPDATE verdicts SET notified_at = ? WHERE id = ?", (notified_at, verdict_id))
 
 
 # ─────────────────── Prises de position (bot d'écoute, étape 1.5) ───────────────────

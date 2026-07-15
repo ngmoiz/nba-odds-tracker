@@ -88,3 +88,30 @@ class TelegramClient:
             raise TelegramError(f"HTTP {response.status_code} : {response.text[:200]}")
 
         return response.json()
+
+    def edit_message_text(
+        self, message_id: int, text: str, reply_markup: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Édite un message déjà envoyé. Sans `reply_markup`, le clavier inline est retiré.
+
+        Utilisé pour désactiver les boutons d'un verdict devenu obsolète (supersession).
+        """
+        payload: dict[str, Any] = {
+            "chat_id": self._chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+
+        try:
+            response = self._client.post(f"/bot{self._token}/editMessageText", json=payload)
+        except httpx.RequestError as exc:
+            raise TelegramError(f"Erreur réseau vers Telegram : {exc}") from exc
+
+        if response.status_code != 200:
+            raise TelegramError(f"HTTP {response.status_code} : {response.text[:200]}")
+
+        return response.json()

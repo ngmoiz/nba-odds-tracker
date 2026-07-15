@@ -14,6 +14,7 @@ import pytest
 from common import db
 from common.db import get_connection, init_db
 from listener.callbacks import is_authorized, parse_callback
+from listener.handling import handle_click
 from listener.odds import current_median_odds
 from listener.positions import PASS, TAKE, record_click
 
@@ -159,3 +160,44 @@ def test_idempotent_pass_then_take_keeps_first(conn):
 def test_record_click_rejects_invalid_action(conn):
     with pytest.raises(ValueError):
         record_click(conn, verdict_id=1, action="wager", odds_at_click=1.85, clicked_at="t")
+
+
+# ─────────────────── Anti-clic sur message périmé (correctif H-1) ───────────────────
+
+def _positions_count(conn) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM positions").fetchone()["n"]
+
+
+def test_handle_click_records_on_current_message(conn):
+    """Clic sur le message COURANT du verdict → position enregistrée."""
+    db.set_verdict_notified(conn, 1, 200, "t")  # message courant = 200
+    conn.commit()
+    result = handle_click(conn, verdict_id=1, callback_message_id=200,
+                          action=TAKE, clicked_at="t1")
+    assert result.status == "recorded"
+    assert _positions_count(conn) == 1
+
+
+def test_handle_click_stale_message_records_nothing(conn):
+    """Clic sur un ancien message (id ≠ courant) → rejeté, AUCUNE position."""
+    db.set_verdict_notified(conn, 1, 200, "t")  # courant = 200
+    conn.commit()
+    result = handle_click(conn, verdict_id=1, callback_message_id=100,  # ancien message
+                          action=TAKE, clicked_at="t1")
+    assert result.status == "stale"
+    assert _positions_count(conn) == 0
+
+
+def test_handle_click_stale_when_no_current_message(conn):
+    """Verdict re-décidé, nouveau message pas encore envoyé (telegram_message_id NULL) → périmé."""
+    result = handle_click(conn, verdict_id=1, callback_message_id=100,
+                          action=TAKE, clicked_at="t1")
+    assert result.status == "stale"
+    assert _positions_count(conn) == 0
+
+
+def test_handle_click_unknown_verdict(conn):
+    result = handle_click(conn, verdict_id=999, callback_message_id=200,
+                          action=TAKE, clicked_at="t1")
+    assert result.status == "unknown"
+    assert _positions_count(conn) == 0

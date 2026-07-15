@@ -18,13 +18,12 @@ from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
-from common import db
 from common.config import Settings
 from common.db import get_connection
 from common.logging_config import get_logger
 from listener.callbacks import is_authorized, parse_callback
-from listener.odds import current_median_odds
-from listener.positions import TAKE, ClickOutcome, record_click
+from listener.handling import ClickResult, handle_click
+from listener.positions import TAKE
 
 logger = get_logger("listener")
 
@@ -38,26 +37,30 @@ def _fr_odds(odds: float | None) -> str:
     return f"{odds:.2f}".replace(".", ",") if odds is not None else "—"
 
 
-def _confirmation_line(outcome: ClickOutcome, tz_name: str) -> str:
-    """Ligne de confirmation ajoutée au message (persistante) après un clic."""
+def _confirmation_line(result: ClickResult, tz_name: str) -> str:
+    """Ligne de confirmation ajoutée au message (persistante) après un clic retenu."""
     heure = datetime.now(ZoneInfo(tz_name)).strftime("%d/%m %H:%M")
-    cote = _fr_odds(outcome.odds_at_click)
-    if not outcome.recorded:
-        deja = "Positionné" if outcome.action == TAKE else "Passé"
+    cote = _fr_odds(result.odds_at_click)
+    if result.status == "duplicate":
+        deja = "Positionné" if result.action == TAKE else "Passé"
         return f"• Décision déjà enregistrée ({deja})."
-    if outcome.action == TAKE:
+    if result.action == TAKE:
         return f"✅ Positionné @ {cote} — {heure}"
     return f"➖ Passé @ {cote} — {heure}"
 
 
-def _toast(outcome: ClickOutcome) -> str:
+def _toast(result: ClickResult) -> str:
     """Notification courte (toast) affichée à l'utilisateur au moment du clic."""
-    if not outcome.recorded:
+    if result.status == "stale":
+        return "Ce verdict a été remplacé par une version plus récente."
+    if result.status == "unknown":
+        return "Verdict introuvable."
+    if result.status == "duplicate":
         return "Décision déjà enregistrée pour ce verdict."
-    cote = _fr_odds(outcome.odds_at_click)
+    cote = _fr_odds(result.odds_at_click)
     return (
         f"Position enregistrée @ {cote}."
-        if outcome.action == TAKE
+        if result.action == TAKE
         else f"Passe enregistrée @ {cote}."
     )
 
@@ -86,25 +89,24 @@ def build_application(settings: Settings, config: dict) -> Application:
             return
 
         action, verdict_id = parsed
+        callback_message_id = query.message.message_id if query.message else None
         conn = get_connection(db_path)
         try:
-            verdict = db.get_verdict(conn, verdict_id)
-            if verdict is None:
-                await query.answer(text="Verdict introuvable.")
-                return
-            odds = current_median_odds(conn, verdict)
-            outcome = record_click(
+            result = handle_click(
                 conn,
                 verdict_id=verdict_id,
+                callback_message_id=callback_message_id,
                 action=action,
-                odds_at_click=odds,
                 clicked_at=_now_iso(),
             )
         finally:
             conn.close()
 
-        await query.answer(text=_toast(outcome))
-        await _finalize_message(query, _confirmation_line(outcome, tz_name))
+        await query.answer(text=_toast(result))
+        # On ne finalise (édition du message) que si le clic a été retenu : un clic
+        # périmé ou sur un verdict inconnu ne touche pas au message.
+        if result.status in ("recorded", "duplicate"):
+            await _finalize_message(query, _confirmation_line(result, tz_name))
 
     application = Application.builder().token(settings.telegram_bot_token).build()
     application.add_handler(CallbackQueryHandler(on_callback))

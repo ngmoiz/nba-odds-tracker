@@ -162,6 +162,12 @@ Les seuils sont configurables dans [config.yaml](config.yaml).
 - **`NO_BET`** : défaut. La sélection « pressentie » est quand même stockée pour
   mesurer les faux négatifs.
 
+Le verdict est **re-décidé à chaque collecte** tant que le match est proche du tip-off
+(décision « à H-1 », sur les données les plus fraîches). S'il change **matériellement**
+(type ou sélection), l'ancien message Telegram est édité (« remplacé ») et un nouveau
+est envoyé ; un signal qui retombe en `NO_BET` déclenche une **annulation**. Dès que tu
+prends une position, le verdict est **gelé**. Un clic sur un message périmé est rejeté.
+
 ### Notifications Telegram
 
 Après chaque collecte, le notificateur pousse sur Telegram ce que l'analyseur vient

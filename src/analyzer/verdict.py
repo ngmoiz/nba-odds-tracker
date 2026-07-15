@@ -28,6 +28,12 @@ class Verdict:
     rationale: str
 
 
+# Version de la logique de décision. Incrémentée à chaque évolution matérielle du
+# calcul du verdict, pour distinguer les cohortes dans les stats/calibration.
+#   1 = décision figée à la 1ʳᵉ collecte de la fenêtre (pré-correctif H-1)
+#   2 = re-décision à chaque collecte jusqu'au tip-off (décision « à H-1 »)
+DECISION_LOGIC_VERSION = 2
+
 # Tolérance pour distinguer un mouvement réel du bruit numérique.
 _EPS = 1e-9
 

@@ -141,15 +141,34 @@ def _format_us_selection(row: sqlite3.Row) -> str:
     return us
 
 
-def format_verdict(row: sqlite3.Row, tz_name: str) -> str:
+# Texte qui remplace un message de verdict devenu obsolète (supersession).
+SUPERSEDED_TEXT = "🔁 <b>Remplacé</b> par une décision plus récente."
+
+
+def format_cancellation(row: sqlite3.Row, tz_name: str) -> str:
+    """Message d'annulation : un signal précédent devient NO_BET (à ne jamais laisser traîner)."""
+    heure = _local_time(row["tipoff_utc"], tz_name)
+    return (
+        f"❌ <b>Signal annulé</b> — {_match_label(row)}\n"
+        f"Tip-off {heure}\n"
+        f"Le signal précédent n'est plus valide : verdict désormais <b>NO_BET</b>. "
+        f"Ne te positionne pas."
+    )
+
+
+def format_verdict(row: sqlite3.Row, tz_name: str, updated: bool = False) -> str:
     """Message de verdict H-1 : verdict, sélection traduite en FR, puis justificatif.
 
     La sélection apparaît d'abord au **format bookmaker français** (ligne principale),
     puis en **notation US** technique (ligne secondaire), avant le justificatif complet.
+    `updated=True` préfixe le message d'un bandeau « mis à jour » (re-décision H-1).
     """
     heure = _local_time(row["tipoff_utc"], tz_name)
     emoji = VERDICT_EMOJI.get(row["verdict"], "•")
-    lines = [
+    lines = []
+    if updated:
+        lines.append("🔄 <b>Mis à jour</b> (décision plus récente)")
+    lines += [
         f"{emoji} <b>{html.escape(row['verdict'])}</b> — {_match_label(row)}",
         f"Tip-off {heure}",
     ]

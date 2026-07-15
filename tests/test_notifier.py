@@ -235,3 +235,87 @@ def test_migration_adds_notified_at_column_idempotently(tmp_path: Path):
     cols = {r["name"] for r in connection.execute("PRAGMA table_info(alerts)")}
     connection.close()
     assert "notified_at" in cols
+
+
+# ─────────────────── Supersession / re-décision H-1 (notificateur) ───────────────────
+
+def routing_client(sent: list[dict], edited: list[dict], *,
+                   send_status: int = 200, edit_status: int = 200) -> TelegramClient:
+    """Client mock qui sépare éditions et envois, et renvoie un message_id croissant."""
+    ids = {"n": 500}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path.endswith("/editMessageText"):
+            edited.append(body)
+            return httpx.Response(edit_status, json={"ok": edit_status == 200})
+        sent.append(body)
+        mid = ids["n"]
+        ids["n"] += 1
+        return httpx.Response(send_status, json={"ok": send_status == 200,
+                                                 "result": {"message_id": mid}})
+
+    return TelegramClient("tok", "chat", transport=httpx.MockTransport(handler))
+
+
+def _verdict_row(conn, vid):
+    return conn.execute("SELECT * FROM verdicts WHERE id = ?", (vid,)).fetchone()
+
+
+def test_supersession_edits_old_message_and_resends_updated(conn):
+    """Supersession : l'ancien message est édité (« Remplacé »), le nouveau renvoyé (« Mis à jour »)."""
+    vid = add_verdict(conn)                       # SIGNAL
+    db.set_verdict_notified(conn, vid, 100, "t")  # 1er envoi : message 100
+    db.supersede_verdict(conn, vid, 100)          # re-décision matérielle
+    conn.commit()
+    sent, edited = [], []
+
+    notify_pending(conn, SETTINGS, CONFIG, client=routing_client(sent, edited))
+
+    assert len(edited) == 1 and edited[0]["message_id"] == 100 and "Remplacé" in edited[0]["text"]
+    assert len(sent) == 1 and "Mis à jour" in sent[0]["text"] and "reply_markup" in sent[0]
+    row = _verdict_row(conn, vid)
+    assert row["superseded_message_id"] is None   # effacé après édition réussie
+    assert row["notified_at"] is not None
+    assert row["telegram_message_id"] == 500       # nouvel id mémorisé
+
+
+def test_supersession_edit_failure_keeps_superseded_id(conn):
+    """Édition en échec : superseded_message_id conservé (réessai), le nouveau message part quand même."""
+    vid = add_verdict(conn)
+    db.set_verdict_notified(conn, vid, 100, "t")
+    db.supersede_verdict(conn, vid, 100)
+    conn.commit()
+    sent, edited = [], []
+
+    notify_pending(conn, SETTINGS, CONFIG, client=routing_client(sent, edited, edit_status=429))
+
+    assert _verdict_row(conn, vid)["superseded_message_id"] == 100  # non effacé
+    assert len(sent) == 1                                            # renvoi tout de même
+
+
+def test_signal_to_nobet_sends_cancellation(conn):
+    """Un signal devenu NO_BET envoie une annulation (malgré NO_BET-silencieux), sans boutons."""
+    vid = add_verdict(conn)                        # SIGNAL notifié
+    db.set_verdict_notified(conn, vid, 100, "t")
+    db.update_verdict_fields(conn, vid, verdict="NO_BET", selection="Boston Celtics",
+                             market="spreads", line=-5.0, odds_at_verdict=1.91, signal_score=0,
+                             rules_triggered="[]", rationale="…", decided_at="t2", logic_version=2)
+    db.supersede_verdict(conn, vid, 100)
+    conn.commit()
+    sent, edited = [], []
+
+    notify_pending(conn, SETTINGS, CONFIG, client=routing_client(sent, edited))
+
+    assert len(edited) == 1 and "Remplacé" in edited[0]["text"]
+    assert len(sent) == 1 and "annulé" in sent[0]["text"].lower()
+    assert "reply_markup" not in sent[0]           # une annulation ne se joue pas
+    row = _verdict_row(conn, vid)
+    assert row["notified_at"] is not None and row["telegram_message_id"] is None
+
+
+def test_message_id_stored_on_first_send(conn):
+    """Le message_id renvoyé par Telegram est mémorisé (base de l'anti-clic-périmé)."""
+    vid = add_verdict(conn)
+    notify_pending(conn, SETTINGS, CONFIG, client=routing_client([], []))
+    assert _verdict_row(conn, vid)["telegram_message_id"] == 500
