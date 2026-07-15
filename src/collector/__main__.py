@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 
+from analyzer.analyzer import analyze_open_matches
 from collector.collector import run_collection
 from common.config import load_config, load_settings
 from common.db import get_connection, init_db
@@ -49,6 +50,8 @@ def main() -> None:
         )
         with client:
             run_collection(conn, client, sport)
+        # L'analyseur tourne immédiatement après la collecte (alertes + verdict H-1).
+        analyze_open_matches(conn, config)
     finally:
         conn.close()
 

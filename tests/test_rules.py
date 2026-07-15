@@ -6,7 +6,15 @@ des règles, indépendamment des valeurs de config.yaml.
 from __future__ import annotations
 
 from analyzer.preprocessing import preprocess_rows
-from analyzer.rules import evaluate_r1, evaluate_r2, evaluate_r3, evaluate_r4
+from analyzer.rules import (
+    evaluate_r1,
+    evaluate_r2,
+    evaluate_r3,
+    evaluate_r4,
+    evaluate_r5,
+    evaluate_r6,
+    evaluate_r7,
+)
 from analyzer.scoring import evaluate_rules, signal_score, triggered_rules
 from tests import fixtures as fx
 
@@ -16,6 +24,17 @@ CONFIG = {
         "R2_steam_move": {"threshold_prob_pct": 5.0, "window_hours": 3, "score": 3},
         "R3_sustained_trend": {"min_consecutive_snapshots": 3, "score": 2},
         "R4_multi_bookmaker_sync": {"min_bookmakers": 4, "score": 3},
+        "R5_cross_market_coherence": {
+            "min_spread_move_points": 1.0,
+            "min_prob_move_pct": 3.0,
+            "score": 2,
+        },
+        "R6_bookmaker_divergence": {"threshold_prob_pct": 7.0, "score": 2},
+        "R7_spread_moneyline_inconsistency": {
+            "min_prob_gap_pct": 3.0,
+            "min_abs_spread": 1.5,
+            "score": 2,
+        },
     }
 }
 
@@ -134,3 +153,89 @@ def test_scoring_sums_triggered_rules():
     results = evaluate_rules(_data(rows), CONFIG)
     assert signal_score(results) == 5
     assert {r.rule for r in triggered_rules(results)} == {"R1", "R3"}
+
+
+# ─────────────────────────────── R5 ───────────────────────────────
+
+def test_r5_triggers_when_spread_and_moneyline_agree():
+    """Spread plus négatif ET proba moneyline en hausse pour la même équipe → cohérent."""
+    rows = (
+        fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])
+        + fx.spreads("dk", "Home", "Away", -4.0, 1.91, 1.91, fx.T[1])   # spread -2.0 pt
+        + fx.h2h("dk", "Home", "Away", 1.90, 1.90, fx.T[0])              # Home ~50 %
+        + fx.h2h("dk", "Home", "Away", 1.65, 2.30, fx.T[1])             # Home ~58 %
+    )
+    result = evaluate_r5(_data(rows), CONFIG)
+    assert result.triggered and result.points == 2
+
+
+def test_r5_ignores_when_moneyline_flat():
+    """Le spread bouge mais le moneyline ne confirme pas → pas de cohérence croisée."""
+    rows = (
+        fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])
+        + fx.spreads("dk", "Home", "Away", -4.0, 1.91, 1.91, fx.T[1])
+        + fx.h2h("dk", "Home", "Away", 1.90, 1.90, fx.T[0])
+        + fx.h2h("dk", "Home", "Away", 1.90, 1.90, fx.T[1])  # inchangé
+    )
+    assert not evaluate_r5(_data(rows), CONFIG).triggered
+
+
+def test_r5_ignores_when_markets_contradict():
+    """Spread plus favorable mais proba en baisse (sens opposés) → non cohérent."""
+    rows = (
+        fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])
+        + fx.spreads("dk", "Home", "Away", -4.0, 1.91, 1.91, fx.T[1])  # Home plus favori
+        + fx.h2h("dk", "Home", "Away", 1.65, 2.30, fx.T[0])            # Home ~58 %
+        + fx.h2h("dk", "Home", "Away", 1.90, 1.90, fx.T[1])           # Home retombe à ~50 %
+    )
+    assert not evaluate_r5(_data(rows), CONFIG).triggered
+
+
+# ─────────────────────────────── R6 ───────────────────────────────
+
+def test_r6_triggers_on_bookmaker_divergence():
+    rows = []
+    for book in ("a", "b", "c", "d"):  # consensus à ~50 %
+        rows += fx.h2h(book, "Home", "Away", 1.90, 1.90)
+    rows += fx.h2h("x", "Home", "Away", 1.50, 2.60)  # book divergent : Home ~63 %
+    result = evaluate_r6(_data(rows), CONFIG)
+    assert result.triggered and result.orientation == "anomaly"
+
+
+def test_r6_ignores_when_books_agree():
+    rows = (
+        fx.h2h("a", "Home", "Away", 1.90, 1.90)
+        + fx.h2h("b", "Home", "Away", 1.88, 1.92)
+        + fx.h2h("c", "Home", "Away", 1.92, 1.88)
+    )
+    assert not evaluate_r6(_data(rows), CONFIG).triggered
+
+
+# ─────────────────────────────── R7 ───────────────────────────────
+
+def test_r7_triggers_on_favorite_contradiction():
+    """Spread donne Home favori (-3.5) mais moneyline donne Away favori → incohérence."""
+    rows = (
+        fx.h2h("x", "Home", "Away", 2.20, 1.60)                 # Away favori au moneyline
+        + fx.spreads("x", "Home", "Away", -3.5, 1.91, 1.91)     # Home favori au spread
+    )
+    result = evaluate_r7(_data(rows), CONFIG)
+    assert result.triggered and result.orientation == "anomaly"
+
+
+def test_r7_ignores_when_markets_coherent():
+    """Home favori des deux côtés → pas de contradiction."""
+    rows = (
+        fx.h2h("x", "Home", "Away", 1.60, 2.20)                 # Home favori au moneyline
+        + fx.spreads("x", "Home", "Away", -3.5, 1.91, 1.91)     # Home favori au spread
+    )
+    assert not evaluate_r7(_data(rows), CONFIG).triggered
+
+
+def test_r7_ignores_near_pickem_below_spread_guard():
+    """|spread| < 1.5 (pick'em) : la contradiction est du bruit, on ne déclenche pas."""
+    rows = (
+        fx.h2h("x", "Home", "Away", 2.20, 1.60)
+        + fx.spreads("x", "Home", "Away", -1.0, 1.91, 1.91)  # |spread| = 1.0 < 1.5
+    )
+    assert not evaluate_r7(_data(rows), CONFIG).triggered

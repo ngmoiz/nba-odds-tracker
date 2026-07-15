@@ -44,6 +44,7 @@ class ConsensusPoint:
     snapshot_at: str
     line: float | None   # médiane des lignes (None pour h2h)
     prob: float          # médiane des probabilités dé-margées
+    odds: float          # médiane des cotes brutes (pour odds_at_verdict / CLV)
     n_books: int         # nombre de books ayant coté cette issue à cet instant
 
 
@@ -149,6 +150,7 @@ def _build_consensus(quotes: list[Quote]) -> list[ConsensusPoint]:
                 snapshot_at=snapshot_at,
                 line=median(lines) if lines else None,
                 prob=median(q.prob for q in group),
+                odds=median(q.odds for q in group),
                 n_books=len(group),
             )
         )

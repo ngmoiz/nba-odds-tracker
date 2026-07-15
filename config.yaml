@@ -70,3 +70,4 @@ rules:
 # --- Décision finale à H-1 (section 6.4) ---
 decision:
   signal_score_threshold: 6   # score ≥ 6 ET cohérence globale → SIGNAL
+  window_hours: 1.5           # verdict produit si le tip-off est dans cette fenêtre

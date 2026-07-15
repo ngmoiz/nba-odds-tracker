@@ -201,6 +201,49 @@ def insert_snapshot(
     )
 
 
+def insert_alert(
+    conn: sqlite3.Connection,
+    *,
+    match_id: str,
+    rule: str,
+    details: str,
+    created_at: str,
+) -> None:
+    """Enregistre une alerte temps réel émise par l'analyseur."""
+    conn.execute(
+        "INSERT INTO alerts (match_id, rule, details, created_at) VALUES (?, ?, ?, ?)",
+        (match_id, rule, details, created_at),
+    )
+
+
+def insert_verdict(
+    conn: sqlite3.Connection,
+    *,
+    match_id: str,
+    verdict: str,
+    selection: str | None,
+    market: str | None,
+    line: float | None,
+    odds_at_verdict: float | None,
+    signal_score: int,
+    rules_triggered: str,
+    rationale: str,
+    decided_at: str,
+) -> int:
+    """Enregistre un verdict final. Renvoie l'identifiant de la ligne créée."""
+    cursor = conn.execute(
+        "INSERT INTO verdicts "
+        "(match_id, verdict, selection, market, line, odds_at_verdict, signal_score, "
+        "rules_triggered, rationale, decided_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            match_id, verdict, selection, market, line, odds_at_verdict,
+            signal_score, rules_triggered, rationale, decided_at,
+        ),
+    )
+    return cursor.lastrowid
+
+
 def close_finished_matches(conn: sqlite3.Connection, now_utc: datetime) -> int:
     """Passe en CLOS les matchs actifs dont l'heure de tip-off est dépassée.
 
