@@ -167,16 +167,24 @@ chmod +x scripts/setup_cron.sh
 ./scripts/setup_cron.sh
 ```
 
-Planning (heure locale Europe/Paris) :
+Planning (heure locale Europe/Paris, calé sur les tip-offs WNBA actuels — les
+matchs se jouent en soirée heure US, soit 01:00–04:00 du matin à Paris) :
 
 | Heure | Job |
 |---|---|
 | 09:00 | Collecte du matin (découverte + cotes d'ouverture) |
 | 09:30 | Évaluateur (bilan du matin + rapport hebdo le lundi) |
 | 15:00 | Collecte après-midi (relevé intermédiaire) |
-| 18:00 | Collecte H-6 |
-| 21:00 | Collecte H-3 |
-| 23:00 | Collecte H-1 (fenêtre de décision) |
+| 20:00 | Collecte H-6 (tip-offs ~02:00 Paris) |
+| 23:00 | Collecte H-3 (tip-offs ~02:00 Paris) |
+| 01:00 | Collecte H-1 (fenêtre de décision, tip-offs 01:00–02:30) |
+
+Budget : 5 collectes/jour × 3 crédits = 15 crédits/jour ≈ 450/mois.
+
+> ⚠️ **Limite structurelle cron-WSL2** : si le PC est éteint ou en veille, les
+> jobs ne s'exécutent pas. Pour la validation 7 jours, laisser le PC allumé en
+> permanence. Cette limite motive le déploiement EC2 (phase 3) où cron tourne
+> sur un serveur 24/7.
 
 Pour désinstaller les jobs : `crontab -l | grep -v 'nba-odds-tracker' | crontab -`
 
