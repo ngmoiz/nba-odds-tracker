@@ -23,6 +23,7 @@ from evaluator.clv import compute_clv
 from evaluator.grading import grade_verdict
 from evaluator.reconcile import find_result, tipoff_calendar_date
 from evaluator.reporting import EvalLine, format_daily_report
+from evaluator.weekly import format_weekly_report
 from notifier.direct import send_direct
 
 logger = get_logger("evaluator")
@@ -154,3 +155,41 @@ def evaluate_pending(
 
     logger.info("Évaluation terminée : %s", summary)
     return summary
+
+
+def run_weekly_report(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    config: dict,
+    *,
+    telegram_client=None,
+    now: datetime | None = None,
+) -> bool:
+    """Calcule et envoie le rapport hebdomadaire (7 jours glissants sur `evaluated_at`).
+
+    Pure agrégation par-dessus `evaluations` : aucune nouvelle donnée produite.
+    Segregation par `logic_version` (v1 pré-correction H-1 vs v2 décision H-1).
+    Renvoie True si le rapport a été envoyé, False sinon (vide ou échec d'envoi).
+    """
+    now = now or datetime.now(timezone.utc)
+    since = now - timedelta(days=7)
+    since_iso = since.isoformat()
+
+    signal_rows = db.get_weekly_signal_evals(conn, since_iso)
+    nobet_rows = db.get_weekly_nobet_evals(conn, since_iso)
+    total_evals = db.count_evaluations(conn)
+    v2_evals = db.count_evaluations_by_logic_version(conn, logic_version=2)
+
+    display_tz = config["display"]["timezone"]
+    fmt = "%d/%m/%Y"
+    since_label = since.astimezone(ZoneInfo(display_tz)).strftime(fmt)
+    now_label = now.astimezone(ZoneInfo(display_tz)).strftime(fmt)
+    week_label = f"7 derniers jours ({since_label} → {now_label})"
+
+    text = format_weekly_report(week_label, signal_rows, nobet_rows, total_evals, v2_evals)
+    sent = send_direct(settings, text, client=telegram_client)
+    logger.info(
+        "Rapport hebdomadaire : %d SIGNAL, %d NO_BET pressentis sur la période.",
+        len(signal_rows), len(nobet_rows),
+    )
+    return sent

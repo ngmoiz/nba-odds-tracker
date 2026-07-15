@@ -534,3 +534,59 @@ def insert_evaluation(
 def count_evaluations(conn: sqlite3.Connection) -> int:
     """Nombre total d'évaluations cumulées (garde-fou des 50–100, section 11)."""
     return conn.execute("SELECT COUNT(*) AS n FROM evaluations").fetchone()["n"]
+
+
+def count_evaluations_by_logic_version(
+    conn: sqlite3.Connection, logic_version: int
+) -> int:
+    """Nombre d'évaluations cumulées pour une cohorte de logique donnée.
+
+    Le garde-fou règle 11 du rapport hebdo se mesure sur la **cohorte de calibration**
+    (v2), pas sur le cumul global : les évaluations v1 (pré-correction H-1) ne doivent
+    pas faire basculer le seuil prématurément.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM evaluations e "
+        "JOIN verdicts v ON v.id = e.verdict_id "
+        "WHERE v.logic_version = ?",
+        (logic_version,),
+    ).fetchone()["n"]
+
+
+# ─────────────────── Rapport hebdomadaire (post-1.6) ───────────────────
+# Pure agrégation par-dessus `evaluations` + `verdicts` : aucune nouvelle donnée
+# produite. La période est glissante (7 jours sur `evaluated_at`).
+
+
+def get_weekly_signal_evals(conn: sqlite3.Connection, since_iso: str) -> list[sqlite3.Row]:
+    """Lignes évaluées SIGNAL sur la période, avec les champs nécessaires à l'agrégation.
+
+    Retourne : verdict_id, logic_version, market, rules_triggered (JSON texte), outcome, clv.
+    L'agrégation par marché et par règle se fait en Python (parsing JSON fiable).
+    `verdict_id` est inclus pour logger les règles illisibles (parsing défensif non silencieux).
+    """
+    return conn.execute(
+        "SELECT e.verdict_id, v.logic_version, v.market, v.rules_triggered, e.outcome, e.clv "
+        "FROM evaluations e "
+        "JOIN verdicts v ON v.id = e.verdict_id "
+        "WHERE v.verdict = 'SIGNAL' AND e.evaluated_at >= ? "
+        "ORDER BY e.evaluated_at",
+        (since_iso,),
+    ).fetchall()
+
+
+def get_weekly_nobet_evals(conn: sqlite3.Connection, since_iso: str) -> list[sqlite3.Row]:
+    """Lignes évaluées NO_BET **pressenties** (sélection non-NULL) sur la période.
+
+    Sert à mesurer les faux négatifs : la sélection pressentie aurait-elle gagné ?
+    Retourne : logic_version, outcome.
+    """
+    return conn.execute(
+        "SELECT v.logic_version, e.outcome "
+        "FROM evaluations e "
+        "JOIN verdicts v ON v.id = e.verdict_id "
+        "WHERE v.verdict = 'NO_BET' AND v.selection IS NOT NULL "
+        "  AND e.evaluated_at >= ? "
+        "ORDER BY e.evaluated_at",
+        (since_iso,),
+    ).fetchall()
