@@ -50,7 +50,11 @@ def run_collection(conn: sqlite3.Connection, client, sport: str) -> dict[str, in
     snapshot_at = now.isoformat()
 
     events = client.get_odds()
-    logger.info("Collecte %s : %d match(s) à venir.", sport, len(events))
+    credits = getattr(client, "credits_remaining", None) or "?"
+    logger.info(
+        "Collecte %s : %d match(s) à venir — crédits restants : %s.",
+        sport, len(events), credits,
+    )
 
     discovered = newly_tracked = snapshots = 0
     for event in events:
@@ -88,5 +92,5 @@ def run_collection(conn: sqlite3.Connection, client, sport: str) -> dict[str, in
         "snapshots": snapshots,
         "closed": closed,
     }
-    logger.info("Collecte terminée : %s", summary)
+    logger.info("Collecte terminée : %s — crédits restants : %s.", summary, credits)
     return summary

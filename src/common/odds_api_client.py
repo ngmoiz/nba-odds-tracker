@@ -106,6 +106,8 @@ class OddsApiClient:
         self._region = region
         self._markets = markets
         self._odds_format = odds_format
+        # Dernier quota connu (en-tête x-requests-remaining du dernier appel).
+        self.credits_remaining: str | None = None
         # `transport` permet d'injecter un faux transport dans les tests (sans réseau).
         self._client = httpx.Client(base_url=BASE_URL, timeout=timeout, transport=transport)
 
@@ -135,10 +137,11 @@ class OddsApiClient:
     # --- Requête générique ---
 
     def _log_quota(self, response: httpx.Response) -> None:
-        """Logge le quota d'après les en-têtes renvoyés par l'API."""
+        """Mémorise et logge le quota d'après les en-têtes renvoyés par l'API."""
+        self.credits_remaining = response.headers.get("x-requests-remaining")
         logger.info(
-            "Quota API — restant: %s, utilisé: %s, coût de la requête: %s",
-            response.headers.get("x-requests-remaining", "?"),
+            "Quota API — crédits restants: %s, consommés: %s, coût de la requête: %s",
+            self.credits_remaining or "?",
             response.headers.get("x-requests-used", "?"),
             response.headers.get("x-requests-last", "?"),
         )
