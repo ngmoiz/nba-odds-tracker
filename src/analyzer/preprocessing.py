@@ -78,6 +78,29 @@ class MatchData:
                 return c
         return None
 
+    def markets(self) -> list[str]:
+        """Marchés présents dans les relevés (h2h, spreads, totals)."""
+        return sorted({q.market for q in self.quotes})
+
+    def selections(self, market: str) -> list[str]:
+        """Issues distinctes d'un marché (équipes, ou Over/Under)."""
+        return sorted({q.selection for q in self.quotes if q.market == market})
+
+    def bookmakers(self, market: str, selection: str) -> list[str]:
+        """Bookmakers ayant coté une issue donnée."""
+        return sorted(
+            {q.bookmaker for q in self.quotes if q.market == market and q.selection == selection}
+        )
+
+    def book_series(self, market: str, selection: str, bookmaker: str) -> list[Quote]:
+        """Série temporelle d'un book pour une issue, triée par instant."""
+        quotes = [
+            q
+            for q in self.quotes
+            if q.market == market and q.selection == selection and q.bookmaker == bookmaker
+        ]
+        return sorted(quotes, key=lambda q: q.snapshot_at)
+
 
 def _demargin(rows) -> list[Quote]:
     """Calcule la probabilité dé-margée de chaque relevé.
