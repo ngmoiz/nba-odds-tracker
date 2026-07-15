@@ -70,10 +70,14 @@ CREATE TABLE IF NOT EXISTS verdicts (
 );
 
 -- Prises de position du développeur (via boutons Telegram).
+-- `action` distingue une prise ('take') d'un passage explicite ('pass') : les deux
+-- sont des décisions humaines évaluables (résultat + CLV), à ne pas confondre avec
+-- l'absence de réaction (aucune ligne). `odds_at_click` est renseigné dans les deux cas.
 CREATE TABLE IF NOT EXISTS positions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     verdict_id    INTEGER NOT NULL REFERENCES verdicts(id),
-    odds_at_click REAL,                    -- cote au moment du clic (celle qui compte)
+    action        TEXT NOT NULL,           -- 'take' (je me positionne) / 'pass' (je passe)
+    odds_at_click REAL,                    -- cote médiane au moment du clic (celle qui compte)
     clicked_at    TEXT NOT NULL
 );
 
@@ -150,6 +154,10 @@ def init_db(db_path: Path) -> None:
         # Bases créées avant l'étape 1.4 : ajout de la colonne de suivi des envois.
         _ensure_column(conn, "alerts", "notified_at", "TEXT")
         _ensure_column(conn, "verdicts", "notified_at", "TEXT")
+        # Base créée avant l'étape 1.5 : ajout de l'action du clic (take/pass).
+        # DEFAULT 'take' uniquement pour d'éventuelles lignes préexistantes (aucune en
+        # pratique) ; l'application fournit toujours l'action explicitement.
+        _ensure_column(conn, "positions", "action", "TEXT NOT NULL DEFAULT 'take'")
         conn.commit()
         logger.info("Base prête : tables, index et triggers append-only en place.")
     finally:
@@ -331,3 +339,39 @@ def mark_alert_notified(conn: sqlite3.Connection, alert_id: int, notified_at: st
 def mark_verdict_notified(conn: sqlite3.Connection, verdict_id: int, notified_at: str) -> None:
     """Marque un verdict comme envoyé (horodatage UTC de l'envoi)."""
     conn.execute("UPDATE verdicts SET notified_at = ? WHERE id = ?", (notified_at, verdict_id))
+
+
+# ─────────────────── Prises de position (bot d'écoute, étape 1.5) ───────────────────
+
+
+def get_verdict(conn: sqlite3.Connection, verdict_id: int) -> sqlite3.Row | None:
+    """Renvoie la ligne d'un verdict par son identifiant, ou None."""
+    return conn.execute("SELECT * FROM verdicts WHERE id = ?", (verdict_id,)).fetchone()
+
+
+def get_position(conn: sqlite3.Connection, verdict_id: int) -> sqlite3.Row | None:
+    """Renvoie la prise de position existante pour un verdict, ou None.
+
+    Sert à garantir l'idempotence : un seul clic est retenu par verdict (le premier),
+    toutes actions confondues (take/pass).
+    """
+    return conn.execute(
+        "SELECT * FROM positions WHERE verdict_id = ? ORDER BY id LIMIT 1", (verdict_id,)
+    ).fetchone()
+
+
+def insert_position(
+    conn: sqlite3.Connection,
+    *,
+    verdict_id: int,
+    action: str,
+    odds_at_click: float | None,
+    clicked_at: str,
+) -> int:
+    """Enregistre une prise de position ('take') ou un passage ('pass'). Renvoie l'id créé."""
+    cursor = conn.execute(
+        "INSERT INTO positions (verdict_id, action, odds_at_click, clicked_at) "
+        "VALUES (?, ?, ?, ?)",
+        (verdict_id, action, odds_at_click, clicked_at),
+    )
+    return cursor.lastrowid

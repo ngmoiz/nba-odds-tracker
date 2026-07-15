@@ -22,13 +22,14 @@ dans [CLAUDE.md](CLAUDE.md).
 | 1.2 | Client The Odds API + collecteur + machine à états | ✅ |
 | 1.3 | Analyseur : moteur de règles R1–R7 + verdict | ✅ |
 | 1.4 | Notificateur Telegram (envoi alertes + verdicts) | ✅ |
-| 1.5 | Bot d'écoute (boutons Telegram) | ⏳ à venir |
-| 1.6 | Évaluateur (résultats, CLV, bilans) | ⏳ |
+| 1.5 | Bot d'écoute (boutons Telegram → positions) | ✅ |
+| 1.6 | Évaluateur (résultats, CLV, bilans) | ⏳ à venir |
 | 1.7 | docker-compose + cron | ⏳ |
 
 Aujourd'hui, le collecteur interroge l'API, enregistre les relevés, l'analyseur
-écrit **alertes** et **verdicts** en base, et le notificateur les **envoie sur
-Telegram**. Les clics sur les boutons de position ne sont pas encore traités (étape 1.5).
+écrit **alertes** et **verdicts** en base, le notificateur les **envoie sur
+Telegram**, et le bot d'écoute **enregistre tes décisions** (prise / passe) quand tu
+cliques sur les boutons d'un verdict.
 
 ---
 
@@ -94,6 +95,10 @@ uv run python -m collector --sport basketball_wnba
 # Rejouer uniquement l'envoi Telegram des alertes/verdicts en attente
 # (utile après un incident réseau ; sans effet si Telegram n'est pas configuré)
 uv run python -m notifier
+
+# Démarrer le bot d'écoute (processus qui tourne en continu) : il enregistre
+# tes clics sur les boutons des verdicts. À laisser tourner en fond.
+uv run python -m listener
 
 # Initialiser / réinitialiser la base (idempotent)
 uv run python scripts/init_db.py
@@ -165,8 +170,25 @@ Les `NO_BET` restent en base (pour l'évaluation des faux négatifs) mais **ne s
 envoyés** — évite un flux quotidien de « rien à signaler ». Les types de verdict
 notifiés sont configurables dans [config.yaml](config.yaml) (`notifier.verdicts_notified`).
 La base sert de file d'attente : chaque ligne envoyée est horodatée (`notified_at`),
-un envoi échoué reste en attente et repart au passage suivant. Le clic sur les boutons
-sera traité par le bot d'écoute (étape 1.5) ; d'ici là les boutons sont inertes.
+un envoi échoué reste en attente et repart au passage suivant.
+
+### Prises de position (bot d'écoute)
+
+Le bot d'écoute (`python -m listener`) tourne **en continu** et écoute tes clics sur
+les boutons d'un verdict :
+
+- `✅ Je me positionne` → décision `take` ; `➖ Je passe` → décision `pass`.
+- Dans **les deux cas**, on enregistre la **cote médiane du dernier relevé** au moment
+  du clic (`odds_at_click`) : « passer » est une décision évaluable, distincte de « ne
+  pas réagir ». L'évaluateur pourra ainsi comparer plus tard le résultat (et le CLV) de
+  tes prises **et** de tes passes.
+- **Premier clic gagnant** : une seule décision par verdict, toutes actions confondues.
+- Seuls les clics venant de ta conversation (`TELEGRAM_CHAT_ID`) sont acceptés.
+
+Ces décisions personnelles sont **indépendantes** de l'auto-évaluation du modèle :
+l'évaluateur (étape 1.6) note **tous** les verdicts contre les résultats réels — y
+compris les `NO_BET` et même si tu ne cliques jamais — pour mesurer la performance du
+modèle. Les deux axes se rejoignent seulement dans les bilans.
 
 ---
 
@@ -182,7 +204,7 @@ nba-odds-tracker/
 │   ├── collector/         # collecte + machine à états
 │   ├── analyzer/          # prétraitement, règles, scoring, verdict
 │   ├── notifier/          # envoi Telegram (client + formatage + file d'attente)
-│   ├── listener/          # (à venir) bot d'écoute
+│   ├── listener/          # bot d'écoute (clics → positions ; polling)
 │   └── evaluator/         # (à venir) évaluation des verdicts
 └── tests/                 # pytest (priorité au moteur de règles)
 ```

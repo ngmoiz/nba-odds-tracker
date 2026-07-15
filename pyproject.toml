@@ -8,6 +8,7 @@ dependencies = [
     "python-dotenv>=1.0", # chargement du fichier .env
     "httpx>=0.28.1",
     "tzdata>=2024.1",     # base de fuseaux pour zoneinfo (affichage Europe/Paris hors OS pourvu)
+    "python-telegram-bot>=22.8", # réception des clics Telegram (bot d'écoute, polling)
 ]
 
 # Outils de développement : groupe installé par défaut par `uv sync` / `uv run`.
