@@ -46,6 +46,33 @@ def test_signal_when_score_reaches_threshold():
     assert verdict.odds_at_verdict is not None
 
 
+def test_selection_follows_spread_direction_when_h2h_flat():
+    """Régression : signal spread + h2h plat → la sélection suit le spread (bon côté).
+
+    Avant correctif, la sélection venait d'un tie-break h2h et pouvait désigner
+    l'outsider (ex. « Away +5.0 » alors que la steam va sur Home -5.0).
+    """
+    rows = []
+    for book in ("a", "b", "c", "d"):
+        rows += fx.spreads(book, "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])
+        rows += fx.spreads(book, "Home", "Away", -5.0, 1.91, 1.91, fx.T[1])  # Home devient favori
+        rows += fx.h2h(book, "Home", "Away", 1.90, 1.90, fx.T[0])
+        rows += fx.h2h(book, "Home", "Away", 1.90, 1.90, fx.T[1])            # h2h PLAT
+    verdict = _decide(rows)
+    assert verdict.verdict == "SIGNAL"
+    assert verdict.selection == "Home"   # le côté vers lequel le spread a bougé
+    assert verdict.market == "spreads"
+    assert verdict.line == -5.0          # Home -5.0, pas Away +5.0
+
+
+def test_pressenti_follows_h2h_move_without_spread():
+    """Sans spread, la sélection suit la hausse de proba h2h."""
+    rows = fx.h2h("dk", "Home", "Away", 1.90, 1.90, fx.T[0]) + fx.h2h("dk", "Home", "Away", 1.60, 2.40, fx.T[1])
+    verdict = _decide(rows)
+    assert verdict.selection == "Home"   # proba Home en hausse
+    assert verdict.market == "h2h"
+
+
 def test_r7_blocks_even_a_strong_signal():
     """R7 (contradiction) casse la cohérence → ANOMALIE même avec un mouvement fort."""
     rows = []

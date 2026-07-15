@@ -28,24 +28,78 @@ class Verdict:
     rationale: str
 
 
-def favored_selection(data: MatchData) -> str | None:
-    """Équipe vers laquelle le marché a le plus bougé (proba moneyline en hausse).
+# Tolérance pour distinguer un mouvement réel du bruit numérique.
+_EPS = 1e-9
 
-    À défaut de mouvement, on retient le favori courant (proba la plus haute).
-    """
-    selections = data.selections("h2h")
-    if not selections:
-        return None
-    times = data.times()
-    latest = times[-1] if times else None
 
-    def rank(selection: str) -> tuple[float, float]:
+def _favored_by_spread_move(data: MatchData) -> str | None:
+    """Équipe dont la ligne de spread est devenue la plus négative (plus favorite)."""
+    best_team, best_drop = None, -_EPS
+    for selection in data.selections("spreads"):
+        series = data.consensus_series("spreads", selection)
+        if len(series) < 2 or series[0].line is None or series[-1].line is None:
+            continue
+        delta = series[-1].line - series[0].line  # < 0 : l'équipe devient plus favorite
+        if delta < best_drop:
+            best_drop, best_team = delta, selection
+    return best_team
+
+
+def _favored_by_h2h_move(data: MatchData) -> str | None:
+    """Équipe dont la probabilité moneyline a le plus augmenté."""
+    best_team, best_delta = None, _EPS
+    for selection in data.selections("h2h"):
         series = data.consensus_series("h2h", selection)
-        delta = series[-1].prob - series[0].prob if series else 0.0
-        current = data.consensus_at("h2h", selection, latest) if latest else None
-        return (delta, current.prob if current else 0.0)
+        if len(series) < 2:
+            continue
+        delta = series[-1].prob - series[0].prob
+        if delta > best_delta:
+            best_delta, best_team = delta, selection
+    return best_team
 
-    return max(selections, key=rank)
+
+def _current_favorite(data: MatchData) -> str | None:
+    """Favori courant : proba h2h la plus haute, à défaut ligne spread la plus négative."""
+    times = data.times()
+    if not times:
+        return None
+    latest = times[-1]
+
+    h2h_selections = data.selections("h2h")
+    if h2h_selections:
+        def h2h_prob(selection: str) -> float:
+            point = data.consensus_at("h2h", selection, latest)
+            return point.prob if point else 0.0
+        return max(h2h_selections, key=h2h_prob)
+
+    spread_selections = data.selections("spreads")
+    if spread_selections:
+        def spread_line(selection: str) -> float:
+            point = data.consensus_at("spreads", selection, latest)
+            return point.line if point and point.line is not None else 0.0
+        return min(spread_selections, key=spread_line)
+
+    return None
+
+
+def favored_selection(data: MatchData, driving_market: str = "h2h") -> str | None:
+    """Équipe pressentie, cohérente avec le marché qui porte le signal.
+
+    - signal spread (R1/R5) : l'équipe dont la ligne est devenue la plus négative ;
+    - signal moneyline (ou repli) : l'équipe dont la proba h2h a le plus monté ;
+    - sans mouvement : le favori courant.
+
+    Corrige la dette où la sélection, déduite du seul h2h, pouvait désigner le
+    mauvais côté d'un signal porté par le spread.
+    """
+    if driving_market == "spreads":
+        team = _favored_by_spread_move(data)
+        if team is not None:
+            return team
+    team = _favored_by_h2h_move(data)
+    if team is not None:
+        return team
+    return _current_favorite(data)
 
 
 def _rationale(
@@ -66,25 +120,24 @@ def _rationale(
     return base
 
 
-def _reference_quote(data: MatchData, selection: str | None, triggered: list[RuleResult]):
+def _reference_quote(data: MatchData, selection: str | None, driving_market: str):
     """Marché, ligne et cote de référence du verdict (base du CLV).
 
-    Le verdict porte sur le marché qui a déclenché le signal : le **spread** si
-    R1/R5 sont en jeu (cas dominant en basket), sinon le **moneyline**. On
-    enregistre la ligne et la cote médiane de ce marché pour l'équipe pressentie.
+    Le verdict porte sur le marché qui a déclenché le signal (spread ou moneyline).
+    On enregistre la ligne et la cote médiane de ce marché pour l'équipe pressentie.
     """
     times = data.times()
     if selection is None or not times:
         return "h2h", None, None
 
-    driving_market = "spreads" if any(r.rule in ("R1", "R5") for r in triggered) else "h2h"
-    point = data.consensus_at(driving_market, selection, times[-1])
-    if point is None and driving_market != "h2h":
-        driving_market = "h2h"  # repli si le marché déclencheur n'est pas coté
+    market = driving_market
+    point = data.consensus_at(market, selection, times[-1])
+    if point is None and market != "h2h":
+        market = "h2h"  # repli si le marché déclencheur n'est pas coté
         point = data.consensus_at("h2h", selection, times[-1])
     if point is None:
-        return driving_market, None, None
-    return driving_market, point.line, point.odds
+        return market, None, None
+    return market, point.line, point.odds
 
 
 def decide(data: MatchData, results: list[RuleResult], config: dict) -> Verdict:
@@ -112,8 +165,9 @@ def decide(data: MatchData, results: list[RuleResult], config: dict) -> Verdict:
     else:
         verdict = "NO_BET"
 
-    selection = favored_selection(data)
-    market, line, odds = _reference_quote(data, selection, triggered)
+    driving_market = "spreads" if any(r.rule in ("R1", "R5") for r in triggered) else "h2h"
+    selection = favored_selection(data, driving_market)
+    market, line, odds = _reference_quote(data, selection, driving_market)
     rationale = _rationale(verdict, triggered, selection, score, flag_r6=(verdict == "SIGNAL" and r6_fired))
 
     return Verdict(
