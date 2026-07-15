@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from analyzer.preprocessing import MatchData
 from analyzer.rules import RuleResult
-from analyzer.scoring import signal_score, triggered_rules
+from analyzer.scoring import movement_score, triggered_rules
 
 
 @dataclass(frozen=True)
@@ -48,44 +48,81 @@ def favored_selection(data: MatchData) -> str | None:
     return max(selections, key=rank)
 
 
-def _rationale(verdict: str, triggered: list[RuleResult], selection: str | None, score: int) -> str:
+def _rationale(
+    verdict: str,
+    triggered: list[RuleResult],
+    selection: str | None,
+    score: int,
+    flag_r6: bool = False,
+) -> str:
     """Compose un justificatif lisible pour Telegram."""
     if not triggered:
         return f"{verdict} — aucune règle déclenchée (score {score})."
     details = " ; ".join(f"{r.rule}: {r.detail}" for r in triggered)
     cible = f" sur {selection}" if selection else ""
-    return f"{verdict}{cible} (score {score}) — {details}."
+    base = f"{verdict}{cible} (score {score}) — {details}."
+    if flag_r6:
+        base += " ⚠ divergence bookmaker signalée (R6), signal maintenu."
+    return base
+
+
+def _reference_quote(data: MatchData, selection: str | None, triggered: list[RuleResult]):
+    """Marché, ligne et cote de référence du verdict (base du CLV).
+
+    Le verdict porte sur le marché qui a déclenché le signal : le **spread** si
+    R1/R5 sont en jeu (cas dominant en basket), sinon le **moneyline**. On
+    enregistre la ligne et la cote médiane de ce marché pour l'équipe pressentie.
+    """
+    times = data.times()
+    if selection is None or not times:
+        return "h2h", None, None
+
+    driving_market = "spreads" if any(r.rule in ("R1", "R5") for r in triggered) else "h2h"
+    point = data.consensus_at(driving_market, selection, times[-1])
+    if point is None and driving_market != "h2h":
+        driving_market = "h2h"  # repli si le marché déclencheur n'est pas coté
+        point = data.consensus_at("h2h", selection, times[-1])
+    if point is None:
+        return driving_market, None, None
+    return driving_market, point.line, point.odds
 
 
 def decide(data: MatchData, results: list[RuleResult], config: dict) -> Verdict:
-    """Construit le verdict à partir des résultats de règles."""
-    score = signal_score(results)
+    """Construit le verdict à partir des résultats de règles (arbitrage option 2).
+
+    - R7 (contradiction spread/moneyline) casse la cohérence → ANOMALIE, toujours.
+    - Sinon un score de mouvement ≥ seuil → SIGNAL (une divergence R6 devient un
+      simple drapeau, elle ne masque pas un signal fort).
+    - Sinon une divergence R6 seule → ANOMALIE (à vérifier).
+    - Sinon → NO_BET (défaut).
+    """
     threshold = config["decision"]["signal_score_threshold"]
     triggered = triggered_rules(results)
-    has_anomaly = any(r.orientation == "anomaly" for r in triggered)
+    score = movement_score(results)  # hors points d'anomalie
 
-    if has_anomaly:
+    r7_fired = any(r.rule == "R7" for r in triggered)
+    r6_fired = any(r.rule == "R6" for r in triggered)
+
+    if r7_fired:
         verdict = "ANOMALIE"
     elif score >= threshold:
         verdict = "SIGNAL"
+    elif r6_fired:
+        verdict = "ANOMALIE"
     else:
         verdict = "NO_BET"
 
-    # Sélection pressentie + cote de référence (moneyline en V1).
     selection = favored_selection(data)
-    odds = None
-    times = data.times()
-    if selection is not None and times:
-        consensus = data.consensus_at("h2h", selection, times[-1])
-        odds = consensus.odds if consensus else None
+    market, line, odds = _reference_quote(data, selection, triggered)
+    rationale = _rationale(verdict, triggered, selection, score, flag_r6=(verdict == "SIGNAL" and r6_fired))
 
     return Verdict(
         verdict=verdict,
         selection=selection,
-        market="h2h",
-        line=None,
+        market=market,
+        line=line,
         odds_at_verdict=odds,
         signal_score=score,
         rules_triggered=[r.rule for r in triggered],
-        rationale=_rationale(verdict, triggered, selection, score),
+        rationale=rationale,
     )

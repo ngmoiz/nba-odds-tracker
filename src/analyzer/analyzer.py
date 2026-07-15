@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from analyzer.preprocessing import preprocess
 from analyzer.rules import ALERT_RULES, ALL_RULES
-from analyzer.scoring import evaluate_rules, signal_score
+from analyzer.scoring import evaluate_rules, movement_score
 from analyzer.verdict import decide
 from common import db
 from common.logging_config import get_logger
@@ -69,7 +69,7 @@ def analyze_match(conn: sqlite3.Connection, match: sqlite3.Row, config: dict, no
         verdict_type = verdict.verdict
         logger.info("Verdict %s pour %s (score %d).", verdict_type, match_id, verdict.signal_score)
 
-    return {"alerts": alerts, "verdict": verdict_type, "score": signal_score(results)}
+    return {"alerts": alerts, "verdict": verdict_type, "score": movement_score(results)}
 
 
 def analyze_open_matches(conn: sqlite3.Connection, config: dict, now: datetime | None = None) -> dict:

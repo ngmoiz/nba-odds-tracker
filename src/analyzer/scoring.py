@@ -16,8 +16,17 @@ def evaluate_rules(data: MatchData, config: dict, rules=MOVEMENT_RULES) -> list[
 
 
 def signal_score(results: list[RuleResult]) -> int:
-    """Somme des points des règles déclenchées."""
+    """Somme des points de toutes les règles déclenchées (mouvement + anomalies)."""
     return sum(result.points for result in results)
+
+
+def movement_score(results: list[RuleResult]) -> int:
+    """Score de signal = points des seules règles de MOUVEMENT (hors anomalies R6/R7).
+
+    Les règles d'anomalie orientent le verdict mais ne mesurent pas la force d'un
+    signal : leurs points ne doivent pas gonfler le score comparé au seuil.
+    """
+    return sum(result.points for result in results if result.orientation != "anomaly")
 
 
 def triggered_rules(results: list[RuleResult]) -> list[RuleResult]:

@@ -271,9 +271,14 @@ Après chaque collecte : toute règle R1, R2 ou R4 déclenchée envoie immédiat
 
 ### 6.4 Décision finale (à la collecte H-1)
 
-- `signal_score ≥ 6` **et** cohérence globale (pas de signaux contradictoires) → **`SIGNAL`** (avec sélection, marché, ligne, cote, justificatif).
-- Règles R6/R7 dominantes → **`ANOMALIE`** (à vérifier manuellement, pas une recommandation).
-- Sinon → **`NO_BET`** (défaut). Stocker quand même la sélection « pressentie » (celle au meilleur score partiel) pour l'évaluation des faux négatifs.
+Le **score de signal** ne compte que les points des règles de **mouvement (R1–R5)** ; les points d'anomalie (R6/R7) orientent le verdict mais ne gonflent pas le score. Arbitrage, dans l'ordre :
+
+1. **R7** déclenchée (contradiction spread/moneyline chez un book) → **`ANOMALIE`** : la cohérence globale est cassée, un tel dossier ne peut pas être un `SIGNAL` propre.
+2. Sinon, **score de mouvement ≥ 6** → **`SIGNAL`** (avec sélection, **marché déclencheur**, ligne, cote, justificatif). Si **R6** s'est aussi déclenchée, elle devient un **drapeau** joint au signal (« divergence bookmaker signalée ») — elle ne masque pas un signal fort.
+3. Sinon, **R6** seule → **`ANOMALIE`** (divergence à vérifier, sans signal de mouvement derrière).
+4. Sinon → **`NO_BET`** (défaut). Stocker quand même la sélection « pressentie » pour l'évaluation des faux négatifs.
+
+La **cote de référence du verdict** (`odds_at_verdict`, base du CLV) est celle du **marché qui a déclenché le signal** : le spread quand R1/R5 sont en jeu (cas dominant en basket), sinon le moneyline.
 
 ---
 
@@ -385,4 +390,6 @@ Une fonctionnalité est terminée quand : le code est testé (pytest vert), logg
 | 2026-07-15 | R7 V1 = contradiction de favori + garde-fous (écart proba ≥ 3 % **et** \|spread\| ≥ 1.5) | Peu de faux positifs, adapté à un déclencheur d'ANOMALIE. **Limite connue** : aveugle hors des matchs serrés. **Évolution V1.1** : comparer la proba moneyline à la proba implicite du spread via Φ(spread/σ), σ configurable par ligue (~11.5 NBA, à ajuster WNBA). |
 | 2026-07-15 | Consensus = **médiane** entre bookmakers | Robuste aux cotes aberrantes/périmées, contrairement à la moyenne. **Piste V2** : consensus pondéré par les *sharp books* (Pinnacle/Circa) qui mènent le marché — Pinnacle est en région `eu` (coût quota supplémentaire à arbitrer) ; le schéma stocke déjà le `bookmaker` par relevé, donc rien n'est perdu. |
 | 2026-07-15 | V1 : le verdict est enregistré sur le marché **h2h** (moneyline) de l'équipe pressentie | Fournit une cote concrète et quotable pour le CLV, même quand le signal vient du spread (les détails spread restent dans le `rationale`). **Évolution possible** : verdict porté sur le marché déclencheur (spread) avec sa ligne. |
+| 2026-07-15 | **Corrigé (revue temps 2)** : `odds_at_verdict` enregistrée sur le **marché déclencheur** (spread si R1/R5, sinon h2h) | Le CLV compare la cote au verdict à la cote de clôture du *même* marché ; enregistrer la cote h2h pour un signal spread mesurait le CLV du mauvais marché. Le verdict stocke désormais marché + ligne + cote médiane du marché signalé. |
+| 2026-07-15 | **Corrigé (revue temps 2)** : arbitrage anomalie/score = option 2 | Une anomalie ne prime plus en absolu. R7 (contradiction) reste bloquant ; un score de mouvement ≥ seuil donne SIGNAL même si R6 s'est déclenchée (R6 → drapeau) ; R6 seule sans signal → ANOMALIE. Les points R6/R7 sont exclus du score de mouvement (ils n'inflent plus le score). |
 | 2026-07-14 | Création du document (V1) | — |
