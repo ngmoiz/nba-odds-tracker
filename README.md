@@ -23,8 +23,8 @@ dans [CLAUDE.md](CLAUDE.md).
 | 1.3 | Analyseur : moteur de règles R1–R7 + verdict | ✅ |
 | 1.4 | Notificateur Telegram (envoi alertes + verdicts) | ✅ |
 | 1.5 | Bot d'écoute (boutons Telegram → positions) | ✅ |
-| 1.6 | Évaluateur (résultats, CLV, bilan quotidien) | ✅ (rapport hebdo à venir) |
-| 1.7 | docker-compose + cron | ⏳ à venir |
+| 1.6 | Évaluateur (résultats, CLV, bilan quotidien + rapport hebdo) | ✅ |
+| 1.7 | docker-compose + cron WSL2 | ✅ |
 
 Aujourd'hui, le collecteur interroge l'API, enregistre les relevés, l'analyseur
 écrit **alertes** et **verdicts** en base, le notificateur les **envoie sur
@@ -121,6 +121,64 @@ fichier jetable le temps d'une commande :
 ```bash
 DATABASE_PATH=/tmp/essai.db uv run python -m collector --sport basketball_wnba
 ```
+
+---
+
+## Docker (étape 1.7)
+
+L'outil est conteneurisé : une **image commune** pour tous les composants, avec un
+point d'entrée paramétré. Le bot d'écoute tourne en continu, les collecteurs et
+l'évaluateur sont lancés par cron.
+
+### Lancer le bot d'écoute (continu)
+
+```bash
+# Construit l'image et démarre le listener en arrière-plan
+docker compose up -d listener
+
+# Voir les logs
+docker compose logs -f listener
+
+# Arrêter
+docker compose down
+```
+
+### Lancer une collecte manuellement (one-shot)
+
+```bash
+docker compose run --rm collector
+# ou avec un sport différent :
+docker compose run --rm collector python -m collector --sport basketball_wnba
+```
+
+### Lancer l'évaluateur manuellement (one-shot)
+
+```bash
+docker compose run --rm evaluator
+```
+
+### Installer le cron WSL2
+
+Le script `scripts/setup_cron.sh` installe les jobs cron pour les collecteurs
+(5 collectes/jour) et l'évaluateur (matin + rapport hebdo le lundi) :
+
+```bash
+chmod +x scripts/setup_cron.sh
+./scripts/setup_cron.sh
+```
+
+Planning (heure locale Europe/Paris) :
+
+| Heure | Job |
+|---|---|
+| 09:00 | Collecte du matin (découverte + cotes d'ouverture) |
+| 09:30 | Évaluateur (bilan du matin + rapport hebdo le lundi) |
+| 15:00 | Collecte après-midi (relevé intermédiaire) |
+| 18:00 | Collecte H-6 |
+| 21:00 | Collecte H-3 |
+| 23:00 | Collecte H-1 (fenêtre de décision) |
+
+Pour désinstaller les jobs : `crontab -l | grep -v 'nba-odds-tracker' | crontab -`
 
 ---
 

@@ -1,0 +1,33 @@
+# Exclut du contexte de build Docker tout ce qui n'est pas nécessaire
+# à l'image de production (build plus rapide, image plus légère).
+
+# Environnement virtuel et caches (déjà recréés dans le conteneur par uv sync)
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Tests : non nécessaires en production (image sans --dev)
+tests/
+
+# Données locales (base SQLite, secrets)
+data/
+*.db
+*.sqlite
+*.sqlite3
+.env
+
+# Git et IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+.claude/
+.DS_Store
+
+# Documentation (pas utile dans le conteneur)
+README.md
+CLAUDE.md

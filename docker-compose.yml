@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────
+# docker-compose.yml — NBA Odds Tracker (étape 1.7)
+#
+# Orchestration locale des composants. Deux types de services :
+#
+# 1. **Bot d'écoute** (long-running) : tourne en continu, écoute les clics
+#    Telegram. `restart: unless-stopped` le relance automatiquement.
+#
+# 2. **Collecteur + évaluateur** (one-shot) : lancés par cron WSL2 via
+#    `docker compose run --rm`. Ils s'exécutent, font leur travail, puis
+#    s'arrêtent. Pas de `restart` : ce ne sont pas des démons.
+#
+# Volume partagé : `./data` monté dans `/app/data` → la base SQLite est
+# partagée entre tous les composants et persiste entre les exécutions.
+#
+# Fichier `.env` : chargé automatiquement par docker-compose (secrets).
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ───────────── Bot d'écoute (processus continu) ─────────────
+  listener:
+    build: .
+    container_name: nba-listener
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - nba-data:/app/data
+    command: ["python", "-m", "listener"]
+
+  # ───────────── Collecteur (one-shot, lancé par cron) ─────────────
+  # Pas de `restart` : lancé manuellement ou par cron via
+  # `docker compose run --rm collector` puis s'arrête.
+  collector:
+    build: .
+    container_name: nba-collector
+    env_file: .env
+    volumes:
+      - nba-data:/app/data
+    command: ["python", "-m", "collector"]
+    # Pas de restart : one-shot.
+
+  # ───────────── Évaluateur (one-shot, lancé par cron) ─────────────
+  evaluator:
+    build: .
+    container_name: nba-evaluator
+    env_file: .env
+    volumes:
+      - nba-data:/app/data
+    command: ["python", "-m", "evaluator"]
+    # Pas de restart : one-shot.
+
+# Volume nommé : la base SQLite persiste entre les exécutions des
+# one-shots et le listener. Monté dans /app/data (DATABASE_PATH par défaut).
+volumes:
+  nba-data:
