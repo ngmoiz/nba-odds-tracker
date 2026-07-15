@@ -99,6 +99,42 @@ def test_single_book_consensus_equals_book():
     assert point.n_books == 1
 
 
+def test_demargin_totals_sum_to_one():
+    """Le dé-margeage s'applique aussi aux totals : Over + Under = 100 %."""
+    data = preprocess_rows("m", fx.totals("dk", 210.5, 1.91, 1.91))
+    over = _quote(data, "dk", "totals", "Over", fx.T[0])
+    under = _quote(data, "dk", "totals", "Under", fx.T[0])
+    assert over.prob == pytest.approx(0.5)
+    assert over.prob + under.prob == pytest.approx(1.0)
+
+
+def test_demargin_spreads_both_sides_sum_to_one():
+    """Le dé-margeage s'applique aux deux côtés du spread : Home + Away = 100 %."""
+    data = preprocess_rows("m", fx.spreads("dk", "Home", "Away", -3.5, 1.95, 1.87))
+    home = _quote(data, "dk", "spreads", "Home", fx.T[0])
+    away = _quote(data, "dk", "spreads", "Away", fx.T[0])
+    assert home.prob + away.prob == pytest.approx(1.0)
+
+
+def test_consensus_median_ignores_outlier_book():
+    """Un book aberrant (cote périmée/erronée) est ignoré par la médiane.
+
+    C'est la raison d'être du choix médiane vs moyenne : ici la moyenne serait
+    tirée à ~0.56, la médiane reste à ~0.50.
+    """
+    rows = (
+        fx.h2h("a", "Home", "Away", 1.90, 1.90)          # ~0.500
+        + fx.h2h("b", "Home", "Away", 1.88, 1.92)         # ~0.505
+        + fx.h2h("c", "Home", "Away", 1.92, 1.88)         # ~0.495
+        + fx.h2h("d", "Home", "Away", 1.90, 1.90)         # ~0.500
+        + fx.h2h("aberrant", "Home", "Away", 1.20, 4.50)  # ~0.790 (aberrant)
+    )
+    data = preprocess_rows("m", rows)
+    point = data.consensus_series("h2h", "Home")[0]
+    assert point.n_books == 5
+    assert point.prob == pytest.approx(0.50, abs=0.01)  # l'aberrant n'influence pas la médiane
+
+
 def test_preprocess_from_database(tmp_path):
     """Le chemin base de données charge et prétraite correctement les relevés."""
     db_path = tmp_path / "test.db"
