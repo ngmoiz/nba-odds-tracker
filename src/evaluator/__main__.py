@@ -8,10 +8,12 @@ les résultats officiels (balldontlie), calcule CLV, et envoie le bilan Telegram
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from common.config import load_config, load_settings
 from common.db import get_connection, init_db
 from common.logging_config import configure_logging, get_logger
-from evaluator.evaluator import evaluate_pending
+from evaluator.evaluator import evaluate_pending, run_weekly_report
 
 
 def main() -> None:
@@ -27,8 +29,15 @@ def main() -> None:
     init_db(settings.database_path)
     conn = get_connection(settings.database_path)
     try:
+        now = datetime.now(timezone.utc)
         logger.info("Démarrage de l'évaluation des matchs clos.")
-        evaluate_pending(conn, settings, config)
+        evaluate_pending(conn, settings, config, now=now)
+
+        # Rapport hebdomadaire le lundi matin (en plus du bilan quotidien).
+        weekly_weekday = config["evaluator"].get("weekly_report_weekday", 0)
+        if now.weekday() == weekly_weekday:
+            logger.info("Lundi : envoi du rapport hebdomadaire en plus du bilan.")
+            run_weekly_report(conn, settings, config, now=now)
     finally:
         conn.close()
 
