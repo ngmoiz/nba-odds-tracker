@@ -7,7 +7,7 @@
 
 # --- Source de données : The Odds API (section 4.1) ---
 api:
-  sport: basketball_nba       # sport suivi (paramétrable pour V2, pas une constante)
+  sport: basketball_wnba      # sport suivi (paramétrable pour V2, pas une constante)
   region: us                  # région des bookmakers
   markets:                    # marchés collectés (coût quota = nb marchés × nb régions)
     - h2h                     # moneyline (vainqueur sec)

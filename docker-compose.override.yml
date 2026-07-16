@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────
+# docker-compose.override.yml — Surcharge automatique en dev (local)
+#
+# Docker Compose fusionne ce fichier avec docker-compose.yml automatiquement
+# quand on lance `docker compose up` (sans -f). En prod, on lance avec
+# `docker compose -f docker-compose.yml up` pour ignorer cet override.
+#
+# Différence dev vs prod :
+# - Dev  : bind mount (./data:/app/data) → la base SQLite est visible
+#          directement sur ton PC, inspectable avec `sqlite3 data/nba_odds.db`.
+# - Prod : volume nommé (nba-data) → isolé, géré par Docker.
+# ─────────────────────────────────────────────────────────────
+
+services:
+  listener:
+    volumes:
+      - ./data:/app/data
+
+  collector:
+    volumes:
+      - ./data:/app/data
+
+  evaluator:
+    volumes:
+      - ./data:/app/data
