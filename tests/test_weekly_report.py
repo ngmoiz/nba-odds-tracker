@@ -19,13 +19,10 @@ from pathlib import Path
 
 import pytest
 
-from common import db
 from common.config import Settings
 from common.db import get_connection, init_db
 from evaluator.evaluator import run_weekly_report
 from evaluator.weekly import (
-    NoBetStats,
-    SignalStats,
     aggregate_nobet,
     aggregate_signal_by_market,
     aggregate_signal_by_rule,

@@ -24,6 +24,7 @@ quota:
   monthly_credits: 500        # plafond du plan gratuit
   cost_per_collection: 3      # 3 marchés × 1 région
   target_collections_per_day: 5
+  reserve: 50                 # garde de réserve : skip des collectes non essentielles sous ce seuil
 
 # --- Planning de collecte (section 4.3) ---
 # Les fenêtres H-x sont calées sur l'heure de tip-off, pas sur des heures fixes.
@@ -70,7 +71,7 @@ rules:
 # --- Décision finale à H-1 (section 6.4) ---
 decision:
   signal_score_threshold: 6   # score ≥ 6 ET cohérence globale → SIGNAL
-  window_hours: 1.5           # verdict produit si le tip-off est dans cette fenêtre
+  window_hours: 2.0           # verdict produit si le tip-off est dans cette fenêtre (borne inclusive)
 
 # --- Notificateur Telegram (section 7) ---
 # Le notificateur lit les alertes/verdicts non envoyés en base et les pousse sur

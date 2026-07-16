@@ -101,6 +101,13 @@ CREATE TABLE IF NOT EXISTS evaluations (
     evaluated_at TEXT NOT NULL
 );
 
+-- Métadonnées du projet (quota persisté, état de la garde de réserve, etc.).
+-- Clé-valeur simple : évite une table dédiée par méta-donnée.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 -- Index pour accélérer les requêtes fréquentes.
 CREATE INDEX IF NOT EXISTS idx_snapshots_match        ON odds_snapshots(match_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_match_market ON odds_snapshots(match_id, market);
@@ -590,3 +597,36 @@ def get_weekly_nobet_evals(conn: sqlite3.Connection, since_iso: str) -> list[sql
         "ORDER BY e.evaluated_at",
         (since_iso,),
     ).fetchall()
+
+
+# ─────────────────── Métadonnées et collectes conditionnelles ───────────────────
+
+
+def has_active_matches(conn: sqlite3.Connection) -> bool:
+    """Vrai s'il existe au moins un match en statut actif (DECOUVERT/SUIVI/DECIDE).
+
+    Sert au collecteur conditionnel : si aucun match n'est suivi, la collecte est
+    sautée (zéro crédit API consommé). Le créneau du matin reste inconditionnel car
+    l'API peut renvoyer de nouveaux matchs non encore en base.
+    """
+    placeholders = ",".join("?" * len(ACTIVE_STATUSES))
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM matches WHERE status IN ({placeholders})",
+        ACTIVE_STATUSES,
+    ).fetchone()
+    return row["n"] > 0
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    """Récupère une valeur de la table `meta`, ou None si absente."""
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Insère ou met à jour une valeur dans la table `meta` (upsert)."""
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )

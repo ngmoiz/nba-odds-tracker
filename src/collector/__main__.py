@@ -1,11 +1,16 @@
 """Point d'entrée du collecteur.
 
 Usage :
-    uv run python -m collector                        # sport de config.yaml (NBA)
-    uv run python -m collector --sport basketball_wnba  # surcharge ponctuelle
+    uv run python -m collector                        # collecte conditionnelle (sport de config.yaml)
+    uv run python -m collector --morning              # collecte inconditionnelle (créneau du matin)
+    uv run python -m collector --sport basketball_wnba  # surcharge ponctuelle du sport
 
 La surcharge `--sport` permet de tester sur un sport en cours (ex. WNBA l'été)
 sans modifier config.yaml : la cible par défaut du projet reste la NBA.
+
+`--morning` force la collecte même si aucun match actif n'est en base (découverte
+de nouveaux matchs) et n'est pas soumis à la garde de réserve. Les autres créneaux
+sont conditionnels : skip si aucun match actif ou si la réserve est sous le seuil.
 """
 from __future__ import annotations
 
@@ -26,6 +31,11 @@ def main() -> None:
         "--sport",
         help="Surcharge le sport de config.yaml (ex. basketball_wnba).",
     )
+    parser.add_argument(
+        "--morning",
+        action="store_true",
+        help="Collecte inconditionnelle (créneau du matin : découverte + exempté de la garde de réserve).",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
@@ -34,7 +44,9 @@ def main() -> None:
     logger = get_logger("collector")
 
     sport = args.sport or config["api"]["sport"]
-    logger.info("Démarrage de la collecte pour le sport : %s", sport)
+    force = args.morning
+    logger.info("Démarrage de la collecte %s pour le sport : %s",
+                "inconditionnelle (matin)" if force else "conditionnelle", sport)
 
     # Garantit que le schéma existe (idempotent) : le collecteur peut tourner
     # sur une base neuve sans dépendre d'un lancement préalable de init_db.
@@ -50,11 +62,11 @@ def main() -> None:
             odds_format=config["api"]["odds_format"],
         )
         with client:
-            run_collection(conn, client, sport)
-        # L'analyseur tourne immédiatement après la collecte (alertes + verdict H-1).
-        analyze_open_matches(conn, config)
-        # Puis le notificateur pousse sur Telegram ce que l'analyseur vient d'écrire.
-        notify_pending(conn, settings, config)
+            result = run_collection(conn, client, sport, config, force=force, settings=settings)
+        # L'analyseur et le notificateur ne tournent que si la collecte a eu lieu.
+        if not result.get("skipped"):
+            analyze_open_matches(conn, config)
+            notify_pending(conn, settings, config)
     finally:
         conn.close()
 

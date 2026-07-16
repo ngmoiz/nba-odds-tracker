@@ -1,6 +1,9 @@
 # Secrets — ne JAMAIS commiter (règle 0.4.1)
 .env
 
+# Logs (sorties cron, perdus au reboot si dans /tmp — conservés dans le projet)
+logs/
+
 # Base de données SQLite (données locales, jamais versionnées)
 data/
 *.db

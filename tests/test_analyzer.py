@@ -62,3 +62,27 @@ def test_no_verdict_outside_decision_window(tmp_path):
     assert conn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"] == "SUIVI"
     assert summary["alerts"] >= 1
     conn.close()
+
+
+def test_verdict_at_exact_window_boundary(tmp_path):
+    """Tip-off exactement a now + window_hours (2.0h) -> dans la fenetre (borne inclusive <=)."""
+    tipoff = (NOW + timedelta(hours=2, seconds=0)).isoformat()
+    conn = _setup(tmp_path, tipoff)
+
+    summary = analyze_open_matches(conn, CFG, NOW)
+
+    assert summary["verdicts"] == 1
+    assert conn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"] == "DECIDE"
+    conn.close()
+
+
+def test_no_verdict_just_beyond_window(tmp_path):
+    """Tip-off a now + window_hours + 1s -> hors fenetre (strictement au-dela de la borne)."""
+    tipoff = (NOW + timedelta(hours=2, seconds=1)).isoformat()
+    conn = _setup(tmp_path, tipoff)
+
+    summary = analyze_open_matches(conn, CFG, NOW)
+
+    assert summary["verdicts"] == 0
+    assert conn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"] == "SUIVI"
+    conn.close()
