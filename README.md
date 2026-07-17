@@ -345,3 +345,25 @@ Budget cible : ~5 collectes/jour ≈ 450 crédits/mois, sur les 500 du plan grat
 Les données sont testées **sans consommer de quota** grâce à des relevés simulés
 ([tests/fixtures.py](tests/fixtures.py)) : chaque règle a son scénario déterministe.
 Le moteur de règles est le composant le plus couvert (tests obligatoires).
+
+---
+
+## Rituel de déploiement (après modification du code)
+
+Après tout changement de code, appliquer les **trois gestes impératifs** — sans
+raccourci, sans analyse d'impact (le rituel vaut par son inconditionnalité) :
+
+1. **Rebuilder l'image** (tous les services partagent la même image) :
+   ```bash
+   docker compose build
+   ```
+2. **Recréer le conteneur long-running** (listener) :
+   ```bash
+   docker compose up -d --force-recreate listener
+   ```
+3. **Vérifier post-déploiement** : régénérer une alerte depuis la base réelle avec
+   le nouveau code et confirmer que le format attendu est produit.
+
+> Le raccourci « pas besoin de rebuilder, c'est juste du formatage » a coûté une nuit
+> d'alertes à l'ancien format (17/07) : le cron tourne sur l'image Docker, pas sur le
+> disque. Sans rebuild, le code nouveau n'entre jamais en production.

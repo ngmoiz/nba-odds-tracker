@@ -571,3 +571,52 @@ def test_format_movement_proba_at_exact_boundary():
     assert "hausse" in detail
     assert "l'argent va vers Home" in detail
     assert "quasi stable" not in detail
+
+
+# ─────────────────── Formatage totals : ligne avant → après ───────────────────
+
+def test_format_movement_totals_with_line():
+    """totals : la ligne du total est affichée avant → après (ex. « ligne 163,5 → 162,5 »).
+
+    Défaut de complétude constaté en réel : les alertes totals n'affichaient pas
+    la ligne, contrairement aux spreads. La donnée existe dans ConsensusPoint.line.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[0],
+        line=163.5, prob=0.500, odds=1.91, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[1],
+        line=162.5, prob=0.520, odds=1.85, n_books=1,  # ligne baisse, proba hausse
+    )
+    detail = _format_movement(
+        _data(fx.totals("dk", 163.5, 1.91, 1.91, fx.T[0]) + fx.totals("dk", 162.5, 1.85, 1.97, fx.T[1])),
+        "totals", "Over", before, after, "test",
+    )
+    assert "ligne 163,5 → 162,5" in detail
+    assert "📈 hausse" in detail
+    assert "l'argent va vers l'Over" in detail
+
+
+def test_format_movement_totals_line_stable():
+    """totals : ligne stable → « ligne 162,5 » sans flèche (pas de mouvement de ligne)."""
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[0],
+        line=162.5, prob=0.500, odds=1.91, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[1],
+        line=162.5, prob=0.520, odds=1.85, n_books=1,  # ligne stable, proba hausse
+    )
+    detail = _format_movement(
+        _data(fx.totals("dk", 162.5, 1.91, 1.91, fx.T[0]) + fx.totals("dk", 162.5, 1.85, 1.97, fx.T[1])),
+        "totals", "Over", before, after, "test",
+    )
+    assert "ligne 162,5" in detail
+    assert "→" not in detail.split("ligne")[1].split(",")[0]  # pas de flèche après "ligne 162,5"

@@ -189,7 +189,16 @@ def _format_movement(
         else:
             emoji, direction = "📉", "baisse"
             target = _opponent(data, market, selection)
-        parts.append(f"{emoji} {direction}")
+        # Pour totals, afficher la ligne avant → après (ex. « ligne 163,5 → 162,5 »).
+        if market == "totals" and before.line is not None and after.line is not None:
+            if abs(after.line - before.line) < _EPS:
+                parts.append(f"{emoji} {direction} : ligne {_fr_num(before.line)}")
+            else:
+                parts.append(
+                    f"{emoji} {direction} : ligne {_fr_num(before.line)} → {_fr_num(after.line)}"
+                )
+        else:
+            parts.append(f"{emoji} {direction}")
 
     # Cote médiane avant → après (médiane des books US).
     parts.append(f"cote méd. {_fr_num(before.odds, 2)} → {_fr_num(after.odds, 2)}")
