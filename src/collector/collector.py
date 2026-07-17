@@ -212,6 +212,12 @@ def run_collection(
     now = datetime.now(timezone.utc)
     snapshot_at = now.isoformat()
 
+    # --- Clôture en tête de traitement : passe en CLOS les matchs dont le tip-off
+    # est passé AVANT de stocker les snapshots. Sans cela, l'API renvoie encore des
+    # matchs en cours (cotes live) qui seraient stockés en violation de la règle
+    # « CLOS au tip-off, plus aucune collecte » (bug révélé par la simulation du 17/07).
+    closed = db.close_finished_matches(conn, now)
+
     events = client.get_odds()
     credits = getattr(client, "credits_remaining", None) or "?"
     cost = getattr(client, "last_request_cost", None) or "?"
@@ -222,6 +228,16 @@ def run_collection(
 
     discovered = newly_tracked = snapshots = 0
     for event in events:
+        # Garde tip-off : exclut tout match dont le tip-off est passé. L'API peut
+        # encore renvoyer des matchs en cours (cotes live) — on ne les stocke pas.
+        tipoff = datetime.fromisoformat(event.commence_time.replace("Z", "+00:00"))
+        if tipoff <= now:
+            logger.info(
+                "Match %s ignoré : tip-off passé (%s), cotes live non stockées.",
+                event.id, event.commence_time,
+            )
+            continue
+
         existing = db.get_match(conn, event.id)
         if existing is None:
             # Nouveau match : on l'enregistre et ce premier relevé = cotes d'ouverture.
@@ -246,8 +262,6 @@ def run_collection(
             newly_tracked += 1
 
         snapshots += _record_snapshots(conn, event, snapshot_at)
-
-    closed = db.close_finished_matches(conn, now)
 
     # Persiste le quota rafraîchi pour la garde de réserve.
     if config is not None:

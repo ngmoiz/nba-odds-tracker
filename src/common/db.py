@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     rule        TEXT NOT NULL,
     details     TEXT,
     created_at  TEXT NOT NULL,
-    notified_at TEXT                       -- horodatage d'envoi Telegram ; NULL = en attente
+    notified_at TEXT,                      -- horodatage d'envoi Telegram ; NULL = en attente
+    state_key   TEXT                        -- clé de déduplication (sélection + direction)
 );
 
 -- Verdicts finaux (décision H-1).
@@ -204,6 +205,7 @@ def init_db(db_path: Path) -> None:
         conn.executescript(SCHEMA)
         # Bases créées avant l'étape 1.4 : ajout de la colonne de suivi des envois.
         _ensure_column(conn, "alerts", "notified_at", "TEXT")
+        _ensure_column(conn, "alerts", "state_key", "TEXT")
         _ensure_column(conn, "verdicts", "notified_at", "TEXT")
         # Base créée avant l'étape 1.5 : ajout de l'action du clic (take/pass).
         # DEFAULT 'take' uniquement pour d'éventuelles lignes préexistantes (aucune en
@@ -291,12 +293,33 @@ def insert_alert(
     rule: str,
     details: str,
     created_at: str,
+    state_key: str = "",
 ) -> None:
-    """Enregistre une alerte temps réel émise par l'analyseur."""
+    """Enregistre une alerte temps réel émise par l'analyseur.
+
+    ``state_key`` encode la sélection et la direction du mouvement : il sert à la
+    déduplication par changement d'état (l'analyseur vérifie avant d'insérer).
+    """
     conn.execute(
-        "INSERT INTO alerts (match_id, rule, details, created_at) VALUES (?, ?, ?, ?)",
-        (match_id, rule, details, created_at),
+        "INSERT INTO alerts (match_id, rule, details, created_at, state_key) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (match_id, rule, details, created_at, state_key),
     )
+
+
+def get_last_alert_state(conn: sqlite3.Connection, match_id: str, rule: str) -> str | None:
+    """Renvoie le ``state_key`` de la dernière alerte d'un match/règle, ou None.
+
+    Sert à la déduplication : si le nouvel état est identique au précédent,
+    l'analyseur n'insère pas de nouvelle alerte (même mouvement, déjà notifié).
+    """
+    row = conn.execute(
+        "SELECT state_key FROM alerts "
+        "WHERE match_id = ? AND rule = ? AND state_key IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (match_id, rule),
+    ).fetchone()
+    return row["state_key"] if row else None
 
 
 def insert_verdict(

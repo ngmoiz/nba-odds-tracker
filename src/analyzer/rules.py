@@ -12,10 +12,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from analyzer.preprocessing import MatchData
+from analyzer.preprocessing import ConsensusPoint, MatchData
 
 # Tolérance pour distinguer un vrai mouvement du bruit numérique (probas, lignes).
 _EPS = 1e-9
+
+# Seuils métier de « mouvement négligeable » (quasi stable) : en dessous, un mouvement
+# est réel (au-dessus du bruit flottant _EPS) mais pas actionnable — c'est du bruit
+# d'équilibrage de book, pas de l'argent informé. La conclusion « l'argent va vers »
+# n'a de sens que pour un mouvement significatif. Configurables dans config.yaml.
+_NEGLIGIBLE_PROBA = 0.002   # 0,2 pt de proba (h2h/totals)
+_NEGLIGIBLE_LINE = 0.25     # 0,25 pt de ligne (spreads)
 
 
 @dataclass(frozen=True)
@@ -27,6 +34,7 @@ class RuleResult:
     points: int          # points ajoutés au score (0 si non déclenchée)
     detail: str          # justificatif lisible (pour l'alerte / le verdict)
     orientation: str = "signal"  # "signal" ou "anomaly" (R6/R7)
+    state_key: str = ""  # clé de déduplication (sélection + direction) pour les alertes
 
 
 def _parse_time(value: str) -> datetime:
@@ -61,6 +69,152 @@ def _longest_monotonic_run(values: list[float]) -> int:
     return best
 
 
+# ─────────────────── Helpers de formatage des mouvements ───────────────────
+# Les données existent dans les séries de consensus (ConsensusPoint) : ces helpers
+# ne font que du **formatage** — aucun nouveau calcul de règle. Ils enrichissent
+# le `detail` de chaque règle, qui alimente à la fois les alertes (format_alert)
+# et le justificatif du verdict (_rationale).
+
+def _fr_num(value: float, decimals: int = 1) -> str:
+    """Formate un nombre à la française (virgule décimale)."""
+    return f"{value:.{decimals}f}".replace(".", ",")
+
+
+def _fr_signed(value: float, decimals: int = 1) -> str:
+    """Formate un nombre signé à la française (ex. '+2,0', '-5,0')."""
+    return f"{value:+.{decimals}f}".replace(".", ",")
+
+
+def _opponent(data: MatchData, market: str, selection: str) -> str | None:
+    """L'autre issue d'un marché à deux issues (équipe adverse ou Over/Under)."""
+    others = [s for s in data.selections(market) if s != selection]
+    return others[0] if others else None
+
+
+def _state_key(market: str, selection: str, before: ConsensusPoint,
+                after: ConsensusPoint, amplitude: str = "") -> str:
+    """Clé de déduplication canonique (format machine, point décimal).
+
+    Format : ``market/selection|signe|ampleur`` où ampleur est spécifique à la règle :
+    - R1 : ligne arrondie à 1 décimale (ex. ``-5.0``) ;
+    - R2 : palier de proba en % entier (ex. ``58``) ;
+    - R4 : nombre de books synchronisés (ex. ``9``).
+
+    Deux alertes de la même règle sur le même match avec le même `state_key` sont
+    considérées comme le même état → la seconde est supprimée. Un changement
+    d'ampleur (approfondissement de ligne, renforcement de synchro) change la clé
+    → nouvelle alerte émise.
+    """
+    if market == "spreads" and before.line is not None and after.line is not None:
+        sign = _direction(after.line - before.line)
+    else:
+        sign = _direction(after.prob - before.prob)
+    return f"{market}/{selection}|{sign}|{amplitude}"
+
+
+def parse_state_key(state_key: str) -> dict:
+    """Parse un `state_key` canonique → dict {market, selection, sign, amplitude}.
+
+    Round-trip avec `_state_key` : ``parse_state_key(_state_key(...))`` retrouve les
+    composantes. La sélection peut contenir des espaces (ex. ``Portland Fire``).
+    """
+    # Format : market/selection|sign|amplitude — mais selection peut contenir des /
+    # et des espaces. On split sur | (qui n'apparaît pas dans market/selection).
+    parts = state_key.split("|")
+    if len(parts) < 3:
+        return {"market": "", "selection": "", "sign": 0, "amplitude": ""}
+    market_selection, sign_str, amplitude = parts[0], parts[1], parts[2]
+    # market_selection = "market/selection" — split sur le premier /
+    slash_idx = market_selection.find("/")
+    if slash_idx == -1:
+        return {"market": "", "selection": "", "sign": 0, "amplitude": ""}
+    return {
+        "market": market_selection[:slash_idx],
+        "selection": market_selection[slash_idx + 1:],
+        "sign": int(sign_str) if sign_str.lstrip("-").isdigit() else 0,
+        "amplitude": amplitude,
+    }
+
+
+def _format_movement(
+    data: MatchData,
+    market: str,
+    selection: str,
+    before: ConsensusPoint,
+    after: ConsensusPoint,
+    temporal_ref: str,
+    negligible_prob: float = _NEGLIGIBLE_PROBA,
+    negligible_line: float = _NEGLIGIBLE_LINE,
+) -> str:
+    """Construit le détail lisible d'un mouvement de consensus (3 tiers).
+
+    Affiche : direction explicite (📉 baisse / 📈 hausse sur la sélection observée),
+    ligne (spreads) avant → après, cote médiane avant → après, variation de probabilité
+    dé-margée en **points de proba** (pas % de cote), référence temporelle, et la
+    conclusion « l'argent va vers [cible] ».
+
+    Trois tiers de lisibilité (la conclusion directionnelle n'a de sens que pour un
+    mouvement significatif) :
+    - **stable** : |δ| < _EPS (bruit flottant, before == after) → « mouvement consensus négligeable » ;
+    - **quasi stable** : mouvement réel mais sous le seuil métier (proba < 0,2 pt ou
+      ligne < 0,25 pt) → « quasi stable » (ampleur affichée, pas de conclusion) ;
+    - **directionnel** : au-dessus du seuil métier → « 📉 baisse / 📈 hausse, l'argent va vers… ».
+    """
+    parts: list[str] = []
+
+    if market == "spreads" and before.line is not None and after.line is not None:
+        delta_line = after.line - before.line
+        abs_delta = abs(delta_line)
+        if abs_delta < _EPS:
+            emoji, direction, target = "→", "stable", None
+        elif abs_delta < negligible_line:
+            emoji, direction, target = "≈", "quasi stable", None
+        elif delta_line < -_EPS:
+            emoji, direction, target = "📉", "baisse", selection
+        else:
+            emoji, direction = "📈", "hausse"
+            target = _opponent(data, market, selection)
+        parts.append(
+            f"{emoji} {direction} : ligne {_fr_signed(before.line)} → {_fr_signed(after.line)}"
+        )
+    else:
+        delta_prob = after.prob - before.prob
+        abs_delta = abs(delta_prob)
+        if abs_delta < _EPS:
+            emoji, direction, target = "→", "stable", None
+        elif abs_delta < negligible_prob:
+            emoji, direction, target = "≈", "quasi stable", None
+        elif delta_prob > _EPS:
+            emoji, direction, target = "📈", "hausse", selection
+        else:
+            emoji, direction = "📉", "baisse"
+            target = _opponent(data, market, selection)
+        parts.append(f"{emoji} {direction}")
+
+    # Cote médiane avant → après (médiane des books US).
+    parts.append(f"cote méd. {_fr_num(before.odds, 2)} → {_fr_num(after.odds, 2)}")
+
+    # Variation de probabilité dé-margée en points de proba (pas % de cote).
+    d_prob_pts = (after.prob - before.prob) * 100
+    parts.append(f"Δproba {_fr_signed(d_prob_pts, 1)} pts")
+
+    # Référence temporelle.
+    parts.append(f"({temporal_ref})")
+
+    # Conclusion directionnelle (sauf stable / quasi stable).
+    if target is not None:
+        if market == "totals":
+            parts.append(f"l'argent va vers l'{target}")
+        else:
+            parts.append(f"l'argent va vers {target}")
+    elif "quasi stable" in (p for p in parts):
+        parts.append("mouvement consensus quasi stable")
+    else:
+        parts.append("mouvement consensus négligeable")
+
+    return ", ".join(parts)
+
+
 # ─────────────────────────────── Règles ───────────────────────────────
 
 def evaluate_r1(data: MatchData, config: dict) -> RuleResult:
@@ -78,11 +232,20 @@ def evaluate_r1(data: MatchData, config: dict) -> RuleResult:
             best_move, best_selection = move, selection
 
     triggered = best_move >= threshold
+    state_key = ""
     if best_selection is None:
         detail = "aucune donnée spread exploitable"
     else:
-        detail = f"spread {best_selection} : {best_move:.1f} pt de mouvement depuis l'ouverture"
-    return RuleResult("R1", triggered, score if triggered else 0, detail)
+        series = data.consensus_series("spreads", best_selection)
+        negligible_line = config["rules"].get("movement_negligible_line", _NEGLIGIBLE_LINE)
+        movement = _format_movement(
+            data, "spreads", best_selection, series[0], series[-1], "depuis l'ouverture",
+            negligible_line=negligible_line,
+        )
+        detail = f"spread {best_selection} : {movement}"
+        amplitude = f"{series[-1].line:.1f}"
+        state_key = _state_key("spreads", best_selection, series[0], series[-1], amplitude)
+    return RuleResult("R1", triggered, score if triggered else 0, detail, state_key=state_key)
 
 
 def evaluate_r2(data: MatchData, config: dict) -> RuleResult:
@@ -100,11 +263,16 @@ def evaluate_r2(data: MatchData, config: dict) -> RuleResult:
                     elapsed = _parse_time(series[j].snapshot_at) - _parse_time(series[i].snapshot_at)
                     move = abs(series[j].prob - series[i].prob)
                     if elapsed <= window and move >= threshold:
-                        detail = (
-                            f"steam {market}/{selection} : Δproba {move:.1%} "
-                            f"en {elapsed} (≤ {params['window_hours']} h)"
+                        negligible_prob = config["rules"].get("movement_negligible_prob", _NEGLIGIBLE_PROBA)
+                        movement = _format_movement(
+                            data, market, selection, series[i], series[j],
+                            f"fenêtre ≤ {params['window_hours']} h",
+                            negligible_prob=negligible_prob,
                         )
-                        return RuleResult("R2", True, score, detail)
+                        detail = f"steam {market}/{selection} : {movement}"
+                        amplitude = f"{round(series[j].prob * 100)}"
+                        state_key = _state_key(market, selection, series[i], series[j], amplitude)
+                        return RuleResult("R2", True, score, detail, state_key=state_key)
     return RuleResult("R2", False, 0, "aucun steam move détecté")
 
 
@@ -123,7 +291,13 @@ def evaluate_r3(data: MatchData, config: dict) -> RuleResult:
                 continue
             run = _longest_monotonic_run(values)
             if run >= need:
-                detail = f"tendance {market}/{selection} : {run} relevés consécutifs même sens"
+                negligible_prob = config["rules"].get("movement_negligible_prob", _NEGLIGIBLE_PROBA)
+                negligible_line = config["rules"].get("movement_negligible_line", _NEGLIGIBLE_LINE)
+                movement = _format_movement(
+                    data, market, selection, series[0], series[-1], "depuis l'ouverture",
+                    negligible_prob=negligible_prob, negligible_line=negligible_line,
+                )
+                detail = f"tendance {market}/{selection} : {movement}, {run} relevés consécutifs même sens"
                 return RuleResult("R3", True, score, detail)
     return RuleResult("R3", False, 0, "aucune tendance soutenue")
 
@@ -149,8 +323,22 @@ def evaluate_r4(data: MatchData, config: dict) -> RuleResult:
                     down += 1
             synced = max(up, down)
             if synced >= need:
-                detail = f"synchro {market}/{selection} : {synced} bookmakers dans le même sens"
-                return RuleResult("R4", True, score, detail)
+                consensus = data.consensus_series(market, selection)
+                if len(consensus) >= 2:
+                    negligible_prob = config["rules"].get("movement_negligible_prob", _NEGLIGIBLE_PROBA)
+                    negligible_line = config["rules"].get("movement_negligible_line", _NEGLIGIBLE_LINE)
+                    movement = _format_movement(
+                        data, market, selection, consensus[0], consensus[-1], "fenêtre récente",
+                        negligible_prob=negligible_prob, negligible_line=negligible_line,
+                    )
+                else:
+                    movement = "consensus indisponible"
+                detail = f"synchro {market}/{selection} : {synced} bookmakers dans le même sens ; {movement}"
+                if len(consensus) >= 2:
+                    state_key = _state_key(market, selection, consensus[0], consensus[-1], str(synced))
+                else:
+                    state_key = ""
+                return RuleResult("R4", True, score, detail, state_key=state_key)
     return RuleResult("R4", False, 0, "pas de synchronisation multi-bookmakers")
 
 

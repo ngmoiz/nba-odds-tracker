@@ -16,7 +16,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from analyzer.preprocessing import preprocess
-from analyzer.rules import ALERT_RULES, ALL_RULES
+from analyzer.rules import ALERT_RULES, ALL_RULES, parse_state_key
 from analyzer.scoring import evaluate_rules, movement_score
 from analyzer.verdict import DECISION_LOGIC_VERSION, Verdict, decide
 from common import db
@@ -35,9 +35,25 @@ def _in_decision_window(tipoff_utc: str, now: datetime, config: dict) -> bool:
     return timedelta(0) < (tipoff - now) <= window
 
 
+def _tipoff_passed(tipoff_utc: str, now: datetime) -> bool:
+    """Vrai si le tip-off est passé (now ≥ tipoff). Garde délibérée contre les alertes live."""
+    tipoff = datetime.fromisoformat(tipoff_utc.replace("Z", "+00:00"))
+    return now >= tipoff
+
+
 def analyze_match(conn: sqlite3.Connection, match: sqlite3.Row, config: dict, now: datetime) -> dict:
-    """Analyse un match : alertes temps réel + verdict si dans la fenêtre de décision."""
+    """Analyse un match : alertes temps réel + verdict si dans la fenêtre de décision.
+
+    Garde tip-off : si le tip-off est passé, on n'émet ni alerte ni verdict/re-décision.
+    Cette protection est **délibérée** (bug 17/07 : sans elle, un match resté SUIVI au
+    tip-off aurait alerté en live). Le filtre de statut (DECOUVERT/SUIVI) protégeait
+    Portland *par coïncidence* (elle était DECIDE) — cette garde rend la protection
+    explicite et couvre aussi le chemin de re-décision des matchs DECIDE.
+    """
     match_id = match["match_id"]
+    if _tipoff_passed(match["tipoff_utc"], now):
+        logger.info("Match %s ignoré : tip-off passé, aucune analyse.", match_id)
+        return {"alerts": 0, "verdict": None, "score": 0}
     data = preprocess(conn, match_id)
     results = evaluate_rules(data, config, ALL_RULES)
     now_iso = now.isoformat()
@@ -45,8 +61,19 @@ def analyze_match(conn: sqlite3.Connection, match: sqlite3.Row, config: dict, no
     alerts = 0
     for result in results:
         if result.triggered and result.rule in ALERT_RULES:
+            # Déduplication par changement d'état : ne pas réémettre si l'état
+            # (sélection + direction + ampleur) n'a pas changé depuis la dernière alerte.
+            detail = result.detail
+            if result.state_key:
+                last_state = db.get_last_alert_state(conn, match_id, result.rule)
+                if last_state == result.state_key:
+                    continue  # même état → pas de nouvelle alerte
+                # Évolution d'ampleur : injecter "ancien → nouveau" dans le détail.
+                if last_state:
+                    detail = _inject_evolution(detail, last_state, result.state_key, result.rule)
             db.insert_alert(conn, match_id=match_id, rule=result.rule,
-                            details=result.detail, created_at=now_iso)
+                            details=detail, created_at=now_iso,
+                            state_key=result.state_key)
             alerts += 1
 
     verdict_type = None
@@ -74,6 +101,29 @@ def analyze_match(conn: sqlite3.Connection, match: sqlite3.Row, config: dict, no
             verdict_type = _redecide(conn, match_id, decide(data, results, config), now_iso)
 
     return {"alerts": alerts, "verdict": verdict_type, "score": movement_score(results)}
+
+
+def _inject_evolution(detail: str, old_key: str, new_key: str, rule: str) -> str:
+    """Injecte l'évolution d'ampleur dans le détail d'une alerte ré-émise.
+
+    Compare l'ancien et le nouveau `state_key` : si l'ampleur a changé (ex. R4 :
+    8 -> 9 bookmakers), préfixe le détail avec l'évolution. Pour R1/R2, l'évolution
+    est déjà visible dans le détail (ligne avant -> après, Delta proba) -- on n'ajoute rien.
+    """
+    old = parse_state_key(old_key)
+    new = parse_state_key(new_key)
+    if not old["amplitude"] or not new["amplitude"]:
+        return detail
+    if old["amplitude"] == new["amplitude"]:
+        return detail
+    if rule == "R4":
+        # R4 : amplitude = nombre de books -> "8 -> 9 bookmakers"
+        return detail.replace(
+            f"{new['amplitude']} bookmakers dans le même sens",
+            f"{old['amplitude']} → {new['amplitude']} bookmakers dans le même sens",
+        )
+    # R1/R2 : l'évolution est déjà dans le détail (ligne/proba avant -> après).
+    return detail
 
 
 def _redecide(conn: sqlite3.Connection, match_id: str, new: Verdict, now_iso: str) -> str | None:

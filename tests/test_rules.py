@@ -43,6 +43,18 @@ def _data(rows):
     return preprocess_rows("m", rows)
 
 
+def _snap(bookmaker, market, selection, odds, line, snapshot_at):
+    """Relevé unitaire (forme dict), pour construire des rows asymétriques."""
+    return {
+        "bookmaker": bookmaker,
+        "market": market,
+        "selection": selection,
+        "line": line,
+        "odds": odds,
+        "snapshot_at": snapshot_at,
+    }
+
+
 # ─────────────────────────────── R1 ───────────────────────────────
 
 def test_r1_triggers_on_large_spread_move():
@@ -239,3 +251,323 @@ def test_r7_ignores_near_pickem_below_spread_guard():
         + fx.spreads("x", "Home", "Away", -1.0, 1.91, 1.91)  # |spread| = 1.0 < 1.5
     )
     assert not evaluate_r7(_data(rows), CONFIG).triggered
+
+
+# ─────────────────── Formatage des mouvements (R1–R4) ───────────────────
+# On valide le contenu du `detail` : direction, cote médiane, Δproba en points,
+# référence temporelle, conclusion « l'argent va vers ». Aucun nouveau calcul —
+# les données proviennent des séries de consensus.
+#
+# Note : le fixture `spreads()` crée des lignes symétriques (Away = -Home), donc
+# |move| Home = |move| Away → R1 sélectionne Away (tri alphabétique, `>` strict).
+# Pour tester la sélection Home (baisse/favori qui se renforce), on construit des
+# rows asymétriques via `_snap`.
+
+
+def test_r1_detail_favorite_strengthens():
+    """R1 : favori qui se renforce (Home -2,0 → -5,0) → baisse, argent vers Home.
+
+    Rows asymétriques : Home move=3,0 > Away move=2,0 → Home sélectionnée.
+    """
+    rows = [
+        _snap("dk", "spreads", "Home", 1.91, -2.0, fx.T[0]),
+        _snap("dk", "spreads", "Away", 1.91, 1.0, fx.T[0]),
+        _snap("dk", "spreads", "Home", 1.91, -5.0, fx.T[1]),
+        _snap("dk", "spreads", "Away", 1.91, 3.0, fx.T[1]),
+    ]
+    detail = evaluate_r1(_data(rows), CONFIG).detail
+    assert "baisse" in detail
+    assert "ligne -2,0 → -5,0" in detail
+    assert "depuis l'ouverture" in detail
+    assert "l'argent va vers Home" in detail
+    assert "Δproba" in detail and "pts" in detail
+    assert "cote méd." in detail
+
+
+def test_r1_detail_outsider_weakens():
+    """R1 : outsider qui s'affaiblit (Away +2,0 → +5,0) → hausse, argent vers l'adversaire.
+
+    Fixture symétrique : |move| égal → Away sélectionnée (tri alphabétique).
+    Sa ligne passe de +2,0 à +5,0 (plus positive) → l'argent va vers Home.
+    """
+    rows = (
+        fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])
+        + fx.spreads("dk", "Home", "Away", -5.0, 1.91, 1.91, fx.T[1])
+    )
+    detail = evaluate_r1(_data(rows), CONFIG).detail
+    assert "hausse" in detail
+    assert "ligne +2,0 → +5,0" in detail
+    assert "l'argent va vers Home" in detail
+
+
+def test_r1_detail_line_crosses_zero():
+    """R1 : traversée de zéro (Away +1,5 → -1,5) → baisse, argent vers Away.
+
+    Fixture symétrique : |move| égal → Away sélectionnée. Sa ligne passe de
+    +1,5 à -1,5 (devient plus négative) → baisse → l'argent va vers Away.
+    """
+    rows = (
+        fx.spreads("dk", "Home", "Away", -1.5, 1.91, 1.91, fx.T[0])
+        + fx.spreads("dk", "Home", "Away", 1.5, 1.91, 1.91, fx.T[1])
+    )
+    detail = evaluate_r1(_data(rows), CONFIG).detail
+    assert "baisse" in detail
+    assert "ligne +1,5 → -1,5" in detail
+    assert "l'argent va vers Away" in detail
+
+
+def test_r2_detail_h2h_money_flows_to_home():
+    """R2 : h2h, proba Home en hausse → Away observée en baisse, argent vers Home.
+
+    R2 parcourt les sélections triées (["Away", "Home"]) : Away est traitée en
+    premier. Sa proba baisse (1/2,30 < 1/1,90) → direction « baisse » → l'argent
+    va vers Home (l'adversaire).
+    """
+    rows = (
+        fx.h2h("dk", "Home", "Away", 1.90, 1.90, fx.T[0])
+        + fx.h2h("dk", "Home", "Away", 1.65, 2.30, fx.T[1])
+    )
+    detail = evaluate_r2(_data(rows), CONFIG).detail
+    assert "baisse" in detail
+    assert "l'argent va vers Home" in detail
+    assert "fenêtre ≤" in detail
+    assert "Δproba" in detail and "pts" in detail
+
+
+def test_r2_detail_totals_over():
+    """R2 : totals Over en hausse → hausse, « vers l'Over ».
+
+    R2 parcourt ["Over", "Under"] : Over en premier, sa proba monte → hausse.
+    """
+    rows = (
+        fx.totals("dk", 224.5, 1.90, 1.90, fx.T[0])
+        + fx.totals("dk", 224.5, 1.65, 2.30, fx.T[1])
+    )
+    detail = evaluate_r2(_data(rows), CONFIG).detail
+    assert "hausse" in detail
+    assert "vers l'Over" in detail
+
+
+# ─────────────────── Cas stable (mouvement consensus négligeable) ───────────────────
+
+def test_format_movement_stable_consensus():
+    """Quand le consensus ne bouge pas (|δ| < ε), pas de conclusion directionnelle.
+
+    On teste `_format_movement` directement : before == after (proba et cote
+    identiques) → « mouvement consensus négligeable » au lieu d'une direction.
+    Le seuil ε = 1e-9 (rules.py, ligne 18) distingue un vrai mouvement du bruit
+    numérique sur les probabilités et lignes flottantes.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    point = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[0],
+        line=None, prob=0.5, odds=1.90, n_books=1,
+    )
+    detail = _format_movement(_data(fx.h2h("dk", "Home", "Away", 1.90, 1.90)), "h2h", "Home", point, point, "test")
+    assert "stable" in detail
+    assert "mouvement consensus négligeable" in detail
+    assert "l'argent va vers" not in detail
+
+
+# ─────────────────── state_key canonique (round-trip) ───────────────────
+
+def test_state_key_round_trip():
+    """Construction puis parsing du state_key : toutes les composantes retrouvées.
+
+    Format canonique machine (point décimal) : market/selection|signe|amplitude.
+    La sélection peut contenir des espaces (ex. Portland Fire).
+    """
+    from analyzer.rules import _state_key, parse_state_key
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="h2h", selection="Portland Fire", snapshot_at=fx.T[0],
+        line=None, prob=0.30, odds=3.00, n_books=8,
+    )
+    after = ConsensusPoint(
+        market="h2h", selection="Portland Fire", snapshot_at=fx.T[1],
+        line=None, prob=0.286, odds=3.15, n_books=9,
+    )
+    key = _state_key("h2h", "Portland Fire", before, after, "9")
+    parsed = parse_state_key(key)
+    assert parsed["market"] == "h2h"
+    assert parsed["selection"] == "Portland Fire"
+    assert parsed["sign"] == -1  # proba baisse
+    assert parsed["amplitude"] == "9"
+
+
+# ─────────────────── Quasi stable (seuils métier) ───────────────────
+
+def test_format_movement_quasi_stable_proba():
+    """h2h : Δproba < 0,2 pt → « quasi stable », pas de conclusion directionnelle.
+
+    Un mouvement de 0,1 pt de proba est réel (au-dessus du bruit flottant _EPS)
+    mais pas actionnable — c'est du bruit d'équilibrage de book.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[0],
+        line=None, prob=0.500, odds=1.90, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[1],
+        line=None, prob=0.501, odds=1.89, n_books=1,  # +0,1 pt de proba
+    )
+    detail = _format_movement(_data(fx.h2h("dk", "Home", "Away", 1.90, 1.90)), "h2h", "Home", before, after, "test")
+    assert "quasi stable" in detail
+    assert "l'argent va vers" not in detail
+    assert "Δproba" in detail  # l'ampleur reste affichée
+
+
+def test_format_movement_quasi_stable_line():
+    """spreads : |Δligne| < 0,25 pt → « quasi stable », pas de conclusion directionnelle."""
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="spreads", selection="Home", snapshot_at=fx.T[0],
+        line=-2.0, prob=0.5, odds=1.91, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="spreads", selection="Home", snapshot_at=fx.T[1],
+        line=-2.2, prob=0.5, odds=1.91, n_books=1,  # Δligne = -0.2 < 0.25
+    )
+    detail = _format_movement(
+        _data(fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])),
+        "spreads", "Home", before, after, "test",
+    )
+    assert "quasi stable" in detail
+    assert "l'argent va vers" not in detail
+
+
+def test_format_movement_above_negligible_proba():
+    """h2h : Δproba ≥ 0,2 pt → direction normale + conclusion directionnelle."""
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[0],
+        line=None, prob=0.500, odds=1.90, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[1],
+        line=None, prob=0.503, odds=1.85, n_books=1,  # +0,3 pt de proba ≥ 0,2
+    )
+    detail = _format_movement(_data(fx.h2h("dk", "Home", "Away", 1.90, 1.90)), "h2h", "Home", before, after, "test")
+    assert "hausse" in detail
+    assert "l'argent va vers Home" in detail
+
+
+def test_format_movement_above_negligible_line():
+    """spreads : |Δligne| ≥ 0,25 pt → direction normale + conclusion directionnelle."""
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="spreads", selection="Home", snapshot_at=fx.T[0],
+        line=-2.0, prob=0.5, odds=1.91, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="spreads", selection="Home", snapshot_at=fx.T[1],
+        line=-2.3, prob=0.5, odds=1.91, n_books=1,  # Δligne = -0.3 ≥ 0.25
+    )
+    detail = _format_movement(
+        _data(fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])),
+        "spreads", "Home", before, after, "test",
+    )
+    assert "baisse" in detail
+    assert "l'argent va vers Home" in detail
+
+
+# ─────────────────── Config prime sur constante (règle 0.4.7) ───────────────────
+
+def test_config_overrides_negligible_thresholds():
+    """La config prime sur les constantes _NEGLIGIBLE_* (règle 0.4.7 : rien en dur).
+
+    Avec movement_negligible_prob = 0.5 (au lieu de 0.002 par défaut), un mouvement
+    de 0,3 pt de proba — qui serait directionnel avec le défaut — devient « quasi stable ».
+    Prouve que la config contrôle le comportement, pas la constante.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[0],
+        line=None, prob=0.500, odds=1.90, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[1],
+        line=None, prob=0.503, odds=1.85, n_books=1,  # +0,3 pt
+    )
+    data = _data(fx.h2h("dk", "Home", "Away", 1.90, 1.90))
+
+    # Avec le défaut (0.002), 0,3 pt ≥ seuil → directionnel
+    detail_default = _format_movement(data, "h2h", "Home", before, after, "test")
+    assert "hausse" in detail_default
+    assert "l'argent va vers Home" in detail_default
+
+    # Avec config 0.5, 0,3 pt < 0.5 → quasi stable
+    detail_config = _format_movement(
+        data, "h2h", "Home", before, after, "test",
+        negligible_prob=0.5,
+    )
+    assert "quasi stable" in detail_config
+    assert "l'argent va vers" not in detail_config
+
+
+# ─────────────────── Bornes exactes (figer < vs ≤) ───────────────────
+
+def test_format_movement_line_at_exact_boundary():
+    """spreads : |Δligne| = 0,25 pile → directionnel (convention < pour quasi-stable).
+
+    La borne est exclusive pour quasi-stable : 0,25 n'est PAS quasi-stable,
+    c'est directionnel. Figé par ce test.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="spreads", selection="Home", snapshot_at=fx.T[0],
+        line=-2.0, prob=0.5, odds=1.91, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="spreads", selection="Home", snapshot_at=fx.T[1],
+        line=-2.25, prob=0.5, odds=1.91, n_books=1,  # |Δ| = 0.25 exact
+    )
+    detail = _format_movement(
+        _data(fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])),
+        "spreads", "Home", before, after, "test",
+    )
+    assert "baisse" in detail
+    assert "l'argent va vers Home" in detail
+    assert "quasi stable" not in detail
+
+
+def test_format_movement_proba_at_exact_boundary():
+    """h2h : Δproba = 0,002 pile → directionnel (convention < pour quasi-stable).
+
+    La borne est exclusive pour quasi-stable : 0,002 n'est PAS quasi-stable,
+    c'est directionnel. Figé par ce test.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[0],
+        line=None, prob=0.500, odds=1.90, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[1],
+        line=None, prob=0.502, odds=1.85, n_books=1,  # Δ = 0.002 exact
+    )
+    detail = _format_movement(
+        _data(fx.h2h("dk", "Home", "Away", 1.90, 1.90)),
+        "h2h", "Home", before, after, "test",
+    )
+    assert "hausse" in detail
+    assert "l'argent va vers Home" in detail
+    assert "quasi stable" not in detail

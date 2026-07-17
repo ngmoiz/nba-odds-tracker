@@ -293,3 +293,37 @@ def test_reserve_allows_collection_on_fresh_db(conn):
 
     assert summary["skipped"] is False
     assert summary["snapshots"] == 4
+
+
+# ─────────────────── Garde tip-off : pas de snapshots post-tip-off ───────────────────
+
+def test_no_snapshots_after_tipoff(conn):
+    """Un match dont le tip-off vient de passer → zéro snapshot stocké, statut CLOS.
+
+    Bug révélé par la simulation du 17/07 : l'API renvoie encore des matchs en cours
+    (cotes live). Le collecteur doit les exclure avant le stockage.
+    """
+    # Match dont le tip-off est dans le passé
+    db.insert_match(
+        conn,
+        match_id="past",
+        sport="basketball_wnba",
+        home_team="A",
+        away_team="B",
+        tipoff_utc=in_hours(-1),  # tip-off il y a 1h
+        status="SUIVI",
+        created_at=in_hours(-12),
+    )
+    conn.commit()
+
+    summary = run_collection(
+        conn, FakeClient([make_event("past", in_hours(-1))]), "basketball_wnba", CONFIG, force=False
+    )
+
+    assert summary["snapshots"] == 0  # zéro snapshot stocké
+    assert summary["closed"] >= 1     # passé en CLOS
+    # Vérifie qu'aucun snapshot n'est en base pour ce match
+    count = conn.execute(
+        "SELECT COUNT(*) AS n FROM odds_snapshots WHERE match_id = 'past'"
+    ).fetchone()["n"]
+    assert count == 0

@@ -68,6 +68,12 @@ rules:
     # Évolution V1.1 (voir journal) : comparer la proba moneyline à la proba implicite
     # du spread via Φ(spread/σ), σ configurable par ligue (~11.5 NBA).
 
+  # Seuils de « mouvement négligeable » (quasi stable) pour le formatage des alertes.
+  # En dessous, un mouvement est réel mais pas actionnable : la conclusion
+  # « l argent va vers » est remplacée par « quasi stable » (ampleur affichée).
+  movement_negligible_prob: 0.002   # 0,2 pt de proba (h2h/totals)
+  movement_negligible_line: 0.25     # 0,25 pt de ligne (spreads)
+
 # --- Décision finale à H-1 (section 6.4) ---
 decision:
   signal_score_threshold: 6   # score ≥ 6 ET cohérence globale → SIGNAL

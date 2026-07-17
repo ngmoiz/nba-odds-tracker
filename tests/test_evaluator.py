@@ -283,3 +283,52 @@ def test_format_daily_report_shows_outcome_clv_rate_and_guardrail():
 
 def test_format_daily_report_empty():
     assert "Aucun verdict" in format_daily_report("17/01/2026", [], total_evals=0)
+
+
+# ─────────────────── CLV insensible aux snapshots post-tip-off ───────────────────
+
+def test_clv_ignores_post_tipoff_snapshot(conn):
+    """Un snapshot post-tip-off (cote live) ne fausse pas le calcul de clôture.
+
+    Le CLV filtre sur snapshot_at <= tipoff_utc : les cotes live sont exclues.
+    Bug 17/07 : 30 snapshots live à 00:45 (tip-off 23:10) auraient faussé la clôture
+    sans ce filtre.
+    """
+    from evaluator.clv import compute_clv
+    from analyzer.preprocessing import preprocess
+
+    T0 = "2026-01-16T20:00:00+00:00"
+    T1 = "2026-01-16T22:00:00+00:00"
+    T2 = "2026-01-17T00:20:00+00:00"  # tip-off
+    T3 = "2026-01-17T01:00:00+00:00"  # post-tip-off (live)
+
+    db.insert_match(
+        conn, match_id="m_clv", sport="basketball_wnba",
+        home_team="Home", away_team="Away",
+        tipoff_utc=T2, status="DECIDE", created_at=T0,
+    )
+    db.insert_verdict(
+        conn, match_id="m_clv", verdict="SIGNAL", selection="Home", market="h2h",
+        line=None, odds_at_verdict=1.90, signal_score=6,
+        rules_triggered="[]", rationale="test", decided_at=T1,
+        logic_version="test",
+    )
+    for book in ("a", "b", "c", "d", "e"):
+        db.insert_snapshot(conn, match_id="m_clv", bookmaker=book, market="h2h", selection="Home", line=None, odds=1.90, snapshot_at=T0)
+        db.insert_snapshot(conn, match_id="m_clv", bookmaker=book, market="h2h", selection="Away", line=None, odds=1.90, snapshot_at=T0)
+        db.insert_snapshot(conn, match_id="m_clv", bookmaker=book, market="h2h", selection="Home", line=None, odds=1.85, snapshot_at=T1)
+        db.insert_snapshot(conn, match_id="m_clv", bookmaker=book, market="h2h", selection="Away", line=None, odds=1.95, snapshot_at=T1)
+        # Snapshot post-tip-off (cote live aberrante : 1.02)
+        db.insert_snapshot(conn, match_id="m_clv", bookmaker=book, market="h2h", selection="Home", line=None, odds=1.02, snapshot_at=T3)
+        db.insert_snapshot(conn, match_id="m_clv", bookmaker=book, market="h2h", selection="Away", line=None, odds=15.0, snapshot_at=T3)
+    conn.commit()
+
+    data = preprocess(conn, "m_clv")
+    closing_odds, clv = compute_clv(
+        data, market="h2h", selection="Home",
+        decided_at=T1, tipoff_utc=T2,
+    )
+    # La cote de clôture doit être ~1.85 (T1, dernier avant tip-off T2),
+    # PAS 1.02 (T3, post-tip-off, live).
+    assert closing_odds is not None
+    assert abs(closing_odds - 1.85) < 0.01  # clôture = T1, pas T3
