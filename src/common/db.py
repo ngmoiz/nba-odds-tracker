@@ -231,6 +231,17 @@ def init_db(db_path: Path) -> None:
 # Statuts « actifs » : un match dans l'un de ces états est encore suivi.
 ACTIVE_STATUSES = ("DECOUVERT", "SUIVI", "DECIDE")
 
+# Version de la logique de décision. Incrémentée à chaque évolution matérielle du
+# calcul du verdict, pour distinguer les cohortes dans les stats/calibration.
+#   1 = décision figée à la 1ʳᵉ collecte de la fenêtre (pré-correctif H-1)
+#   2 = re-décision à chaque collecte jusqu'au tip-off (décision « à H-1 »)
+# Constante de données (pas de construction de verdict) : elle vit dans la couche
+# données car elle est lue par l'évaluateur (ségrégation des cohortes) et écrite
+# par l'analyseur (estampillage des verdicts). Déplacée depuis analyzer/verdict.py
+# lors de la revue externe (M2) pour supprimer la dépendance evaluator→analyzer
+# sur une simple constante.
+DECISION_LOGIC_VERSION = 2
+
 
 def get_match(conn: sqlite3.Connection, match_id: str) -> sqlite3.Row | None:
     """Renvoie la ligne du match, ou None s'il est inconnu."""

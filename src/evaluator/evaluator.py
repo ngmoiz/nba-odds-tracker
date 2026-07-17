@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from analyzer.preprocessing import preprocess
 from common import db
 from common.config import Settings
+from common.db import DECISION_LOGIC_VERSION
 from common.logging_config import get_logger
 from common.results_api_client import ResultsApiClient
 from evaluator.clv import compute_clv
@@ -178,7 +179,7 @@ def run_weekly_report(
     signal_rows = db.get_weekly_signal_evals(conn, since_iso)
     nobet_rows = db.get_weekly_nobet_evals(conn, since_iso)
     total_evals = db.count_evaluations(conn)
-    v2_evals = db.count_evaluations_by_logic_version(conn, logic_version=2)
+    v2_evals = db.count_evaluations_by_logic_version(conn, logic_version=DECISION_LOGIC_VERSION)
 
     display_tz = config["display"]["timezone"]
     fmt = "%d/%m/%Y"

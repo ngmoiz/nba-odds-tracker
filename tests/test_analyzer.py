@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from analyzer.analyzer import analyze_open_matches
 from common import db
 from common.config import load_config
-from common.db import get_connection, init_db
+from common.db import DECISION_LOGIC_VERSION, get_connection, init_db
 from tests import fixtures as fx
 
 CFG = load_config()
@@ -223,6 +223,62 @@ def test_alert_r4_same_8_books_silent(tmp_path):
 
 
 # ─────────────────── Garde tip-off : aucune analyse post-tip-off ───────────────────
+
+# ─────────────────── Re-décision des matchs DECIDE via analyze_open_matches ───────────────────
+
+def test_decide_match_in_window_is_redecided_and_superseded(tmp_path):
+    """Un match DECIDE en fenêtre est re-décidé via analyze_open_matches (C1).
+
+    Correctif C1 (revue externe) : `analyze_open_matches` ne sélectionnait que
+    DECOUVERT/SUIVI — les matchs DECIDE n'étaient jamais réanalysés, la branche
+    `elif status == "DECIDE"` de `analyze_match` était du code mort en production.
+    Les tests passaient car `test_redecision.py` appelle `_redecide` directement.
+
+    Ce test d'intégration prouve le chemin complet : un match DECIDE en fenêtre,
+    passé par `analyze_open_matches`, est re-décidé. Un changement matériel
+    (sélection Home → Away) déclenche la supersession (ancien message mémorisé,
+    verdict remis en file). Vérifie aussi que `logic_version` est estampillé.
+    """
+    tipoff = (NOW + timedelta(hours=1)).isoformat()
+    conn = _setup(tmp_path, tipoff)
+
+    # 1re analyse : SIGNAL Home, match → DECIDE.
+    analyze_open_matches(conn, CFG, NOW)
+    verdict = conn.execute(
+        "SELECT id, verdict, selection, logic_version FROM verdicts WHERE match_id='m1'"
+    ).fetchone()
+    assert verdict["verdict"] == "SIGNAL"
+    assert verdict["selection"] == "Home"
+    assert verdict["logic_version"] == DECISION_LOGIC_VERSION
+    assert conn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"] == "DECIDE"
+
+    # Simule l'envoi Telegram du 1er verdict (message 100).
+    db.set_verdict_notified(conn, verdict["id"], 100, NOW.isoformat())
+    conn.commit()
+
+    # Ajout d'un snapshot T2 : Home passe à +1.0 (Away à -1.0). Le mouvement Away
+    # depuis l'ouverture est |(-1.0) - (+2.0)| = 3.0 >= seuil → R1 déclenchée,
+    # mais la direction s'inverse : la sélection devient Away (changement matériel).
+    for book in ("a", "b", "c", "d"):
+        db.insert_snapshot(conn, match_id="m1", **fx.snap(book, "spreads", "Home", 1.91, 1.0, fx.T[2]))
+        db.insert_snapshot(conn, match_id="m1", **fx.snap(book, "spreads", "Away", 1.91, -1.0, fx.T[2]))
+    conn.commit()
+
+    # 2e analyse : le match est DECIDE mais actif → re-décision via analyze_open_matches.
+    summary = analyze_open_matches(conn, CFG, NOW)
+    assert summary["analyzed"] == 1  # le match DECIDE est bien sélectionné
+
+    redecided = conn.execute(
+        "SELECT verdict, selection, logic_version, superseded_message_id, "
+        "telegram_message_id, notified_at FROM verdicts WHERE match_id='m1'"
+    ).fetchone()
+    assert redecided["selection"] == "Away"                      # changement matériel
+    assert redecided["logic_version"] == DECISION_LOGIC_VERSION  # estampillé
+    assert redecided["superseded_message_id"] == 100             # ancien message mémorisé
+    assert redecided["telegram_message_id"] is None              # message courant effacé
+    assert redecided["notified_at"] is None                      # remis en file d'envoi
+    conn.close()
+
 
 def test_no_alerts_after_tipoff(tmp_path):
     """Un match dont le tip-off est passé → zéro alerte, zéro verdict.

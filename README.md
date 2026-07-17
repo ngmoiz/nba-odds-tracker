@@ -160,7 +160,7 @@ docker compose run --rm evaluator
 ### Installer le cron WSL2
 
 Le script `scripts/setup_cron.sh` installe les jobs cron pour les collecteurs
-(5 collectes/jour) et l'évaluateur (matin + rapport hebdo le lundi) :
+(6 collectes/jour) et l'évaluateur (matin + rapport hebdo le lundi) :
 
 ```bash
 chmod +x scripts/setup_cron.sh
@@ -245,6 +245,10 @@ et en l'absence d'anomalie, le verdict devient `SIGNAL`.
 | R7 | Incohérence spread/moneyline chez un book | +2 → `ANOMALIE` |
 
 Les seuils sont configurables dans [config.yaml](config.yaml).
+
+> ⚠️ « Ouverture » = **première collecte de l'outil** (09:00 Paris), pas l'ouverture
+> réelle du marché. Des lignes ont pu bouger overnight avant que l'outil ne commence
+> à suivre le match. Ce biais est inhérent au planning de collecte local.
 
 ### Verdicts
 

@@ -166,10 +166,20 @@ def _redecide(conn: sqlite3.Connection, match_id: str, new: Verdict, now_iso: st
 
 
 def analyze_open_matches(conn: sqlite3.Connection, config: dict, now: datetime | None = None) -> dict:
-    """Analyse tous les matchs encore suivis. Committe à la fin."""
+    """Analyse tous les matchs actifs (DECOUVERT/SUIVI/DECIDE). Committe à la fin.
+
+    Inclut DECIDE : un match déjà décidé est **re-analysé** à chaque collecte tant
+    qu'il est dans la fenêtre de décision (re-décision H-1). Sans cela, la branche
+    `elif status == "DECIDE"` de `analyze_match` est du code mort en production —
+    les tests passaient car ils appelaient `_redecide` directement. Correctif C1
+    (revue externe) : la sélection doit couvrir tous les statuts actifs, pas seulement
+    les pré-décision.
+    """
     now = now or datetime.now(timezone.utc)
+    placeholders = ",".join("?" * len(db.ACTIVE_STATUSES))
     rows = conn.execute(
-        "SELECT * FROM matches WHERE status IN ('DECOUVERT', 'SUIVI')"
+        f"SELECT * FROM matches WHERE status IN ({placeholders})",
+        db.ACTIVE_STATUSES,
     ).fetchall()
 
     summary = {"analyzed": 0, "alerts": 0, "verdicts": 0}

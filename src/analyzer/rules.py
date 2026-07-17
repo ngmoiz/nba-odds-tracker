@@ -337,7 +337,7 @@ def evaluate_r4(data: MatchData, config: dict) -> RuleResult:
                     negligible_prob = config["rules"].get("movement_negligible_prob", _NEGLIGIBLE_PROBA)
                     negligible_line = config["rules"].get("movement_negligible_line", _NEGLIGIBLE_LINE)
                     movement = _format_movement(
-                        data, market, selection, consensus[0], consensus[-1], "fenêtre récente",
+                        data, market, selection, consensus[0], consensus[-1], "depuis l'ouverture",
                         negligible_prob=negligible_prob, negligible_line=negligible_line,
                     )
                 else:
