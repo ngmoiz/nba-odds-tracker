@@ -200,6 +200,80 @@ CONFIG_WITH_TARGETS = {
 }
 
 
+# ─── Régression : pas de relevé post-tip-off (chemins matin & force) ───
+# Le chemin des vagues est déjà protégé par close_finished_matches (la vague ne
+# contient jamais un match commencé). Le trou réel : les collectes matin et force
+# itèrent tous les events de l'API et stockaient tout `commence_time > now` sans
+# consulter la base — un match CLOS encore renvoyé par l'API (reprogrammé avec un
+# commence_time futur, ou fenêtre live) était re-stocké. Chaque test couvre les
+# DEUX moitiés de la garantie : zéro relevé pour le CLOS, collecte normale pour les
+# autres matchs de la même exécution (une garde trop large casserait la seconde).
+
+
+def test_morning_collection_does_not_restore_closed_match(conn):
+    """Collecte du matin : un match CLOS renvoyé par l'API n'est pas re-stocké,
+    les autres matchs le sont normalement (invariant 7)."""
+    now = datetime(2026, 7, 19, 9, 0, tzinfo=timezone.utc)   # créneau matin (09:00 UTC)
+    past = (now - timedelta(hours=2)).isoformat()            # tip-off d'origine passé
+    future = (now + timedelta(hours=8)).isoformat()          # hors fenêtre cible (6 h)
+
+    db.insert_match(
+        conn, match_id="closed", sport="basketball_wnba",
+        home_team="Chicago Sky", away_team="Seattle Storm",
+        tipoff_utc=past, status="CLOS",
+        created_at=(now - timedelta(hours=10)).isoformat(),
+    )
+    db.insert_match(
+        conn, match_id="live", sport="basketball_wnba",
+        home_team="Las Vegas Aces", away_team="LA Sparks",
+        tipoff_utc=future, status="SUIVI",
+        created_at=(now - timedelta(hours=10)).isoformat(),
+    )
+    conn.commit()
+
+    # L'API renvoie le match CLOS avec un commence_time FUTUR (reprogrammé).
+    run_collection(
+        conn,
+        FakeClient([make_event("closed", future), make_event("live", future)]),
+        "basketball_wnba", CONFIG_WITH_TARGETS, now=now,
+    )
+
+    assert _count_snapshots(conn, "closed") == 0   # CLOS → aucun relevé post-tip-off
+    assert _count_snapshots(conn, "live") == 6     # à venir → collecté (h2h+spreads+totals)
+    assert get_match(conn, "closed")["status"] == "CLOS"
+
+
+def test_force_collection_does_not_restore_closed_match(conn):
+    """Mode force : même garantie que le matin (aucun re-stockage d'un match CLOS)."""
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)  # hors créneau matin
+    past = (now - timedelta(hours=2)).isoformat()
+    future = (now + timedelta(hours=8)).isoformat()
+
+    db.insert_match(
+        conn, match_id="closed", sport="basketball_wnba",
+        home_team="Chicago Sky", away_team="Seattle Storm",
+        tipoff_utc=past, status="CLOS",
+        created_at=(now - timedelta(hours=10)).isoformat(),
+    )
+    db.insert_match(
+        conn, match_id="live", sport="basketball_wnba",
+        home_team="Las Vegas Aces", away_team="LA Sparks",
+        tipoff_utc=future, status="SUIVI",
+        created_at=(now - timedelta(hours=10)).isoformat(),
+    )
+    conn.commit()
+
+    run_collection(
+        conn,
+        FakeClient([make_event("closed", future), make_event("live", future)]),
+        "basketball_wnba", CONFIG_WITH_TARGETS, force=True, now=now,
+    )
+
+    assert _count_snapshots(conn, "closed") == 0
+    assert _count_snapshots(conn, "live") == 6
+    assert get_match(conn, "closed")["status"] == "CLOS"
+
+
 def test_conditional_skip_when_no_active_matches(conn):
     """Collecte conditionnelle sautée si aucun match actif en base (zéro crédit)."""
     summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG, force=False)

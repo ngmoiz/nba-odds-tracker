@@ -70,6 +70,36 @@ def _record_snapshots(conn: sqlite3.Connection, event: OddsEvent, snapshot_at: s
     return count
 
 
+def _event_tipoff_passed(
+    conn: sqlite3.Connection, event: OddsEvent, now: datetime
+) -> bool:
+    """Indique si l'event ne doit PAS être stocké car son match est commencé/CLOS.
+
+    Autorité = la **base** dès que le match existe (indépendamment du ``commence_time``
+    renvoyé par l'API) :
+    - statut ``CLOS`` → exclu (définition CLOS : « plus aucune collecte ») ; couvre
+      le cas d'un match reprogrammé que l'API renvoie avec un ``commence_time`` futur
+      alors qu'il est déjà clos en base ;
+    - sinon, tip-off DB atteint/dépassé → exclu (valeur figée à la découverte,
+      cohérente avec ``close_finished_matches``).
+
+    Pour un match encore inconnu, seule référence disponible : le ``commence_time``
+    de l'API.
+
+    Garde uniforme appelée AVANT tout stockage sur les trois chemins de collecte
+    (matin, force, cibles/vagues) — invariant 7 : jamais de relevé post-tip-off.
+    """
+    existing = db.get_match(conn, event.id)
+    if existing is not None:
+        if existing["status"] == "CLOS":
+            return True
+        tipoff = datetime.fromisoformat(existing["tipoff_utc"].replace("Z", "+00:00"))
+        return tipoff <= now
+
+    tipoff = datetime.fromisoformat(event.commence_time.replace("Z", "+00:00"))
+    return tipoff <= now
+
+
 def _parse_credits(value: str | None) -> int | None:
     """Convertit la valeur de l'en-tête x-requests-remaining en int, ou None."""
     if value is None:
@@ -393,12 +423,11 @@ def _collect_and_record(
     collected_match_ids = set()
     
     for event in events:
-        # Garde tip-off : exclut tout match dont le tip-off est passé
-        tipoff = datetime.fromisoformat(event.commence_time.replace("Z", "+00:00"))
-        if tipoff <= now:
+        # Garde tip-off (autorité = base) : exclut tout match commencé/CLOS
+        if _event_tipoff_passed(conn, event, now):
             logger.info(
-                "Match %s ignoré : tip-off passé (%s), cotes live non stockées.",
-                event.id, event.commence_time,
+                "Match %s ignoré : tip-off passé, cotes live non stockées.",
+                event.id,
             )
             continue
         
@@ -513,8 +542,8 @@ def run_collection(
         
         discovered = newly_tracked = snapshots = 0
         for event in events:
-            tipoff = datetime.fromisoformat(event.commence_time.replace("Z", "+00:00"))
-            if tipoff <= now:
+            if _event_tipoff_passed(conn, event, now):
+                logger.info("Match %s ignoré : tip-off passé, relevé non stocké.", event.id)
                 continue
             
             existing = db.get_match(conn, event.id)
@@ -578,8 +607,8 @@ def run_collection(
         
         discovered = newly_tracked = snapshots = 0
         for event in events:
-            tipoff = datetime.fromisoformat(event.commence_time.replace("Z", "+00:00"))
-            if tipoff <= now:
+            if _event_tipoff_passed(conn, event, now):
+                logger.info("Match %s ignoré : tip-off passé, relevé non stocké.", event.id)
                 continue
             
             existing = db.get_match(conn, event.id)
