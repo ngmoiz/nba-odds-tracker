@@ -10,11 +10,11 @@
 
 **Décisions qui ne se rediscutent jamais :**
 
-1. **Re-décision H-1** : implémentée et branchée par C1 (correctif revue externe 2026-07-17) — les matchs DECIDE sont réanalysés à chaque collecte tant qu'ils sont dans la fenêtre, le verdict est mis à jour en place jusqu'au tip-off ou à la prise de position.
+1. **Re-décision H-1** : implémentée et branchée par C1 (correctif revue externe 2026-07-17) — les matchs DECIDE sont réanalysés à chaque collecte tant qu'ils sont dans la fenêtre, le verdict est mis à jour en place jusqu'au tip-off ou à la prise de position ; une re-décision **matérielle** (changement de type de verdict ou de sélection) rend l'ancien message Telegram obsolète — il est édité (« remplacé ») et un nouveau message envoyé (« mis à jour »), voire annulé si un signal retombe en NO_BET.
 2. **Déduplication** : `(match_id, target_name)` pour collectes (Lot 2, correction bug conception) ; `state_key` (market/selection|signe|ampleur) pour alertes.
-3. **Cibles de collecte** : tip-off le plus précoce de la journée NBA, sauf closing per-match (dernier snapshot avant chaque tip-off).
+3. **Cibles de collecte** : tip-off le plus précoce de la **vague** (bloc de tip-offs rapprochés), pas de la journée NBA entière, sauf closing per-match (dernier snapshot avant chaque tip-off).
 4. **`window_hours = 2.5`** : verdict à H-2 (H-3 hors fenêtre, H-2 dedans), re-décision à H-1.
-5. **`None` explicite obligatoire** : jamais de valeur par défaut masquant une donnée absente (ex: score absent gradé `'push'` au lieu de `None`).
+5. **`None` explicite obligatoire** : une donnée absente est représentée par `None` explicite, jamais par une valeur par défaut qui la masque. Bug d'origine : un score `0-0` (valeur par défaut) gradé « push » au lieu d'être traité comme résultat absent.
 6. **Échec bruyant obligatoire** : jamais de no-op silencieux, tout échec loggé (warning min), anomalie parsing → mention rapport.
 7. **Append-only sur `odds_snapshots`** : on invalide (statut, `superseded_message_id`), on ne supprime jamais.
 8. **TEST_MODE jamais en production** : uniquement pour tests, détecté et rejeté au démarrage.
