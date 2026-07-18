@@ -159,18 +159,35 @@ def evaluate_pending(
 
     conn.commit()
 
+    # Correctif 6 : Idempotence du bilan quotidien via clé meta daily_report_sent_YYYY-MM-DD.
+    # Un bilan déjà envoyé pour une journée ne doit pas partir une seconde fois.
+    # Le bilan dégradé (0 match évalué) compte aussi comme envoyé.
+    display_tz = ZoneInfo(config["display"]["timezone"])
+    today_cal = now.astimezone(display_tz).date().isoformat()
+    report_key = f"daily_report_sent_{today_cal}"
+    
+    if db.get_meta(conn, report_key) == "true":
+        logger.info("Bilan quotidien déjà envoyé pour %s, skip.", today_cal)
+        return summary
+    
     # Envoi inconditionnel du bilan (Défaut 2 : mode de panne interdit).
     # Si des matchs étaient en attente mais qu'aucun n'a pu être évalué (résultats
     # indisponibles), on envoie un bilan dégradé explicite.
-    day_label = now.astimezone(ZoneInfo(config["display"]["timezone"])).strftime("%d/%m/%Y")
+    day_label = now.astimezone(display_tz).strftime("%d/%m/%Y")
+    sent = False
     if lines:
         text = format_daily_report(day_label, lines, db.count_evaluations(conn))
-        send_direct(settings, text, client=telegram_client)
+        sent = send_direct(settings, text, client=telegram_client)
     elif summary["skipped"] > 0:
         # Des matchs étaient en attente mais aucun résultat disponible → bilan dégradé.
         text = format_degraded_report(day_label, summary["skipped"], "résultats indisponibles")
-        send_direct(settings, text, client=telegram_client)
+        sent = send_direct(settings, text, client=telegram_client)
         logger.warning("Bilan dégradé envoyé : %d match(s) en attente sans résultat.", summary["skipped"])
+    
+    # Marque le bilan comme envoyé (même si dégradé)
+    if sent:
+        db.set_meta(conn, report_key, "true")
+        conn.commit()
 
     logger.info("Évaluation terminée : %s", summary)
     return summary

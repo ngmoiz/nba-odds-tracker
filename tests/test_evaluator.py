@@ -195,6 +195,27 @@ def test_compute_clv_none_when_selection_not_quoted(conn):
     assert closing_odds is None and clv is None
 
 
+def test_compute_clv_none_when_same_snapshot(conn):
+    """Correctif 1 : CLV None si verdict et clôture sur le même snapshot (pas de collecte entre).
+    
+    Garde-fou ajouté hier (closing.snapshot_at == opening.snapshot_at) pour distinguer
+    CLV None (non mesurable) de CLV 0,0 (marché stable). Ce test vérifie que le garde-fou
+    fonctionne et n'est pas juste le repli None existant (closing/opening manquant).
+    """
+    from analyzer.preprocessing import preprocess
+    # Un seul snapshot : verdict et clôture tombent sur le même relevé.
+    for sel, ln, od in [("Boston Celtics", -5.0, 1.91), ("Miami Heat", 5.0, 1.91)]:
+        _snap(conn, book="pinnacle", sel=sel, line=ln, odds=od, at="2026-01-16T23:00:00Z")
+    conn.commit()
+    data = preprocess(conn, "m1")
+    # Verdict à 23:05, clôture à 00:20 → les deux pointent vers le snapshot 23:00.
+    closing_odds, clv = compute_clv(data, market="spreads", selection="Boston Celtics",
+                                    decided_at="2026-01-16T23:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
+    # closing_odds est renvoyé (1.91), mais CLV est None (non mesurable).
+    assert closing_odds == 1.91
+    assert clv is None  # Garde-fou : même snapshot → CLV non mesurable
+
+
 # ─────────────────────── orchestration bout en bout ───────────────────────
 
 def _fake_results_client(games):
@@ -274,6 +295,39 @@ def test_evaluate_pending_gives_up_on_old_unmatched(conn):
     assert conn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"] == "EVALUE"
 
 
+def test_evaluate_pending_rejects_zero_zero_scores(conn):
+    """Correctif 2 : Garde-fou grading scores 0-0 (bug API balldontlie).
+    
+    L'API renvoie parfois status="post" avec scores 0-0 (données invalides). Le grading
+    doit rejeter ces scores pour éviter des pushes erronés. Aucune évaluation n'est écrite,
+    ungradable est incrémenté, le match reste CLOS pour réessai.
+    """
+    db.insert_verdict(conn, match_id="m1", verdict="SIGNAL", selection="Boston Celtics",
+                      market="spreads", line=-5.0, odds_at_verdict=1.91, signal_score=6,
+                      rules_triggered=json.dumps(["R1"]), rationale="…",
+                      decided_at="2026-01-16T23:20:00Z")
+    conn.commit()
+
+    # API renvoie status="Final" mais scores 0-0 (bug)
+    games = [_game("2026-01-16", BOS, MIA, 0, 0, status="Final")]
+    from datetime import datetime, timezone
+    summary = evaluate_pending(conn, _settings(), CONFIG,
+                               results_client=_fake_results_client(games),
+                               telegram_client=None,
+                               now=datetime(2026, 1, 17, 12, 0, tzinfo=timezone.utc))
+
+    # Le match est rejeté : ungradable incrémenté, aucune évaluation écrite
+    assert summary["ungradable"] == 1
+    assert summary["evaluated"] == 0
+    
+    # Aucune évaluation en base (pas de push erroné)
+    evals = conn.execute("SELECT * FROM evaluations").fetchall()
+    assert len(evals) == 0
+    
+    # Le match reste CLOS (pas passé en EVALUE) pour réessai
+    assert conn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"] == "CLOS"
+
+
 # ─────────────────────────── bilan ───────────────────────────
 
 def test_success_rate_excludes_push_from_denominator():
@@ -299,6 +353,36 @@ def test_format_daily_report_shows_outcome_clv_rate_and_guardrail():
     # Taux hors push : 1 gagné, 0 perdu, 1 push → 100 %.
     assert "taux 100 % (hors push)" in msg
     assert "bruit statistique" in msg  # garde-fou < 50 évaluations
+
+
+def test_format_daily_report_nobet_display_without_symbols():
+    """Correctif 5 : NO_BET affichés sans ✅/❌, taux séparé pour faux négatifs.
+    
+    Les NO_BET sont gradés contre-factuellement (mesure des faux négatifs). Ils doivent
+    afficher "aurait gagné (occasion manquée)" / "aurait perdu (abstention justifiée)"
+    sans symboles, et le taux de réussite en pied ne doit agréger que SIGNAL/ANOMALIE.
+    """
+    lines = [
+        EvalLine(home_team=BOS, away_team=MIA, verdict="SIGNAL", selection="Boston Celtics",
+                 home_score=110, away_score=100, outcome="won", clv=0.03, position_action=None),
+        EvalLine(home_team="Lakers", away_team="Suns", verdict="NO_BET", selection="Lakers",
+                 home_score=105, away_score=100, outcome="won", clv=0.01, position_action=None),
+        EvalLine(home_team="Nets", away_team="Heat", verdict="NO_BET", selection="Nets",
+                 home_score=95, away_score=100, outcome="lost", clv=-0.01, position_action=None),
+    ]
+    msg = format_daily_report("18/07/2026", lines, total_evals=25)
+    
+    # NO_BET affichés sans ✅/❌
+    assert "aurait gagné (occasion manquée)" in msg
+    assert "aurait perdu (abstention justifiée)" in msg
+    # Les symboles ✅/❌ ne doivent apparaître que pour le SIGNAL
+    assert msg.count("✅") == 1  # Uniquement le SIGNAL gagné
+    assert "❌" not in msg  # Aucun NO_BET ne doit avoir ❌
+    
+    # Taux de réussite séparé : SIGNAL uniquement (1 gagné, 0 perdu)
+    assert "Bilan : 1 gagné(s), 0 perdu(s), 0 push — taux 100 % (hors push)" in msg
+    # Ligne séparée pour les faux négatifs
+    assert "NO_BET : 1/2 auraient gagné (faux négatifs)" in msg
 
 
 def test_format_daily_report_empty():
@@ -348,6 +432,109 @@ def test_evaluate_pending_sends_degraded_report_when_no_results(conn):
     assert "0 match évalué" in msg
     assert "1 match(s) en attente" in msg
     assert "résultats indisponibles" in msg
+
+
+def test_daily_report_idempotence(conn):
+    """Correctif 6 : Idempotence du bilan quotidien via clé meta daily_report_sent_YYYY-MM-DD.
+    
+    Un bilan déjà envoyé pour une journée ne doit pas partir une seconde fois. Le bilan
+    dégradé (0 match évalué) compte aussi comme envoyé. Un second appel le même jour
+    ne doit envoyer aucun message.
+    """
+    db.insert_verdict(conn, match_id="m1", verdict="SIGNAL", selection="Boston Celtics",
+                      market="spreads", line=-5.0, odds_at_verdict=1.91, signal_score=6,
+                      rules_triggered=json.dumps(["R1"]), rationale="…",
+                      decided_at="2026-01-16T23:20:00Z")
+    conn.commit()
+
+    games = [_game("2026-01-16", BOS, MIA, 110, 100)]
+    
+    # Mock telegram client pour compter les envois
+    sent_messages = []
+    class _FakeTelegram:
+        is_configured = True
+        def send_message(self, text, **kwargs):
+            sent_messages.append(text)
+            return True
+
+    from datetime import datetime, timezone
+    now = datetime(2026, 1, 17, 12, 0, tzinfo=timezone.utc)
+    
+    # Premier appel : bilan envoyé
+    summary1 = evaluate_pending(conn, _settings(), CONFIG,
+                                results_client=_fake_results_client(games),
+                                telegram_client=_FakeTelegram(),
+                                now=now)
+    assert summary1["evaluated"] == 1
+    assert len(sent_messages) == 1  # Un bilan envoyé
+    
+    # Vérifie que la clé meta est bien enregistrée
+    report_key = "daily_report_sent_2026-01-17"
+    assert db.get_meta(conn, report_key) == "true"
+    
+    # Second appel le même jour : aucun envoi (idempotence)
+    summary2 = evaluate_pending(conn, _settings(), CONFIG,
+                                results_client=_fake_results_client(games),
+                                telegram_client=_FakeTelegram(),
+                                now=now)
+    assert summary2["evaluated"] == 0  # Aucune nouvelle évaluation (match déjà EVALUE)
+    assert len(sent_messages) == 1  # Toujours 1 seul message (pas de doublon)
+
+
+def test_invalidated_evaluations_excluded_from_aggregations(conn):
+    """Correctif 3c : Les évaluations invalidées sont exclues des 4 fonctions d'agrégation.
+    
+    Une évaluation avec invalidated=1 ne doit apparaître ni dans count_evaluations(),
+    ni dans count_evaluations_by_logic_version(), ni dans get_weekly_signal_evals(),
+    ni dans get_weekly_nobet_evals().
+    """
+    from datetime import datetime, timezone
+    from common.db import DECISION_LOGIC_VERSION
+    
+    # Crée 2 verdicts SIGNAL + 1 NO_BET pressenti
+    v1_id = db.insert_verdict(conn, match_id="m1", verdict="SIGNAL", selection="Boston Celtics",
+                              market="spreads", line=-5.0, odds_at_verdict=1.91, signal_score=6,
+                              rules_triggered=json.dumps(["R1"]), rationale="…",
+                              decided_at="2026-01-16T23:20:00Z", logic_version=DECISION_LOGIC_VERSION)
+    v2_id = db.insert_verdict(conn, match_id="m1", verdict="SIGNAL", selection="Miami Heat",
+                              market="h2h", line=None, odds_at_verdict=2.10, signal_score=7,
+                              rules_triggered=json.dumps(["R2"]), rationale="…",
+                              decided_at="2026-01-16T23:20:00Z", logic_version=DECISION_LOGIC_VERSION)
+    v3_id = db.insert_verdict(conn, match_id="m1", verdict="NO_BET", selection="Lakers",
+                              market="spreads", line=-3.0, odds_at_verdict=1.85, signal_score=0,
+                              rules_triggered="[]", rationale="…",
+                              decided_at="2026-01-16T23:20:00Z", logic_version=DECISION_LOGIC_VERSION)
+    
+    # Crée 3 évaluations : 2 valides + 1 invalidée
+    now_iso = datetime(2026, 1, 17, 12, 0, tzinfo=timezone.utc).isoformat()
+    db.insert_evaluation(conn, verdict_id=v1_id, home_score=110, away_score=100,
+                        outcome="won", closing_odds=1.85, clv=0.03, evaluated_at=now_iso)
+    db.insert_evaluation(conn, verdict_id=v2_id, home_score=110, away_score=100,
+                        outcome="lost", closing_odds=2.05, clv=-0.02, evaluated_at=now_iso)
+    db.insert_evaluation(conn, verdict_id=v3_id, home_score=110, away_score=100,
+                        outcome="won", closing_odds=1.80, clv=0.01, evaluated_at=now_iso)
+    
+    # Invalide la 2e évaluation (verdict_id=v2_id)
+    conn.execute("UPDATE evaluations SET invalidated = 1 WHERE verdict_id = ?", (v2_id,))
+    conn.commit()
+    
+    # Test 1 : count_evaluations() exclut l'invalidée (2 valides sur 3 total)
+    assert db.count_evaluations(conn) == 2
+    
+    # Test 2 : count_evaluations_by_logic_version() exclut l'invalidée
+    assert db.count_evaluations_by_logic_version(conn, DECISION_LOGIC_VERSION) == 2
+    
+    # Test 3 : get_weekly_signal_evals() exclut l'invalidée (1 SIGNAL valide sur 2)
+    since_iso = datetime(2026, 1, 16, 0, 0, tzinfo=timezone.utc).isoformat()
+    signal_rows = db.get_weekly_signal_evals(conn, since_iso)
+    assert len(signal_rows) == 1  # Seul v1 (won) est retourné, v2 (lost, invalidé) est exclu
+    assert signal_rows[0]["verdict_id"] == v1_id
+    assert signal_rows[0]["outcome"] == "won"
+    
+    # Test 4 : get_weekly_nobet_evals() exclut l'invalidée (1 NO_BET valide)
+    nobet_rows = db.get_weekly_nobet_evals(conn, since_iso)
+    assert len(nobet_rows) == 1
+    assert nobet_rows[0]["outcome"] == "won"
 
 
 # ─────────────────── CLV insensible aux snapshots post-tip-off ───────────────────

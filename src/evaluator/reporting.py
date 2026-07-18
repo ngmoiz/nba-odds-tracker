@@ -83,13 +83,40 @@ def format_daily_report(day_label: str, lines: list[EvalLine], total_evals: int)
         match = f"{html.escape(ln.away_team)} @ {html.escape(ln.home_team)}"
         score = f"{ln.away_score}-{ln.home_score}"
         cible = f" [{html.escape(ln.selection)}]" if ln.selection else ""
+        
+        # Correctif 5 : NO_BET affichés sans ✅/❌, avec texte explicite
+        if ln.verdict == "NO_BET":
+            if ln.outcome == WON:
+                outcome_text = "aurait gagné (occasion manquée)"
+            elif ln.outcome == LOST:
+                outcome_text = "aurait perdu (abstention justifiée)"
+            else:  # PUSH
+                outcome_text = "aurait fait push"
+        else:
+            outcome_text = _OUTCOME_LABELS[ln.outcome]
+        
         body.append(
             f"• {match} ({score}) — {html.escape(ln.verdict)}{cible} : "
-            f"{_OUTCOME_LABELS[ln.outcome]}, {_clv_label(ln.clv)}"
+            f"{outcome_text}, {_clv_label(ln.clv)}"
             f"{_position_label(ln.position_action, ln.outcome)}"
         )
 
-    summary = _summary_line([ln.outcome for ln in lines])
+    # Correctif 5 : Taux de réussite séparé (SIGNAL/ANOMALIE uniquement)
+    signal_lines = [ln for ln in lines if ln.verdict in ("SIGNAL", "ANOMALIE")]
+    nobet_lines = [ln for ln in lines if ln.verdict == "NO_BET"]
+    
+    summary_parts = []
+    if signal_lines:
+        summary_parts.append(_summary_line([ln.outcome for ln in signal_lines]))
+    if nobet_lines:
+        won_nobet = sum(1 for ln in nobet_lines if ln.outcome == WON)
+        total_nobet = len(nobet_lines)
+        summary_parts.append(
+            f"NO_BET : {won_nobet}/{total_nobet} auraient gagné (faux négatifs)"
+        )
+    
+    summary = "\n".join(summary_parts) if summary_parts else "Aucune évaluation décisive."
+    
     footer = f"{total_evals} évaluations cumulées."
     if total_evals < _MIN_EVALS_FOR_TRUST:
         footer += (

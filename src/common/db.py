@@ -577,8 +577,11 @@ def insert_evaluation(
 
 
 def count_evaluations(conn: sqlite3.Connection) -> int:
-    """Nombre total d'évaluations cumulées (garde-fou des 50–100, section 11)."""
-    return conn.execute("SELECT COUNT(*) AS n FROM evaluations").fetchone()["n"]
+    """Nombre total d'évaluations cumulées (garde-fou des 50–100, section 11).
+    
+    Correctif 3c : exclut les évaluations invalidées (API bug, données erronées).
+    """
+    return conn.execute("SELECT COUNT(*) AS n FROM evaluations WHERE invalidated = 0").fetchone()["n"]
 
 
 def count_evaluations_by_logic_version(
@@ -589,11 +592,13 @@ def count_evaluations_by_logic_version(
     Le garde-fou règle 11 du rapport hebdo se mesure sur la **cohorte de calibration**
     (v2), pas sur le cumul global : les évaluations v1 (pré-correction H-1) ne doivent
     pas faire basculer le seuil prématurément.
+    
+    Correctif 3c : exclut les évaluations invalidées.
     """
     return conn.execute(
         "SELECT COUNT(*) AS n FROM evaluations e "
         "JOIN verdicts v ON v.id = e.verdict_id "
-        "WHERE v.logic_version = ?",
+        "WHERE v.logic_version = ? AND e.invalidated = 0",
         (logic_version,),
     ).fetchone()["n"]
 
@@ -609,12 +614,14 @@ def get_weekly_signal_evals(conn: sqlite3.Connection, since_iso: str) -> list[sq
     Retourne : verdict_id, logic_version, market, rules_triggered (JSON texte), outcome, clv.
     L'agrégation par marché et par règle se fait en Python (parsing JSON fiable).
     `verdict_id` est inclus pour logger les règles illisibles (parsing défensif non silencieux).
+    
+    Correctif 3c : exclut les évaluations invalidées.
     """
     return conn.execute(
         "SELECT e.verdict_id, v.logic_version, v.market, v.rules_triggered, e.outcome, e.clv "
         "FROM evaluations e "
         "JOIN verdicts v ON v.id = e.verdict_id "
-        "WHERE v.verdict = 'SIGNAL' AND e.evaluated_at >= ? "
+        "WHERE v.verdict = 'SIGNAL' AND e.evaluated_at >= ? AND e.invalidated = 0 "
         "ORDER BY e.evaluated_at",
         (since_iso,),
     ).fetchall()
@@ -625,13 +632,15 @@ def get_weekly_nobet_evals(conn: sqlite3.Connection, since_iso: str) -> list[sql
 
     Sert à mesurer les faux négatifs : la sélection pressentie aurait-elle gagné ?
     Retourne : logic_version, outcome.
+    
+    Correctif 3c : exclut les évaluations invalidées.
     """
     return conn.execute(
         "SELECT v.logic_version, e.outcome "
         "FROM evaluations e "
         "JOIN verdicts v ON v.id = e.verdict_id "
         "WHERE v.verdict = 'NO_BET' AND v.selection IS NOT NULL "
-        "  AND e.evaluated_at >= ? "
+        "  AND e.evaluated_at >= ? AND e.invalidated = 0 "
         "ORDER BY e.evaluated_at",
         (since_iso,),
     ).fetchall()
