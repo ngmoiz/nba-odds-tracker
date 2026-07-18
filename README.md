@@ -25,6 +25,7 @@ dans [CLAUDE.md](CLAUDE.md).
 | 1.5 | Bot d'écoute (boutons Telegram → positions) | ✅ |
 | 1.6 | Évaluateur (résultats, CLV, bilan quotidien + rapport hebdo) | ✅ |
 | 1.7 | docker-compose + cron WSL2 | ✅ |
+| Lot 2 | Collecteur **auto-ordonnancé** (tick unique `*/20`, groupement en vagues) — déployé le 18/07 | ✅ |
 
 Aujourd'hui, le collecteur interroge l'API, enregistre les relevés, l'analyseur
 écrit **alertes** et **verdicts** en base, le notificateur les **envoie sur
@@ -370,10 +371,16 @@ nba-odds-tracker/
 
 - Une collecte complète (h2h + spreads + totals, région `us`) = **3 crédits**.
 - Une requête qui ne renvoie aucun match (hors-saison) = **0 crédit**.
-- L'endpoint « scores » (évaluateur) coûte **2 crédits** par appel.
+- Les scores finaux (évaluateur) viennent de **balldontlie** (gratuit) → **0 crédit The Odds API**.
 - Le quota restant est **loggé après chaque appel** (`x-requests-remaining`).
 
-Budget cible : ~5 collectes/jour ≈ 450 crédits/mois, sur les 500 du plan gratuit.
+Budget variable, fonction du nombre de vagues `W` et de matchs `M` par jour :
+`≈ 3 (matin) + 12·W + ~1·M` (voir la section [Installer le cron WSL2](#installer-le-cron-wsl2)
+pour le détail et des exemples chiffrés). Le plafond du plan gratuit est de 500 crédits/mois.
+
+> ⚠️ **`collection_log` ne trace que les cibles de vague** : les chemins **matin** et
+> **force** n'y écrivent pas encore. Toute mesure de consommation doit donc croiser
+> `collection_log` avec l'en-tête `x-requests-remaining`, sinon elle sous-estime le réel.
 
 ---
 
