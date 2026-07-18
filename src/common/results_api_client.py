@@ -4,6 +4,10 @@ Réservé aux **scores officiels** (utilisé par l'évaluateur). The Odds API re
 seule source de cotes : balldontlie n'entame pas son quota. Le plan gratuit couvre
 la NBA et la WNBA.
 
+Le chemin d'endpoint (`/v1/games` pour NBA, `/wnba/v1/games` pour WNBA) est dérivé
+automatiquement du sport configuré dans `api.sport` (règle 0.4.7 : pas de constante
+codée en dur).
+
 Comme le client The Odds API, on encapsule l'HTTP, on parse le JSON en objets typés,
 et on injecte un `transport` httpx pour tester sans réseau.
 """
@@ -39,8 +43,12 @@ class GameResult:
 
     @property
     def is_final(self) -> bool:
-        """Vrai si le match est terminé (score officiel exploitable)."""
-        return self.status.strip().lower() == "final"
+        """Vrai si le match est terminé (score officiel exploitable).
+        
+        Accepte 'Final' (NBA) et 'post' (WNBA) comme statuts de match terminé.
+        """
+        status_lower = self.status.strip().lower()
+        return status_lower in ("final", "post")
 
 
 class ResultsApiClient:
@@ -66,12 +74,28 @@ class ResultsApiClient:
 
     @classmethod
     def from_config(cls, settings, config: dict) -> ResultsApiClient:
-        """Construit le client à partir de la configuration du projet."""
+        """Construit le client à partir de la configuration du projet.
+        
+        Le chemin d'endpoint est dérivé automatiquement du sport configuré dans
+        `api.sport` (règle 0.4.7). Si le sport n'a pas de chemin configuré, une
+        erreur explicite est levée.
+        """
+        sport = config["api"]["sport"]
         results = config["results"]
+        games_paths = results["games_paths"]
+        
+        try:
+            games_path = games_paths[sport]
+        except KeyError:
+            raise ResultsApiError(
+                f"Aucun chemin balldontlie configuré pour le sport '{sport}'. "
+                f"Sports disponibles : {list(games_paths.keys())}"
+            )
+        
         return cls(
             api_key=settings.balldontlie_api_key,
             base_url=results["base_url"],
-            games_path=results["games_path"],
+            games_path=games_path,
         )
 
     def __enter__(self) -> ResultsApiClient:
@@ -121,12 +145,15 @@ def _parse_game(game: dict) -> GameResult:
 
     La date renvoyée par l'API est une chaîne ISO (parfois avec l'heure) : on ne
     conserve que la partie calendaire 'YYYY-MM-DD'.
+    
+    Compatible NBA et WNBA : les scores sont dans `home_score` / `away_score` (pas
+    `home_team_score` / `visitor_team_score`).
     """
     return GameResult(
         game_date=str(game["date"])[:10],
         status=str(game.get("status", "")),
         home_team=game["home_team"]["full_name"],
         away_team=game["visitor_team"]["full_name"],
-        home_score=int(game["home_team_score"]),
-        away_score=int(game["visitor_team_score"]),
+        home_score=int(game["home_score"]),
+        away_score=int(game["away_score"]),
     )

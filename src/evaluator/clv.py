@@ -74,4 +74,18 @@ def compute_clv(
     closing_odds = closing.odds if closing else None
     if closing is None or opening is None:
         return closing_odds, None
+    
+    # Garde-fou : si verdict et clôture pointent vers le même snapshot, le CLV
+    # n'est pas mesurable (pas de collecte entre verdict et tip-off) → None.
+    # Distinction critique : CLV None (non mesurable) ≠ CLV 0,0 (marché stable).
+    if closing.snapshot_at == opening.snapshot_at:
+        from common.logging_config import get_logger
+        logger = get_logger("clv")
+        logger.warning(
+            "CLV non mesurable : verdict et clôture sur le même snapshot (%s). "
+            "Pas de collecte entre verdict et tip-off.",
+            closing.snapshot_at
+        )
+        return closing_odds, None
+    
     return closing_odds, closing.prob - opening.prob

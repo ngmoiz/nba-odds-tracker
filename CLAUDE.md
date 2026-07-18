@@ -370,9 +370,58 @@ Mode mentor obligatoire : expliquer chaque concept (VPC, groupe de sécurité, p
 3. Collecteur/analyseur/évaluateur en Lambdas planifiées ; bot d'écoute en webhook (API Gateway → Lambda).
 4. Comparaison finale EC2 vs serverless (coûts, exploitation, limites) — question d'entretien DevOps classique à préparer avec le développeur.
 
+### Phase V1.1 — « De suiveur à prédictif » (post-validation 7 jours)
+
+> Plan détaillé (analyse indépendante + tri des avis IA + spec technique complète) dans
+> `draft/analyse-amelioration.md` (**non versionné** : brouillon de travail). Le présent bloc
+> en fige la substance dans la source de vérité. Rien ici ne modifie de seuil avant les
+> 50–100 évaluations de la règle 11.
+
+**Diagnostic.** L'outil est un *détecteur de mouvement de marché* (line-following), pas un
+prédicteur de résultat. La pièce manquante pour créer de la valeur (et non hériter de celle
+des autres) est une **opinion chiffrée indépendante sur l'issue**, confrontée au prix.
+
+**Phase A — hygiène (pendant/juste après J7, ne rien casser).**
+- A1 discipline : paper only, flat 1u, **CLV = métrique n°1**.
+- A2 : lancer `scripts/analyze_r4_distribution.py` **à J7** → choisir le plancher R4 **sur données**.
+- A3 **kill-switch** : valeurs **définies maintenant** au journal (ex. après 50 SIGNAL v3, si CLV
+  glissant < 0 **et** win rate < 52,4 % → `NO_BET` forcé), **code livré avec la release v3, pas
+  pendant le gel**.
+
+**Phase B — cœur (post-J7).**
+- B1 plancher d'ampleur R4 (`min_move_line`/`min_move_prob`) — **bloqué jusqu'aux données J7**.
+- B2 pondération progressive R1 (2/4/6 pt).
+- B3 filtre anti value-trap « move refroidi » : **mesuré en collectes consécutives (≥ 2-3), jamais
+  en heures**, et **inapplicable en fenêtre de décision H-1** (moves frais = les plus exploitables).
+- B4 cooldown / anti-corrélation (1-2 expositions corrélées par soirée).
+- B5 **modèle de force baseline (Elo + marge de victoire + avantage terrain + repos/B2B) → `p_model`** ;
+  décision **hybride** : `SIGNAL` seulement si `sign(move)` cohérent **ET** `|p_model − p_mkt| > τ`.
+  **Pré-requis backfill** : rejouer la **saison WNBA complète** via balldontlie (la base n'a qu'~1
+  semaine à mi-saison ; démarrer à 1500 rendrait `p_model` faux et `min_games_for_edge` jamais
+  satisfait). **Bloquant** : confirmer d'abord l'endpoint WNBA de balldontlie (`games_path` est NBA).
+
+**Séquencement des versions de logique** (évite de multiplier les resets de cohorte) :
+- **v3** = B1+B2+B3+B4 + code du kill-switch A3 → 1er J0.
+- **B5 en shadow** (edge loggé, non bloquant) = **aucun bump** (ne change aucune décision).
+- **v4** = activation de la règle hybride bloquante → 2e J0.
+
+**Multi-ligue (WNBA ↔ NBA).** `config.yaml` restructuré en `active_sport` + `defaults` + `leagues`
+(merge profond dans `common/config.py`, forme plate préservée pour le reste du code). Base SQLite
+**partagée**, partitionnée par `sport` ; toute agrégation de stats doit filtrer par `sport`.
+
+**Phase C — raffinement (données à l'appui).** Ancrage sharp (Pinnacle `eu`, coût quota) ; totals
+(mouvement de ligne réel + Poisson/normale) ; key numbers à la bascule NBA ; Kelly fractionnel
+**seulement après CLV > 0 prouvé sur 200+ évals**.
+
+**Statut permanent (lucidité).** Le CLV est mesuré sur la **médiane US loggée**, pas sur la cote
+**exécutable** (Betclic) → il **surestime** l'edge encaissable. B5 ne corrige pas cet écart
+(structurel). **Statut = laboratoire d'apprentissage** tant que CLV > 0 n'est pas prouvé sur
+**≥ 100 évals en cohorte v4**.
+
 ---
 
 ## 10. Définition de « terminé » (Definition of Done) par fonctionnalité
+
 
 Une fonctionnalité est terminée quand : le code est testé (pytest vert), loggé, configuré via `config.yaml`/`.env` (rien en dur), documenté dans le README, et **expliquée au développeur** (il doit pouvoir la décrire avec ses mots).
 
@@ -386,6 +435,7 @@ Une fonctionnalité est terminée quand : le code est testé (pytest vert), logg
 
 | Date | Changement | Justification |
 |---|---|---|
+| 2026-07-17 | **Adoption du plan V1.1 « de suiveur à prédictif » (voir §9 Roadmap → Phase V1.1)** : analyse indépendante + tri de 3 avis IA (retenu/partiel/écarté) + un 4ᵉ avis d'amendement, consignés dans `draft/analyse-amelioration.md` (non versionné). **Retenu** : modèle de force Elo (marge de victoire + avantage terrain + repos/B2B) → `p_model`, décision hybride `SIGNAL ⟺ sign(move) cohérent ET |p_model−p_mkt|>τ` ; plancher d'ampleur R4 ; pondération progressive R1 ; filtre « move refroidi » ; kill-switch chiffré ; cooldown anti-corrélation ; discipline paper + CLV métrique n°1. **Écarté** (infaisable à cette échelle) : RLM (pas de données de splits sur l'API gratuite), injury reports temps réel automatisés, détection HFT. **4 amendements actés** : (a) backfill Elo = **saison WNBA complète** via balldontlie, pas la base locale (~1 semaine à mi-saison), pré-requis bloquant = confirmer l'endpoint WNBA (`games_path` actuel = NBA) ; (b) « move refroidi » mesuré en **collectes consécutives (≥2-3), jamais en heures**, inapplicable en fenêtre H-1 ; (c) **séquencement des versions** : v3 = B1→B4 + kill-switch (1er J0), B5 shadow **sans bump**, v4 = hybride bloquant (2ᵉ J0) ; (d) kill-switch **défini maintenant, codé en v3** (jamais pendant le gel). **Statut permanent** : le CLV est mesuré sur la médiane US loggée, pas sur la cote exécutable → surestime l'edge encaissable ; projet = **laboratoire** tant que CLV>0 n'est pas prouvé sur ≥100 évals cohorte v4. **1er chantier engagé (hors gel règle 11)** : refactor multi-ligue `config.yaml` (`active_sport`/`defaults`/`leagues`) + `load_config(sport=…)`. | Règle 0.5 (document vivant) : figer dans la source de vérité un plan prospectif qui vivait dans un fichier gitignoré, sans modifier aucun seuil avant les 50–100 évaluations (règle 11). La pièce manquante n'est pas une 8ᵉ règle de mouvement mais une opinion indépendante sur l'issue, confrontée au prix. |
 | 2026-07-16 | **Correctif cron prev-validation 7 jours (post-1.7)** : planning 6 creneaux + collectes conditionnelles + garde de reserve + logs vers logs/ + ligne parasite supprimee + projection corrigee (evaluateur = balldontlie = 0 credit Odds API). Total mensuel : ~438 credits pic (saison WNBA), ~393 avec garde. Table meta ajoutee. Tests : skip base vide, collecte si matchs, morning inconditionnel, reserve, dedup, sortie de garde, borne window_hours=2.0. | Les tip-offs WNBA s etalent jusqu a 04:00 Paris (cote Ouest). Collectes conditionnelles economisent quota hors-saison. Garde de reserve protege fin de mois. /tmp perdu au reboot. Projection initiale comptait a tort 60 credits/mois pour evaluateur (balldontlie = gratuit). |
 | 2026-07-16 | **Correctif planning cron (post-1.7)** : les collectes du soir sont recalées sur les fenêtres H-1 réelles des tip-offs WNBA (matchs en soirée heure US = 01:00–04:00 Paris). H-6 à 20:00, H-3 à 23:00, H-1 à 01:00 (au lieu de 18:00/21:00/23:00 qui rataient les tip-offs nocturnes). Sans ce correctif, la re-décision H-1 livrée à l'étape 1.6 ne s'exécutait jamais en production. **Limite structurelle cron-WSL2 documentée** : rien ne tourne si le PC est éteint ou en veille — motivation opérationnelle de la phase 3 (EC2, serveur 24/7). Pour la validation 7 jours, le PC restera allumé. | Les tip-offs WNBA sont nocturnes en heure de Paris ; un planning calé sur des heures « bureau » ne couvre jamais la fenêtre de décision. La limite WSL2 est inhérente au local et justifie le passage au cloud. |
 | 2026-07-16 | **Étape 1.7** : conteneurisation + cron WSL2. **Image Docker commune** (pas une image par composant) avec point d'entrée paramétré (`ENTRYPOINT ["uv","run"]`, commande via docker-compose). `Dockerfile` : `python:3.12-slim` + `uv` (binary copy from ghcr.io), `uv sync --frozen --no-dev` (production sans pytest/ruff), cache Docker optimisé (dépendances copiées avant le code source). `.dockerignore` exclut tests/data/secrets. `docker-compose.yml` : listener en continu (`restart: unless-stopped`) + collector/évaluateur one-shot (lancés par cron via `docker compose run --rm --no-deps`), volume nommé `nba-data` pour la base SQLite. `scripts/setup_cron.sh` : 5 collectes/jour (09:00, 15:00, 18:00, 21:00, 23:00) + évaluateur 09:30 (heure Europe/Paris), idempotent (marqueur `# nba-odds-tracker (1.7)`), logs via `logger -t nba-*`. | Image commune plutôt qu'une par composant : évite de dupliquer ~300 Mo de couches Python identiques pour ne varier que la commande ; cohérent avec l'enchaînement collecteur→analyseur→notificateur dans le même processus. `--no-dev` : pytest/ruff non nécessaires en production. `--frozen` : reproductibilité stricte (uv.lock). Volume nommé : la base SQLite persiste entre les one-shots et le listener. |

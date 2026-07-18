@@ -108,7 +108,11 @@ notifier:
 results:
   provider: balldontlie
   base_url: https://api.balldontlie.io
-  games_path: /v1/games       # NBA en V1 ; WNBA = chemin dédié (à confirmer le moment venu)
+  # Chemin balldontlie par ligue : le namespace est dans le CHEMIN, pas un paramètre.
+  # Le chemin est sélectionné automatiquement selon api.sport (règle 0.4.7).
+  games_paths:
+    basketball_nba:  /v1/games        # namespace NBA
+    basketball_wnba: /wnba/v1/games   # namespace WNBA
   # Fuseau de référence des dates de match côté balldontlie (calendrier US).
   calendar_timezone: America/New_York
 

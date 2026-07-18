@@ -98,3 +98,18 @@ def format_daily_report(day_label: str, lines: list[EvalLine], total_evals: int)
         )
 
     return header + "\n" + "\n".join(body) + "\n\n" + summary + "\n" + footer
+
+
+def format_degraded_report(day_label: str, pending_count: int, cause: str) -> str:
+    """Compose un bilan dégradé quand aucun match n'a pu être évalué.
+    
+    Mode de panne interdit : un composant qui échoue doit le signaler explicitement.
+    Ce rapport est envoyé quand des matchs clos attendent évaluation mais que les
+    résultats sont indisponibles (API balldontlie en panne, quota épuisé, etc.).
+    """
+    header = f"📊 <b>Bilan du {html.escape(day_label)}</b>"
+    warning = (
+        f"⚠️ <b>0 match évalué</b> — {pending_count} match(s) en attente\n"
+        f"Cause : {html.escape(cause)}"
+    )
+    return f"{header}\n{warning}"

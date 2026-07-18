@@ -21,6 +21,20 @@ def normalize_team(name: str) -> str:
     return " ".join(name.strip().lower().split())
 
 
+def teams_match(name1: str, name2: str) -> bool:
+    """Vérifie si deux noms d'équipes correspondent (exact ou partiel).
+    
+    Accepte une correspondance si :
+    - Les noms normalisés sont identiques (ex: "Boston Celtics" == "boston celtics")
+    - Un nom contient l'autre (ex: "Toronto Tempo" contient "Tempo")
+    
+    Cette flexibilité gère les incohérences entre The Odds API et balldontlie
+    (ex: "Toronto Tempo" vs "Tempo", "Portland Fire" vs "Fire").
+    """
+    n1, n2 = normalize_team(name1), normalize_team(name2)
+    return n1 == n2 or n1 in n2 or n2 in n1
+
+
 def tipoff_calendar_date(tipoff_utc: str, calendar_tz: str) -> date:
     """Date calendaire du match dans le fuseau de la ligue (US), depuis le tip-off UTC."""
     dt = datetime.fromisoformat(tipoff_utc.replace("Z", "+00:00"))
@@ -38,17 +52,19 @@ def find_result(
 ) -> GameResult | None:
     """Trouve le résultat correspondant au match, ou None.
 
-    Critères : mêmes noms d'équipes (normalisés) et date balldontlie à ±`max_day_gap`
-    jour de la date calendaire du tip-off. En cas de plusieurs candidats, on prend le
-    plus proche en date.
+    Critères : noms d'équipes correspondants (exact ou partiel) et date balldontlie à
+    ±`max_day_gap` jour de la date calendaire du tip-off. En cas de plusieurs candidats,
+    on prend le plus proche en date.
+    
+    Le matching flexible gère les incohérences entre APIs (ex: "Toronto Tempo" vs "Tempo").
     """
     target = tipoff_calendar_date(tipoff_utc, calendar_tz)
-    home, away = normalize_team(home_team), normalize_team(away_team)
 
     best: GameResult | None = None
     best_gap = timedelta(days=max_day_gap + 1)
     for game in games:
-        if normalize_team(game.home_team) != home or normalize_team(game.away_team) != away:
+        # Matching flexible : accepte correspondance exacte ou partielle
+        if not (teams_match(game.home_team, home_team) and teams_match(game.away_team, away_team)):
             continue
         gap = abs(date.fromisoformat(game.game_date) - target)
         if gap <= timedelta(days=max_day_gap) and gap < best_gap:

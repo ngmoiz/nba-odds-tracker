@@ -99,17 +99,35 @@ def test_find_result_returns_none_when_absent():
                        tipoff_utc="2026-01-17T00:20:00Z", calendar_tz="America/New_York") is None
 
 
+def test_find_result_flexible_matching_partial_names():
+    """Matching flexible : accepte les noms partiels (ex: "Tempo" match "Toronto Tempo")."""
+    # balldontlie renvoie "Tempo" au lieu de "Toronto Tempo"
+    games = [_game("2026-07-17", "Atlanta Dream", "Tempo", 95, 90)]
+    r = find_result(games, home_team="Atlanta Dream", away_team="Toronto Tempo",
+                    tipoff_utc="2026-07-17T23:30:00Z", calendar_tz="America/New_York")
+    assert r is not None and r.home_score == 95
+
+
+def test_find_result_flexible_matching_reversed_partial():
+    """Matching flexible : fonctionne dans les deux sens (nom court dans nom long)."""
+    # balldontlie renvoie "Fire" au lieu de "Portland Fire"
+    games = [_game("2026-07-16", "Washington Mystics", "Fire", 88, 82)]
+    r = find_result(games, home_team="Washington Mystics", away_team="Portland Fire",
+                    tipoff_utc="2026-07-16T23:00:00Z", calendar_tz="America/New_York")
+    assert r is not None and r.away_score == 82
+
+
 # ─────────────────────────── client balldontlie ───────────────────────────
 
 def test_results_client_parses_and_paginates():
     pages = [
         {"data": [{"date": "2026-01-16", "status": "Final",
                    "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
-                   "home_team_score": 110, "visitor_team_score": 100}],
+                   "home_score": 110, "away_score": 100}],
          "meta": {"next_cursor": 90}},
         {"data": [{"date": "2026-01-16T00:00:00.000Z", "status": "Final",
                    "home_team": {"full_name": "Lakers"}, "visitor_team": {"full_name": "Suns"},
-                   "home_team_score": 99, "visitor_team_score": 98}],
+                   "home_score": 99, "away_score": 98}],
          "meta": {"next_cursor": None}},
     ]
     calls = {"n": 0}
@@ -194,9 +212,11 @@ def _settings() -> Settings:
 
 
 CONFIG = {
+    "api": {"sport": "basketball_wnba"},
     "display": {"timezone": "Europe/Paris"},
     "results": {"calendar_timezone": "America/New_York",
-                "base_url": "https://api.balldontlie.io", "games_path": "/v1/games"},
+                "base_url": "https://api.balldontlie.io",
+                "games_paths": {"basketball_nba": "/v1/games", "basketball_wnba": "/wnba/v1/games"}},
     "evaluator": {"lookback_days": 3},
 }
 
@@ -283,6 +303,51 @@ def test_format_daily_report_shows_outcome_clv_rate_and_guardrail():
 
 def test_format_daily_report_empty():
     assert "Aucun verdict" in format_daily_report("17/01/2026", [], total_evals=0)
+
+
+def test_format_degraded_report():
+    """Bilan dégradé quand des matchs sont en attente mais sans résultats disponibles."""
+    from evaluator.reporting import format_degraded_report
+    msg = format_degraded_report("18/07/2026", pending_count=6, cause="résultats indisponibles")
+    assert "Bilan du 18/07/2026" in msg
+    assert "⚠️" in msg
+    assert "0 match évalué" in msg
+    assert "6 match(s) en attente" in msg
+    assert "résultats indisponibles" in msg
+
+
+def test_evaluate_pending_sends_degraded_report_when_no_results(conn):
+    """Défaut 2 : envoi inconditionnel du bilan, même quand aucun match n'a pu être évalué."""
+    db.insert_verdict(conn, match_id="m1", verdict="SIGNAL", selection="Boston Celtics",
+                      market="spreads", line=-5.0, odds_at_verdict=1.91, signal_score=6,
+                      rules_triggered="[]", rationale="…", decided_at="2026-01-16T23:20:00Z")
+    conn.commit()
+
+    # Mock telegram client pour capturer le message envoyé
+    sent_messages = []
+    class _FakeTelegram:
+        is_configured = True
+        def send_message(self, text, **kwargs):
+            sent_messages.append(text)
+            return True
+
+    from datetime import datetime, timezone
+    summary = evaluate_pending(conn, _settings(), CONFIG,
+                               results_client=_fake_results_client([]),  # aucun résultat
+                               telegram_client=_FakeTelegram(),
+                               now=datetime(2026, 1, 17, 12, 0, tzinfo=timezone.utc))
+
+    # Le match est sauté (pas de résultat)
+    assert summary["skipped"] == 1
+    assert summary["evaluated"] == 0
+    
+    # Un bilan dégradé doit avoir été envoyé
+    assert len(sent_messages) == 1
+    msg = sent_messages[0]
+    assert "⚠️" in msg
+    assert "0 match évalué" in msg
+    assert "1 match(s) en attente" in msg
+    assert "résultats indisponibles" in msg
 
 
 # ─────────────────── CLV insensible aux snapshots post-tip-off ───────────────────

@@ -23,7 +23,7 @@ from common.results_api_client import ResultsApiClient
 from evaluator.clv import compute_clv
 from evaluator.grading import grade_verdict
 from evaluator.reconcile import find_result, tipoff_calendar_date
-from evaluator.reporting import EvalLine, format_daily_report
+from evaluator.reporting import EvalLine, format_daily_report, format_degraded_report
 from evaluator.weekly import format_weekly_report
 from notifier.direct import send_direct
 
@@ -91,6 +91,16 @@ def evaluate_pending(
                 summary["skipped"] += 1
             continue
 
+        # Garde-fou : API balldontlie renvoie parfois status="post" avec scores 0-0
+        # (données invalides). On refuse d'évaluer pour éviter des pushes erronés.
+        if result.home_score == 0 and result.away_score == 0:
+            logger.warning(
+                "Match %s : scores 0-0 invalides (API bug), skip évaluation.",
+                match["match_id"]
+            )
+            summary["ungradable"] += 1
+            continue
+
         data = preprocess(conn, match["match_id"])
         for verdict in db.get_verdicts_for_match(conn, match["match_id"]):
             outcome = grade_verdict(
@@ -149,10 +159,18 @@ def evaluate_pending(
 
     conn.commit()
 
+    # Envoi inconditionnel du bilan (Défaut 2 : mode de panne interdit).
+    # Si des matchs étaient en attente mais qu'aucun n'a pu être évalué (résultats
+    # indisponibles), on envoie un bilan dégradé explicite.
+    day_label = now.astimezone(ZoneInfo(config["display"]["timezone"])).strftime("%d/%m/%Y")
     if lines:
-        day_label = now.astimezone(ZoneInfo(config["display"]["timezone"])).strftime("%d/%m/%Y")
         text = format_daily_report(day_label, lines, db.count_evaluations(conn))
         send_direct(settings, text, client=telegram_client)
+    elif summary["skipped"] > 0:
+        # Des matchs étaient en attente mais aucun résultat disponible → bilan dégradé.
+        text = format_degraded_report(day_label, summary["skipped"], "résultats indisponibles")
+        send_direct(settings, text, client=telegram_client)
+        logger.warning("Bilan dégradé envoyé : %d match(s) en attente sans résultat.", summary["skipped"])
 
     logger.info("Évaluation terminée : %s", summary)
     return summary

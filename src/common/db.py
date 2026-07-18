@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS positions (
 -- `outcome` est un état métier EXPLICITE (jamais porté par un NULL) : 'push' =
 -- remboursement, exclu du dénominateur du taux de réussite (won / (won + lost)).
 -- Pour un NO_BET : issue qu'aurait eue la sélection pressentie (mesure des faux négatifs).
+-- `invalidated` permet de neutraliser une évaluation erronée (ex: API bug scores 0-0).
 CREATE TABLE IF NOT EXISTS evaluations (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     verdict_id   INTEGER NOT NULL REFERENCES verdicts(id),
@@ -99,7 +100,8 @@ CREATE TABLE IF NOT EXISTS evaluations (
     outcome      TEXT CHECK (outcome IN ('won', 'lost', 'push')),
     closing_odds REAL,                     -- cote de clôture (dernier snapshot avant tip-off)
     clv          REAL,                     -- Closing Line Value : odds_at_verdict vs closing_odds
-    evaluated_at TEXT NOT NULL
+    evaluated_at TEXT NOT NULL,
+    invalidated  INTEGER DEFAULT 0         -- 1 = évaluation neutralisée (exclue des agrégations)
 );
 
 -- Métadonnées du projet (quota persisté, état de la garde de réserve, etc.).
@@ -217,6 +219,8 @@ def init_db(db_path: Path) -> None:
         _ensure_column(conn, "verdicts", "logic_version", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "verdicts", "telegram_message_id", "INTEGER")
         _ensure_column(conn, "verdicts", "superseded_message_id", "INTEGER")
+        # Correctif J0 (18/07/2026) : colonne invalidated pour neutraliser évaluations erronées.
+        _ensure_column(conn, "evaluations", "invalidated", "INTEGER DEFAULT 0")
         conn.commit()
         logger.info("Base prête : tables, index et triggers append-only en place.")
     finally:
