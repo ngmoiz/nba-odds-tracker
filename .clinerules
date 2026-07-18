@@ -1,9 +1,10 @@
 # Règles automatiques NBA Odds Tracker
 # Chargées à chaque tâche — voir CLAUDE.md pour le détail complet
+# ⚠️ Cette section doit rester synchronisée avec CLAUDE.md (sections "Invariants" et "Définition de terminé")
 
 ## Décisions verrouillées (ne jamais rediscuter)
 - Re-décision H-1 implémentée et branchée (C1) : matchs DECIDE réanalysés en fenêtre
-- Déduplication : (match_id, target_hours) pour collectes ; state_key (market/selection|signe|ampleur) pour alertes
+- Déduplication : (match_id, target_name) pour collectes ; state_key (market/selection|signe|ampleur) pour alertes
 - Cibles collecte : tip-off le plus précoce sauf closing per-match (dernier snapshot avant chaque tip-off)
 - window_hours = 2.5 : verdict à H-2 (H-3 hors, H-2 dedans), re-décision à H-1
 - None explicite obligatoire : jamais de valeur par défaut masquant une donnée absente (ex: score absent gradé 'push' au lieu de None)

@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from collector.collector import run_collection
 from common import db
-from common.config import load_config
 from common.odds_api_client import Bookmaker, Market, OddsEvent, Outcome
 
 
@@ -118,7 +117,6 @@ def main():
     
     # Crée des verdicts pour les 6 matchs (pour tester closing per-match)
     # Verdicts créés à H-2.5 (juste avant la fenêtre verdict H-2)
-    verdict_time = start_time + timedelta(hours=3, minutes=30)
     
     for tick in range(72):
         tick_time = start_time + (tick * tick_interval)
@@ -183,7 +181,7 @@ def main():
         ORDER BY match_id
     """).fetchall()
     
-    print(f"\n📸 Snapshots par match :")
+    print("\n📸 Snapshots par match :")
     for s in snapshots:
         print(f"  {s['match_id']} : {s['cnt']} snapshots")
     
@@ -191,7 +189,7 @@ def main():
     print(f"\n💰 Crédits consommés : {total_credits}")
     
     # Vérification closing per-match
-    print(f"\n🎯 Vérification closing per-match :")
+    print("\n🎯 Vérification closing per-match :")
     closing_logs = conn.execute("""
         SELECT match_id, markets
         FROM collection_log

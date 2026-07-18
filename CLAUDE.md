@@ -6,29 +6,38 @@
 
 ## Invariants
 
+> **Note** : Cette section doit rester synchronisée avec `.clinerules` (section "Décisions verrouillées").
+
 **Décisions qui ne se rediscutent jamais :**
 
 1. **Re-décision H-1** : implémentée et branchée par C1 (correctif revue externe 2026-07-17) — les matchs DECIDE sont réanalysés à chaque collecte tant qu'ils sont dans la fenêtre, le verdict est mis à jour en place jusqu'au tip-off ou à la prise de position.
-2. **Déduplication (match_id, target_hours)** : un match ne génère qu'une seule collecte par créneau cible ; la déduplication des alertes se fait par `state_key` (market/selection|signe|ampleur).
-3. **Cibles de collecte** : tip-off le plus précoce de la journée NBA, sauf pour la cote de clôture qui est per-match (dernier snapshot avant chaque tip-off).
-4. **`window_hours = 2.5`** : fenêtre de décision H-1 fixée à 2,5 heures avant le tip-off (configurable mais valeur de référence validée).
-5. **Jamais de valeur par défaut masquant une donnée absente** : `None` explicite obligatoire (ex. `outcome='push'` au lieu de `NULL`, `line=NULL` pour h2h au lieu de 0).
-6. **Échec bruyant obligatoire** : jamais de no-op silencieux — tout échec est loggé (warning minimum), toute anomalie de parsing génère une mention dans les rapports (ex. « ⚠️ N verdict(s) à règles illisibles »).
-7. **Append-only sur `odds_snapshots`** : on invalide (statut, `superseded_message_id`), on ne supprime jamais les relevés de cotes ; les autres tables ont un cycle de vie normal.
-8. **Rituel de déploiement** : `docker compose build` + `docker compose up -d --force-recreate` + vérification (logs, base, message Telegram test) — jamais de déploiement sans preuve observée.
+2. **Déduplication** : `(match_id, target_name)` pour collectes (Lot 2, correction bug conception) ; `state_key` (market/selection|signe|ampleur) pour alertes.
+3. **Cibles de collecte** : tip-off le plus précoce de la journée NBA, sauf closing per-match (dernier snapshot avant chaque tip-off).
+4. **`window_hours = 2.5`** : verdict à H-2 (H-3 hors fenêtre, H-2 dedans), re-décision à H-1.
+5. **`None` explicite obligatoire** : jamais de valeur par défaut masquant une donnée absente (ex: score absent gradé `'push'` au lieu de `None`).
+6. **Échec bruyant obligatoire** : jamais de no-op silencieux, tout échec loggé (warning min), anomalie parsing → mention rapport.
+7. **Append-only sur `odds_snapshots`** : on invalide (statut, `superseded_message_id`), on ne supprime jamais.
+8. **TEST_MODE jamais en production** : uniquement pour tests, détecté et rejeté au démarrage.
+9. **Rituel de déploiement** : `docker compose build` + `up -d --force-recreate` + vérification (logs/base/Telegram).
 
 ---
 
 ## Définition de terminé
 
+> **Note** : Cette section doit rester synchronisée avec `.clinerules` (section "Définition de terminé").
+
 **Une tâche est terminée quand :**
 
-1. **Suite complète relancée avec son total réel** : `pytest` exécuté sur l'ensemble des tests (jamais une addition de sous-ensembles ou un test isolé) avec le décompte total affiché.
-2. **`ruff check` passe** : aucune violation de lint non justifiée.
-3. **`git status` propre ou commit effectué** : les changements sont versionnés, pas de fichiers modifiés non commités (sauf `.env` et fichiers gitignorés).
-4. **Preuve observée pour toute affirmation factuelle** : sortie de commande collée telle quelle (logs, résultat de test, message Telegram, requête SQL) — **le mot « déjà » est interdit sans extrait de code à l'appui**.
-5. **Un test qui casse pose la question « la garantie tient-elle ? »** : il n'appelle jamais un champ de compatibilité ascendante sans justification explicite — un test rouge est un signal, pas un obstacle à contourner.
-6. **`scripts/check.sh` lancé avant tout rapport de fin de lot** : sortie collée dans le rapport (preuve que les 3 vérifications — tests, lint, git — ont été faites).
+1. **Suite complète pytest relancée avec total réel** (jamais addition de sous-ensembles).
+2. **`ruff check` passe** (aucune violation non justifiée).
+3. **`git status` propre ou commit effectué**.
+4. **Preuve observée pour toute affirmation factuelle** (sortie commande collée) — **« déjà » interdit sans extrait code**.
+5. **Test qui casse → question « la garantie tient-elle ? »** (jamais champ compatibilité sans justification).
+6. **`scripts/check.sh` lancé avant rapport fin de lot**, sortie collée.
+7. **Interdiction de supprimer, skipper ou réécrire un test pour le faire passer.** Un test qui échoue se corrige côté code, ou son échec est signalé tel quel et laissé rouge.
+8. **Si un bug est identifié en cours de tâche, il est signalé explicitement dans le rapport final, même non corrigé** — jamais contourné en silence.
+9. **Un rapport final ne présente que la sortie brute de `pytest -q`.** Les formulations « X% des tests exécutables », « N tests fonctionnels », ou toute addition de sous-ensembles sont interdites.
+10. **Manquer de temps ou de contexte n'autorise aucun raccourci** : la bonne réponse est de s'arrêter et de rapporter l'état réel.
 
 ---
 
@@ -511,4 +520,5 @@ Une fonctionnalité est terminée quand : le code est testé (pytest vert), logg
 **(2, cosmétique) — R4 étiquette "fenêtre récente"** : le calcul R4 est `values[-1] - values[0]` (ouverture→dernier), identique à R1, mais l'étiquette disait "fenêtre récente". Corrigé → "depuis l'ouverture". Pas de changement de comportement, pas de nouveau J0.
 **(3, documentation) — "ouverture" = première collecte de l'outil** : `series[0]` est le premier snapshot collecté par l'outil (09:00 Paris), pas l'ouverture réelle du marché. Des lignes ont pu bouger overnight avant que l'outil ne commence à suivre le match (lookahead antérieur possible). Précisé dans CLAUDE.md section 6.1 et README. Ce biais est inhérent au planning de collecte local et sera partiellement atténué en phase 3 (EC2 24/7, collecte plus précoce).
 **Pistes V2 confirmées au journal** : (a) consensus ancré sharp books (Pinnacle/Circa, région `eu` — coût quota supplémentaire à arbitrer) ; (b) ordre d'origination des mouvements (qui bouge en premier ?) ; (c) RLM (Reverse Line Movement) inaccessible sans données de splits. | R4 sans plancher = 3 points non discriminants (déclenchement quasi permanent). Étiquette R4 fausse. "Ouverture" ambiguë. Pistes V2 pour enrichir le consensus et l'analyse d'origination. |
+| 2026-07-18 | **Lot 2 : Architecture auto-ordonnancée (état non déployable)** — **FAIT** : tick 20 min, vagues 45 min, `collection_log` avec clé unique `(match_id, target_name)` (correction bug conception : déduplication par nom de cible au lieu de `hours_before` pour permettre plusieurs cibles avec même horaire), 6 cibles configurables (H-6, matin, H-3, verdict H-2, redecision H-1, closing H-0.25), priorités (1=haute, 2=basse), clôture per-match sur le marché du verdict de chaque match (correction bug conception : union des marchés de la vague → marché individuel), `window_hours=2.5` (H-3 hors fenêtre, H-2 dedans), `ConfigurationError` levée si `collector.targets` absent/vide (séparation responsabilités : collecteur lève, `__main__` attrape + log + notif + exit), garde `TEST_MODE` sur `--now` (refusé par défaut, autorisé uniquement si `TEST_MODE=true`), garde anti-gel collecte du matin (retourne AVANT vérification targets si hors fenêtre), 201 tests passed (0 failed, 0 skipped), ruff clean. **RESTE** : **bug critique snapshots post-tip-off** révélé par simulation (garde per-match défaillante, régression correctif 17/07 : la garde `tipoff > now` en tête d'`analyze_match` protège les alertes/re-décision mais pas le stockage dans `run_collection` — les matchs d'une vague étalée dont certains ont déjà commencé continuent à être collectés, les snapshots live entrent en base) ; simulation à refaire depuis un instant où les 6 matchs sont tous à venir (attendu : 6 collectes closing, une par match, chacune à H-0.25 de son tip-off, aucun snapshot après un coup d'envoi) ; `setup_cron.sh` 6 lignes → 1 battement `*/20` ; README ; journal ; déploiement selon rituel. **Commit 95773b0 poussé, NON DÉPLOYABLE.** | Corrections bugs conception validées par tests ; simulation partielle a révélé une régression critique (garde post-tip-off) — signalée telle quelle, non corrigée par manque de temps/contexte. État documenté pour reprise Claude Code. |
 | 2026-07-14 | Création du document (V1) | — |

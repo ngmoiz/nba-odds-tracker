@@ -203,7 +203,7 @@ def main():
         ORDER BY match_id
     """).fetchall()
     
-    print(f"\n📸 Snapshots par match :")
+    print("\n📸 Snapshots par match :")
     for s in snapshots:
         print(f"  {s['match_id']} : {s['cnt']} snapshots")
     
@@ -212,7 +212,7 @@ def main():
     print(f"   Collectes API : {total_credits // 3}")
     
     # Closing per-match (CRITIQUE)
-    print(f"\n🎯 Vérification closing per-match (CRITIQUE) :")
+    print("\n🎯 Vérification closing per-match (CRITIQUE) :")
     closing_logs = conn.execute("""
         SELECT match_id, markets, collected_at
         FROM collection_log
@@ -228,7 +228,7 @@ def main():
         print("  ⚠️  AUCUNE collecte closing (BUG)")
     
     # Snapshots post-tip-off (garde)
-    print(f"\n🚫 Snapshots post-tip-off (garde) :")
+    print("\n🚫 Snapshots post-tip-off (garde) :")
     post_tipoff = conn.execute("""
         SELECT m.match_id, m.tipoff_utc, COUNT(o.id) as cnt
         FROM matches m
