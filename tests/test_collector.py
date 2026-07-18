@@ -29,12 +29,41 @@ class FakeClient:
         self.last_request_cost = "3"
 
     def get_odds(self, markets: list[str] | None = None) -> list[OddsEvent]:
-        """Compatibilité Lot 2 : accepte le paramètre markets (ignoré dans les tests)."""
-        return self.events
+        """Compatibilité Lot 2 : filtre les marchés demandés."""
+        if markets is None:
+            return self.events
+        
+        # Filtre les marchés pour chaque événement
+        filtered_events = []
+        for event in self.events:
+            filtered_bookmakers = []
+            for bookmaker in event.bookmakers:
+                filtered_markets = [m for m in bookmaker.markets if m.key in markets]
+                if filtered_markets:
+                    filtered_bookmakers.append(
+                        Bookmaker(
+                            key=bookmaker.key,
+                            title=bookmaker.title,
+                            last_update=bookmaker.last_update,
+                            markets=filtered_markets,
+                        )
+                    )
+            if filtered_bookmakers:
+                filtered_events.append(
+                    OddsEvent(
+                        id=event.id,
+                        sport_key=event.sport_key,
+                        commence_time=event.commence_time,
+                        home_team=event.home_team,
+                        away_team=event.away_team,
+                        bookmakers=filtered_bookmakers,
+                    )
+                )
+        return filtered_events
 
 
 def make_event(match_id: str, tipoff: str) -> OddsEvent:
-    """Construit un match avec un bookmaker, marchés h2h + spreads (4 issues)."""
+    """Construit un match avec un bookmaker, marchés h2h + spreads + totals (6 issues)."""
     home, away = "Chicago Sky", "Seattle Storm"
     return OddsEvent(
         id=match_id,
@@ -50,6 +79,7 @@ def make_event(match_id: str, tipoff: str) -> OddsEvent:
                 markets=[
                     Market("h2h", [Outcome(home, 1.74, None), Outcome(away, 2.14, None)]),
                     Market("spreads", [Outcome(home, 1.93, -2.5), Outcome(away, 1.89, 2.5)]),
+                    Market("totals", [Outcome("Over", 1.91, 165.5), Outcome("Under", 1.91, 165.5)]),
                 ],
             )
         ],
@@ -84,9 +114,9 @@ def test_discovery_creates_match_as_decouvert(conn):
     summary = run_collection(conn, FakeClient([make_event("m1", in_hours(6))]), "basketball_wnba", force=True)
 
     assert get_match(conn, "m1")["status"] == "DECOUVERT"
-    assert _count_snapshots(conn, "m1") == 4  # 2 h2h + 2 spreads
+    assert _count_snapshots(conn, "m1") == 6  # 2 h2h + 2 spreads + 2 totals
     assert summary["discovered"] == 1
-    assert summary["snapshots"] == 4
+    assert summary["snapshots"] == 6
 
 
 def test_second_collection_moves_to_suivi(conn):
@@ -96,7 +126,7 @@ def test_second_collection_moves_to_suivi(conn):
     summary = run_collection(conn, FakeClient([event]), "basketball_wnba", force=True)
 
     assert get_match(conn, "m1")["status"] == "SUIVI"
-    assert _count_snapshots(conn, "m1") == 8  # deux relevés cumulés (append-only)
+    assert _count_snapshots(conn, "m1") == 12  # deux relevés cumulés (append-only)
     assert summary["discovered"] == 0
     assert summary["newly_tracked"] == 1
 
@@ -393,7 +423,7 @@ def test_dedup_stable_when_wave_composition_changes(conn):
         force=False,
     )
     assert summary1["targets_collected"] == 1  # 1 cible (H-6) servie pour la vague
-    assert summary1["snapshots"] == 8  # 2 matchs × 4 snapshots
+    assert summary1["snapshots"] == 4  # 2 matchs × 2 snapshots h2h (marché filtré)
 
     # Clôture manuelle de m1 (simule tip-off passé)
     db.update_match_status(conn, "m1", "CLOS")
@@ -560,9 +590,9 @@ def test_wave_grouping_threshold_45min(conn):
     # 2 cibles collectées (H-6 pour chaque vague)
     assert summary["targets_collected"] == 2
     # Vérifie que les 3 matchs ont été servis
-    assert db.is_target_served(conn, "m1", 6.0)
-    assert db.is_target_served(conn, "m2", 6.0)
-    assert db.is_target_served(conn, "m3", 6.0)
+    assert db.is_target_served(conn, "m1", "H-6")
+    assert db.is_target_served(conn, "m2", "H-6")
+    assert db.is_target_served(conn, "m3", "H-6")
 
 
 # ─── Tests de déduplication et collection_log ───
@@ -587,7 +617,7 @@ def test_target_not_collected_twice_for_same_match(conn):
         conn, FakeClient([make_event("m1", in_hours(6))]), "basketball_wnba", config, force=False
     )
     assert summary1["targets_collected"] == 1
-    assert summary1["snapshots"] == 4
+    assert summary1["snapshots"] == 2  # h2h uniquement (marché filtré)
 
     # Tick 2 : H-6 déjà servie → 0 cible collectée
     summary2 = run_collection(
@@ -630,9 +660,8 @@ def test_collection_log_records_all_targets(conn):
 # ─── Tests d'union des marchés (closing) ───
 
 
-@pytest.mark.skip(reason="TODO: Nécessite insert_verdict (analyseur) pour créer verdicts en attente")
-def test_closing_unions_verdict_markets(conn):
-    """Closing (per_match) : union des marchés des verdicts en attente."""
+def test_closing_collects_each_match_on_its_own_verdict_market(conn):
+    """Closing (per_match) : chaque match collecté sur son marché de verdict."""
     now = datetime.now(timezone.utc)
     tipoff = (now + timedelta(hours=1)).isoformat()
     
@@ -640,8 +669,8 @@ def test_closing_unions_verdict_markets(conn):
     db.insert_match(conn, match_id="m2", sport="basketball_wnba", home_team="C", away_team="D", tipoff_utc=tipoff, status="DECIDE", created_at=now.isoformat())
     
     # m1 : verdict h2h, m2 : verdict spreads
-    db.mark_verdict(conn, "m1", "h2h", "A", 1.5, "test")
-    db.mark_verdict(conn, "m2", "spreads", "C", -2.5, "test")
+    db.insert_verdict(conn, match_id="m1", verdict="SIGNAL", selection="A", market="h2h", line=None, odds_at_verdict=1.5, signal_score=10, rules_triggered="[]", rationale="test", decided_at=now.isoformat())
+    db.insert_verdict(conn, match_id="m2", verdict="SIGNAL", selection="C", market="spreads", line=-2.5, odds_at_verdict=1.9, signal_score=10, rules_triggered="[]", rationale="test", decided_at=now.isoformat())
     conn.commit()
 
     config = {
@@ -665,9 +694,10 @@ def test_closing_unions_verdict_markets(conn):
         now=tick_time,
     )
     
-    # 1 cible (closing pour la vague), union h2h + spreads = 4 snapshots × 2 matchs = 8
-    assert summary["targets_collected"] == 1
-    assert summary["snapshots"] == 8
+    # 2 collectes distinctes (1 par match), chacune sur son marché
+    # m1 : h2h (2 snapshots), m2 : spreads (2 snapshots) = 4 total
+    assert summary["targets_collected"] == 2
+    assert summary["snapshots"] == 4
 
 
 def test_closing_skipped_if_no_pending_verdicts(conn):
@@ -707,7 +737,6 @@ def test_closing_skipped_if_no_pending_verdicts(conn):
 # ─── Tests de priorités ───
 
 
-@pytest.mark.skip(reason="TODO: Logique multi-marchés/multi-priorités non implémentée (collecte par cible unique)")
 def test_priority_ordering_high_to_low(conn):
     """Cibles collectées par priorité croissante (1 avant 2 avant 3)."""
     now = datetime.now(timezone.utc)
@@ -919,7 +948,7 @@ def test_force_mode_bypasses_all_guards(conn):
     # Collecte exécutée malgré quota bas et config minimale
     assert summary["skipped"] is False
     assert summary["discovered"] == 1
-    assert summary["snapshots"] == 4
+    assert summary["snapshots"] == 6
 
 
 # ─── Garde tip-off : pas de snapshots post-tip-off ───

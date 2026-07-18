@@ -112,14 +112,16 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 -- Traçabilité des collectes auto-ordonnancées (Lot 2, architecture par vague).
--- Déduplication par (match_id, target_hours) : une cible ne peut être servie qu'une
--- fois par match. La vague (wave_label) regroupe les appels API mais n'est pas la clé.
+-- Déduplication par (match_id, target_name) : une cible ne peut être servie qu'une
+-- fois par match. target_hours est informatif. La vague (wave_label) regroupe les
+-- appels API mais n'est pas la clé.
 CREATE TABLE IF NOT EXISTS collection_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     match_id TEXT NOT NULL,
-    target_hours REAL NOT NULL,
-    target_timestamp TEXT NOT NULL,  -- Heure cible calculée (tipoff - hours_before)
-    collected_at TEXT NOT NULL,      -- Heure réelle de collecte
+    target_name TEXT NOT NULL,
+    target_hours REAL NOT NULL,       -- Informatif (plusieurs cibles peuvent partager hours_before)
+    target_timestamp TEXT NOT NULL,   -- Heure cible calculée (tipoff - hours_before)
+    collected_at TEXT NOT NULL,       -- Heure réelle de collecte
     markets TEXT NOT NULL,            -- Marchés collectés (csv)
     credits_used INTEGER NOT NULL,
     wave_label TEXT NOT NULL          -- Label informatif (pas clé de déduplication)
@@ -134,7 +136,7 @@ CREATE INDEX IF NOT EXISTS idx_alerts_match           ON alerts(match_id);
 CREATE INDEX IF NOT EXISTS idx_verdicts_match         ON verdicts(match_id);
 CREATE INDEX IF NOT EXISTS idx_positions_verdict      ON positions(verdict_id);
 CREATE INDEX IF NOT EXISTS idx_evaluations_verdict    ON evaluations(verdict_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_match_target     ON collection_log(match_id, target_hours);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_match_target     ON collection_log(match_id, target_name);
 
 -- Garantie append-only : la base rejette physiquement toute modification/suppression
 -- d'un relevé de cotes existant, quelle que soit l'application ou l'outil.
@@ -236,6 +238,8 @@ def init_db(db_path: Path) -> None:
         _ensure_column(conn, "verdicts", "superseded_message_id", "INTEGER")
         # Correctif J0 (18/07/2026) : colonne invalidated pour neutraliser évaluations erronées.
         _ensure_column(conn, "evaluations", "invalidated", "INTEGER DEFAULT 0")
+        # Lot 2 : migration collection_log (match_id, target_hours) → (match_id, target_name)
+        _ensure_column(conn, "collection_log", "target_name", "TEXT NOT NULL DEFAULT ''")
         conn.commit()
         logger.info("Base prête : tables, index et triggers append-only en place.")
     finally:
@@ -706,11 +710,11 @@ def get_matches_by_status(conn: sqlite3.Connection, statuses: tuple[str, ...]) -
     ).fetchall()
 
 
-def is_target_served(conn: sqlite3.Connection, match_id: str, target_hours: float) -> bool:
+def is_target_served(conn: sqlite3.Connection, match_id: str, target_name: str) -> bool:
     """Vérifie si une cible a déjà été servie pour un match donné."""
     row = conn.execute(
-        "SELECT 1 FROM collection_log WHERE match_id = ? AND target_hours = ?",
-        (match_id, target_hours),
+        "SELECT 1 FROM collection_log WHERE match_id = ? AND target_name = ?",
+        (match_id, target_name),
     ).fetchone()
     return row is not None
 
@@ -719,6 +723,7 @@ def mark_target_served(
     conn: sqlite3.Connection,
     *,
     match_id: str,
+    target_name: str,
     target_hours: float,
     target_timestamp: str,
     collected_at: str,
@@ -730,27 +735,22 @@ def mark_target_served(
     try:
         conn.execute(
             "INSERT INTO collection_log "
-            "(match_id, target_hours, target_timestamp, collected_at, markets, credits_used, wave_label) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (match_id, target_hours, target_timestamp, collected_at, markets, credits_used, wave_label),
+            "(match_id, target_name, target_hours, target_timestamp, collected_at, markets, credits_used, wave_label) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (match_id, target_name, target_hours, target_timestamp, collected_at, markets, credits_used, wave_label),
         )
     except sqlite3.IntegrityError:
         # Déjà servi (normal si collecte précédente), skip silencieusement
         pass
 
 
-def get_closing_markets_for_wave(conn: sqlite3.Connection, match_ids: list[str]) -> list[str]:
-    """Union des marchés des verdicts en attente de la vague (pour clôture H-0.25)."""
-    if not match_ids:
-        return []
-    
-    placeholders = ",".join("?" * len(match_ids))
+def get_closing_markets_for_match(conn: sqlite3.Connection, match_id: str) -> list[str]:
+    """Marchés des verdicts en attente pour un match (clôture H-0.25 per-match)."""
     rows = conn.execute(
-        f"""SELECT DISTINCT v.market 
-            FROM verdicts v
-            JOIN matches m ON v.match_id = m.match_id
-            WHERE m.match_id IN ({placeholders})
-              AND m.status = 'DECIDE'""",
-        match_ids,
+        """SELECT DISTINCT v.market 
+           FROM verdicts v
+           JOIN matches m ON v.match_id = m.match_id
+           WHERE m.match_id = ? AND m.status = 'DECIDE'""",
+        (match_id,),
     ).fetchall()
     return [row["market"] for row in rows]

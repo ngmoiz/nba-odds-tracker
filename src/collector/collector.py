@@ -5,8 +5,8 @@ Architecture Lot 2 (auto-ordonnancement) :
 - Tick anonyme toutes les 20 min (cron battement)
 - Groupement des matchs en vagues (seuil 45 min)
 - 6 cibles par vague : matin (quotidien), H-6, H-3, H-2 (verdict), H-1 (re-décision),
-  H-0.25 (clôture per-match avec union des marchés des verdicts)
-- Déduplication par (match_id, target_hours) : une cible ne peut être servie qu'une
+  H-0.25 (clôture per-match, chaque match collecté sur son marché de verdict)
+- Déduplication par (match_id, target_name) : une cible ne peut être servie qu'une
   fois par match (wave_label informatif, pas clé de dédup)
 - Garde de réserve par priorités : priorité 1 (verdict/re-décision/clôture) jamais
   bloquée, priorités 2-3 (matin/H-6/H-3) bloquables
@@ -290,28 +290,33 @@ def compute_due_targets(
                     continue
                 
                 # Déjà servie pour ce match ?
-                if db.is_target_served(conn, match["match_id"], hours_before):
+                target_name = target.get("name", f"H-{hours_before}")
+                if db.is_target_served(conn, match["match_id"], target_name):
                     continue
                 
                 matches_needing.append(match)
             
             if matches_needing:
+                target_name = target.get("name", f"H-{hours_before}")
                 due.append({
                     "target": target,
+                    "target_name": target_name,
                     "target_timestamp": target_timestamp.isoformat(),  # informatif (earliest)
                     "matches_needing_collection": matches_needing,
                     "per_match": True,
                 })
         else:
             # Cible sur earliest : vérifier dédup pour tous les matchs de la vague
+            target_name = target.get("name", f"H-{hours_before}")
             matches_needing = [
                 m for m in wave
-                if not db.is_target_served(conn, m["match_id"], hours_before)
+                if not db.is_target_served(conn, m["match_id"], target_name)
             ]
             
             if matches_needing:
                 due.append({
                     "target": target,
+                    "target_name": target_name,
                     "target_timestamp": target_timestamp.isoformat(),
                     "matches_needing_collection": matches_needing,
                     "per_match": False,
@@ -361,6 +366,7 @@ def _collect_and_record(
     sport: str,
     markets: list[str],
     match_ids: list[str],
+    target_name: str,
     target_hours: float,
     target_timestamp: str,
     wave_label: str,
@@ -431,6 +437,7 @@ def _collect_and_record(
         db.mark_target_served(
             conn,
             match_id=match_id,
+            target_name=target_name,
             target_hours=target_hours,
             target_timestamp=target_timestamp,
             collected_at=snapshot_at,
@@ -727,45 +734,78 @@ def run_collection(
                     )
                     continue
             
-            # Cible per-match (closing) : union des marchés des verdicts
+            # Cible per-match (closing) : chaque match collecté sur son marché de verdict
             if due.get("per_match"):
-                match_ids_needing = [m["match_id"] for m in matches_needing]
-                markets = db.get_closing_markets_for_wave(conn, match_ids_needing)
-                
-                if not markets:
-                    # Aucun verdict en attente : skip closing
+                # Boucle per-match : chaque match collecté individuellement
+                for match in matches_needing:
+                    # Garde anti-post-tip-off per-match (redondante mais explicite)
+                    match_tipoff = datetime.fromisoformat(match["tipoff_utc"].replace("Z", "+00:00"))
+                    if now >= match_tipoff:
+                        logger.info(
+                            "Match %s ignoré (closing) : tip-off passé (%s).",
+                            match["match_id"], match["tipoff_utc"],
+                        )
+                        continue
+                    
+                    # Récupère les marchés du verdict de CE match
+                    markets = db.get_closing_markets_for_match(conn, match["match_id"])
+                    
+                    if not markets:
+                        # Aucun verdict en attente pour ce match : skip
+                        logger.info(
+                            "Match %s : aucun verdict en attente, closing skippée.",
+                            match["match_id"],
+                        )
+                        continue
+                    
                     logger.info(
-                        "Cible closing : aucun verdict en attente pour %d match(s).",
-                        len(matches_needing),
+                        "Closing match %s : marchés %s (verdict).",
+                        match["match_id"], markets,
                     )
-                    continue
-                
-                logger.info(
-                    "Cible closing : %d match(s), marchés %s (union verdicts).",
-                    len(matches_needing), markets,
-                )
+                    
+                    # Collecte ce match uniquement
+                    result = _collect_and_record(
+                        conn,
+                        client,
+                        sport,
+                        markets,
+                        [match["match_id"]],
+                        due.get("target_name", target_name),
+                        target["hours_before"],
+                        due["target_timestamp"],
+                        wave_label,
+                        now,
+                    )
+                    
+                    total_snapshots += result["snapshots"]
+                    total_targets_collected += 1
+                    
+                    # Persiste crédits après chaque collecte
+                    _persist_credits(conn, client)
             else:
+                # Cible sur earliest : collecte groupée
                 markets = target.get("markets", ["h2h", "spreads", "totals"])
-            
-            # Collecte + enregistrement
-            match_ids = [m["match_id"] for m in matches_needing]
-            result = _collect_and_record(
-                conn,
-                client,
-                sport,
-                markets,
-                match_ids,
-                target["hours_before"],
-                due["target_timestamp"],
-                wave_label,
-                now,
-            )
-            
-            total_snapshots += result["snapshots"]
-            total_targets_collected += 1
-            
-            # Persiste crédits après chaque collecte
-            _persist_credits(conn, client)
+                
+                # Collecte + enregistrement
+                match_ids = [m["match_id"] for m in matches_needing]
+                result = _collect_and_record(
+                    conn,
+                    client,
+                    sport,
+                    markets,
+                    match_ids,
+                    due.get("target_name", target_name),
+                    target["hours_before"],
+                    due["target_timestamp"],
+                    wave_label,
+                    now,
+                )
+                
+                total_snapshots += result["snapshots"]
+                total_targets_collected += 1
+                
+                # Persiste crédits après chaque collecte
+                _persist_credits(conn, client)
     
     conn.commit()
     
