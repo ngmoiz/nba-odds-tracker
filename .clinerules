@@ -1,0 +1,23 @@
+# Règles automatiques NBA Odds Tracker
+# Chargées à chaque tâche — voir CLAUDE.md pour le détail complet
+
+## Décisions verrouillées (ne jamais rediscuter)
+- Re-décision H-1 implémentée et branchée (C1) : matchs DECIDE réanalysés en fenêtre
+- Déduplication : (match_id, target_hours) pour collectes ; state_key (market/selection|signe|ampleur) pour alertes
+- Cibles collecte : tip-off le plus précoce sauf closing per-match (dernier snapshot avant chaque tip-off)
+- window_hours = 2.5 : verdict à H-2 (H-3 hors, H-2 dedans), re-décision à H-1
+- None explicite obligatoire : jamais de valeur par défaut masquant une donnée absente (ex: score absent gradé 'push' au lieu de None)
+- Échec bruyant obligatoire : jamais de no-op silencieux, tout échec loggé (warning min), anomalie parsing → mention rapport
+- Append-only sur odds_snapshots : on invalide (statut, superseded_message_id), on ne supprime jamais
+- TEST_MODE jamais en production : uniquement pour tests, détecté et rejeté au démarrage
+- Rituel déploiement : docker compose build + up -d --force-recreate + vérification (logs/base/Telegram)
+
+## Définition de terminé (chaque tâche)
+- Suite complète pytest relancée avec total réel (jamais addition de sous-ensembles)
+- ruff check passe (aucune violation non justifiée)
+- git status propre ou commit effectué
+- Preuve observée pour toute affirmation factuelle (sortie commande collée) — « déjà » interdit sans extrait code
+- Test qui casse → question « la garantie tient-elle ? » (jamais champ compatibilité sans justification)
+- scripts/check.sh lancé avant rapport fin de lot, sortie collée
+
+Voir CLAUDE.md sections « Invariants » et « Définition de terminé » pour contexte complet.
