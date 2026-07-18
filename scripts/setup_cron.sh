@@ -2,35 +2,38 @@
 # ─────────────────────────────────────────────────────────────
 # setup_cron.sh — Installe les jobs cron WSL2 pour le NBA Odds Tracker.
 #
-# Planning (heure locale Europe/Paris, calé sur les tip-offs WNBA actuels) :
+# Planning (architecture auto-ordonnancée, Lot 2) :
 #
-# Les matchs WNBA se jouent en soirée heure US (19:00–22:00 ET = 01:00–04:00
-# du matin à Paris). Les fenêtres H-6/H-3/H-1 sont donc décalées vers la nuit.
+# Un SEUL battement `*/20` (toutes les 20 min). Le collecteur décide lui-même,
+# à chaque tick, quoi collecter — plus de crons par créneau :
 #
-#   Collecte du matin    : 09:00  → découverte + cotes d'ouverture (INCONDITIONNELLE)
-#   Collecte après-midi  : 15:00  → relevé intermédiaire (conditionnelle)
-#   Collecte H-6         : 20:00  → tip-offs ~02:00 Paris (conditionnelle)
-#   Collecte H-3         : 23:00  → tip-offs ~02:00 Paris (conditionnelle)
-#   Collecte H-1 (bloc1) : 01:00  → fenêtre de décision (tip-offs 01:00–03:00 Paris)
-#   Collecte H-1 (bloc2) : 02:45  → fenêtre de décision (tip-offs 03:00–04:45 Paris, côte Ouest)
-#   Évaluateur           : 09:30  → bilan du matin (après la collecte)
+#   Tick collecteur : */20 * * * *  → auto-ordonnancement (voir ci-dessous)
+#   Évaluateur      : 09:30         → bilan du matin (+ rapport hebdo le lundi)
 #
-# Collectes conditionnelles : les créneaux 15:00–02:45 ne consomment aucun crédit
-# si aucun match actif n'est en base (skip en amont de l'appel API). Le créneau
-# 09:00 (--morning) est inconditionnel : il découvre les nouveaux matchs.
+# À chaque tick, `run_collection` :
+#   - fait la collecte du matin si on est dans la fenêtre du matin (~09:00 UTC),
+#     une seule fois par jour (idempotence via meta['daily_morning_collected_...']) ;
+#   - groupe les matchs actifs en vagues (tip-offs espacés de ≤ 45 min) ;
+#   - sert les cibles dues de chaque vague, calées sur le tip-off le plus précoce :
+#     H-6, H-3, verdict (H-2), re-décision (H-1), et clôture (H-0.4, per-match) ;
+#   - ne consomme AUCUN crédit si aucune cible n'est due (skip), ou si l'API ne
+#     renvoie aucun match (hors-saison / jour sans match).
+# Les 6 cibles, leurs marchés et priorités sont dans config.yaml (collector.targets).
 #
 # Garde de réserve : si le quota restant passe sous quota.reserve (config.yaml),
-# les collectes non essentielles sont sautées + notification Telegram (dédupliquée).
-# La collecte du matin rafraîchit le quota et lève la garde au reset mensuel.
+# les cibles priorité 2-3 (matin/H-6/H-3) sont sautées + notification Telegram
+# (dédupliquée). Les cibles priorité 1 (verdict/re-décision/clôture) passent
+# toujours. La collecte du matin rafraîchit le quota et lève la garde au reset.
 #
 # Logs : les sorties sont redirigées vers logs/nba-collector.log et
 # logs/nba-evaluator.log dans le projet (persistants, contrairement à /tmp).
 # Voir les logs : tail -50 logs/nba-collector.log
 #
-# Budget : 6 créneaux × 3 crédits = 18 crédits/jour max (saison WNBA).
-# Avec les collectes conditionnelles, la consommation réelle est bien moindre
-# (skip hors-saison et jours sans matchs). Projection mensuelle : ~438 crédits
-# en pic (saison), ~393 avec la garde de réserve (voir CLAUDE.md).
+# Budget (selon le nombre de vagues W et de matchs M par jour) :
+#   crédits/jour ≈ 3 (matin) + 12·W (4 cibles de vague × 3 marchés)
+#                            + ~1·M (clôture, 1 marché de verdict/match).
+# Ex. : 1 vague / 3 matchs ≈ 18/jour ; 2 vagues / 6 matchs ≈ 33 ; 3 vagues / 9 ≈ 48.
+# Jours sans match ≈ 0 (ticks en skip). Voir README.md et CLAUDE.md.
 #
 # ⚠️ Limite structurelle cron-WSL2 : si le PC est éteint ou en veille, les jobs
 # ne s'exécutent pas. Pour la validation 7 jours, laisser le PC allumé en
@@ -71,19 +74,11 @@ fi
 # Logs redirigés vers logs/nba-*.log (persistants dans le projet, gitignored).
 cat >> /tmp/nba_cron_new <<EOF
 $MARKER_START
-# Collecte du matin (découverte + cotes d'ouverture) — INCONDITIONNELLE (--morning)
-0 9 * * * cd $PROJECT_DIR && docker compose run --rm --no-deps collector python -m collector --morning >> $LOG_DIR/nba-collector.log 2>&1
-# Collecte de l'après-midi (relevé intermédiaire) — conditionnelle
-0 15 * * * cd $PROJECT_DIR && docker compose run --rm --no-deps collector >> $LOG_DIR/nba-collector.log 2>&1
-# Collecte H-6 (tip-offs WNBA ~02:00 Paris) — conditionnelle
-0 20 * * * cd $PROJECT_DIR && docker compose run --rm --no-deps collector >> $LOG_DIR/nba-collector.log 2>&1
-# Collecte H-3 (tip-offs WNBA ~02:00 Paris) — conditionnelle
-0 23 * * * cd $PROJECT_DIR && docker compose run --rm --no-deps collector >> $LOG_DIR/nba-collector.log 2>&1
-# Collecte H-1 bloc 1 (fenêtre de décision, tip-offs 01:00–03:00 Paris) — conditionnelle
-0 1 * * * cd $PROJECT_DIR && docker compose run --rm --no-deps collector >> $LOG_DIR/nba-collector.log 2>&1
-# Collecte H-1 bloc 2 (côte Ouest, tip-offs 03:00–04:45 Paris) — conditionnelle
-45 2 * * * cd $PROJECT_DIR && docker compose run --rm --no-deps collector >> $LOG_DIR/nba-collector.log 2>&1
-# Évaluateur (bilan du matin + rapport hebdo le lundi)
+# Tick collecteur auto-ordonnancé (Lot 2) : le collecteur décide lui-même quoi
+# collecter (matin, vagues H-6/H-3/verdict/re-décision, clôture per-match).
+# Un seul battement toutes les 20 min ; la plupart des ticks ne consomment rien.
+*/20 * * * * cd $PROJECT_DIR && docker compose run --rm --no-deps collector >> $LOG_DIR/nba-collector.log 2>&1
+# Évaluateur (bilan du matin + rapport hebdo le lundi) — calé sur l'horloge, pas sur les tip-offs
 30 9 * * * cd $PROJECT_DIR && docker compose run --rm --no-deps evaluator >> $LOG_DIR/nba-evaluator.log 2>&1
 $MARKER_END
 EOF

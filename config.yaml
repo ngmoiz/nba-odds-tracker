@@ -27,26 +27,12 @@ quota:
   reserve: 50                 # garde de réserve : skip des collectes non essentielles sous ce seuil
 
 # --- Planning de collecte (section 4.3) ---
-# Les fenêtres H-x sont calées sur l'heure de tip-off, pas sur des heures fixes.
-#
-# ⚠️ Source de vérité du planning d'exécution : `scripts/setup_cron.sh`.
-# Cette section documente les créneaux conceptuels ; les heures concrètes (cron)
-# vivent dans le script car elles dépendent de l'environnement (WSL2 local vs EC2).
-# 6 créneaux par jour (saison WNBA) :
-#   09:00 matin (inconditionnel) | 15:00 après-midi | 20:00 H-6 | 23:00 H-3
-#   01:00 H-1 bloc 1 (côte Est)  | 02:45 H-1 bloc 2 (côte Ouest)
-# Le H-1 est scindé en deux blocs car les tip-offs WNBA s'étalent sur 01:00–04:45
-# Paris (matchs en soirée heure US).
-schedule:
-  morning: true               # découverte des nouveaux matchs + cotes d'ouverture
-  afternoon: true             # relevé intermédiaire
-  hours_before_tipoff:        # collectes rapprochées avant le premier bloc de matchs
-    - 6
-    - 3
-    - 1
-  # H-1 est scindé en deux blocs (côte Est + côte Ouest) car les tip-offs WNBA
-  # s'étalent sur 01:00–04:45 Paris. Voir scripts/setup_cron.sh pour les heures.
-  h1_split_blocks: 2
+# Le planning est AUTO-ORDONNANCÉ (Lot 2) : un seul battement cron `*/20` (voir
+# `scripts/setup_cron.sh`) ; le collecteur décide lui-même, à chaque tick, quoi
+# collecter. Les cibles (matin, H-6, H-3, verdict, re-décision, clôture), leurs
+# marchés et priorités sont définis plus bas dans `collector.targets`.
+# (L'ancien bloc `schedule:` à créneaux fixes — morning/afternoon/hours_before_tipoff/
+# h1_split_blocks — a été retiré : il n'était plus lu par le code.)
 
 # --- Moteur de règles de détection (section 6.2) ---
 # Chaque règle déclenchée ajoute des points au score de signal du match/sélection.

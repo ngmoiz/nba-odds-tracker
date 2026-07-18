@@ -159,41 +159,74 @@ docker compose run --rm evaluator
 
 ### Installer le cron WSL2
 
-Le script `scripts/setup_cron.sh` installe les jobs cron pour les collecteurs
-(6 collectes/jour) et l'évaluateur (matin + rapport hebdo le lundi) :
+Le script `scripts/setup_cron.sh` installe **un seul battement `*/20`** pour le
+collecteur (toutes les 20 min) et l'évaluateur (matin + rapport hebdo le lundi) :
 
 ```bash
 chmod +x scripts/setup_cron.sh
 ./scripts/setup_cron.sh
 ```
 
-Planning (heure locale Europe/Paris, calé sur les tip-offs WNBA actuels — les
-matchs se jouent en soirée heure US, soit 01:00–04:00 du matin à Paris) :
+**Architecture auto-ordonnancée (Lot 2).** Plus de crons par créneau : le
+collecteur décide lui-même, à chaque tick, quoi collecter. Il n'y a que deux
+lignes cron —
 
-| Heure | Job | Condition |
-|---|---|---|
-| 09:00 | Collecte du matin (découverte + cotes d'ouverture) | Inconditionnelle (`--morning`) |
-| 09:30 | Évaluateur (bilan du matin + rapport hebdo le lundi) | — |
-| 15:00 | Collecte après-midi (relevé intermédiaire) | Conditionnelle |
-| 20:00 | Collecte H-6 (tip-offs ~02:00 Paris) | Conditionnelle |
-| 23:00 | Collecte H-3 (tip-offs ~02:00 Paris) | Conditionnelle |
-| 01:00 | Collecte H-1 bloc 1 (tip-offs 01:00–03:00 Paris) | Conditionnelle |
-| 02:45 | Collecte H-1 bloc 2 (côte Ouest, tip-offs 03:00–04:45 Paris) | Conditionnelle |
+| Heure | Job |
+|---|---|
+| `*/20 * * * *` | Tick collecteur (auto-ordonnancement, voir ci-dessous) |
+| `30 9 * * *` | Évaluateur (bilan du matin + rapport hebdo le lundi) |
 
-**Collectes conditionnelles** : les créneaux 15:00–02:45 vérifient en base s'il
-existe des matchs actifs avant d'appeler l'API. Si aucun match n'est suivi, la
-collecte est sautée (zéro crédit consommé). Le créneau 09:00 est inconditionnel
-(découverte de nouveaux matchs).
+À chaque tick, le collecteur :
+
+1. **Collecte du matin** — si on est dans la fenêtre du matin (~09:00 UTC), une
+   seule fois par jour (idempotence via la table `meta`) : découverte des nouveaux
+   matchs + cotes d'ouverture.
+2. **Groupement en vagues** — les matchs dont les tip-offs sont espacés de
+   ≤ `collector.wave_grouping_minutes` (45 min) forment une **vague**. Les cibles
+   temporelles sont calées sur le **tip-off le plus précoce de la vague**.
+3. **Cibles dues** — il sert les cibles atteintes et non encore servies. Les 6
+   cibles (source de vérité : `collector.targets` dans `config.yaml`) :
+
+   | Cible | Déclenchement | Marchés | Priorité | Garde de réserve |
+   |---|---|---|---|---|
+   | `morning` | ~09:00 UTC, quotidien (idempotent) | h2h + spreads + totals | 2 | bloquable |
+   | `h6` | H-6 du tip-off le plus précoce de la vague | h2h + spreads + totals | 2 | bloquable |
+   | `h3` | H-3 | h2h + spreads + totals | 3 | bloquable |
+   | `verdict` | H-2 (produit le verdict) | h2h + spreads + totals | 1 | **jamais bloquée** |
+   | `redecision` | H-1 (re-décision) | h2h + spreads + totals | 1 | **jamais bloquée** |
+   | `closing` | H-0.4 de **chaque** match (per-match) | dynamique (marché du verdict) | 1 | **jamais bloquée** |
+
+Un tick **ne consomme aucun crédit** si aucune cible n'est due (skip), ou si l'API
+ne renvoie aucun match (hors-saison / jour sans match).
+
+> **Fenêtre de clôture `hours_before: 0.4` (24 min).** La fenêtre d'une cible doit
+> être **strictement supérieure au tick** (`validate_collector_config` lève une
+> `ConfigurationError` au démarrage sinon). À 0.25 (15 min < tick 20 min), les
+> clôtures des tip-offs à minute ronde (:00 / :20 / :40) étaient **ratées
+> silencieusement** (simulation 2026-07-18). À 0.4 (24 min > 20), la clôture — base
+> du CLV — est captée pour **100 %** des matchs ; compromis assumé : le CLV est
+> mesuré ~9 min plus tôt qu'à 0.25, mais mesurable pour tous les matchs (et non
+> seulement ceux à minute non ronde).
 
 **Garde de réserve** : si le quota restant passe sous `quota.reserve` (défaut 50,
-configurable dans `config.yaml`), les collectes non essentielles sont sautées et
-une notification Telegram avertit le développeur (dédupliquée : une seule alerte
-par franchissement). La collecte du matin rafraîchit le quota et lève la garde au
-reset mensuel.
+configurable dans `config.yaml`), les cibles **priorité 2-3** (matin / H-6 / H-3)
+sont sautées et une notification Telegram avertit le développeur (dédupliquée : une
+seule alerte par franchissement). Les cibles **priorité 1** (verdict / re-décision /
+clôture) passent toujours. La collecte du matin rafraîchit le quota et lève la garde
+au reset mensuel.
 
-Budget : 6 créneaux × 3 crédits = 18 crédits/jour max (saison WNBA). Avec les
-collectes conditionnelles, la consommation réelle est bien moindre. Projection
-mensuelle : ~438 crédits en pic (saison), ~393 avec la garde de réserve.
+**Budget** (selon le nombre de vagues `W` et de matchs `M` par jour) :
+
+```
+crédits/jour ≈ 3 (matin) + 12·W (4 cibles de vague × 3 marchés) + ~1·M (clôture, 1 marché de verdict/match)
+```
+
+Exemples : 1 vague / 3 matchs ≈ **18 crédits/jour** ; 2 vagues / 6 matchs ≈ **33** ;
+3 vagues / 9 matchs ≈ **48**. Les jours sans match consomment ~0 (ticks en skip). Le
+budget **croît avec le nombre de vagues** : chaque vague atteint ses cibles à des
+ticks différents, donc via des appels API distincts. Une soirée NBA très fournie peut
+approcher ou dépasser le quota gratuit ; la garde de réserve protège alors les cibles
+priorité 2-3, les priorité 1 passant toujours.
 
 > ⚠️ **Limite structurelle cron-WSL2** : si le PC est éteint ou en veille, les
 > jobs ne s'exécutent pas. Pour la validation 7 jours, laisser le PC allumé en
