@@ -77,8 +77,11 @@ def test_verdict_at_exact_window_boundary(tmp_path):
 
 
 def test_no_verdict_just_beyond_window(tmp_path):
-    """Tip-off a now + window_hours + 1s -> hors fenetre (strictement au-dela de la borne)."""
-    tipoff = (NOW + timedelta(hours=2, seconds=1)).isoformat()
+    """Tip-off a now + window_hours + 1s -> hors fenetre (strictement au-dela de la borne).
+    
+    Lot 2 : window_hours passé de 2.0 à 2.5, donc le test utilise 2.5 + 1s.
+    """
+    tipoff = (NOW + timedelta(hours=2.5, seconds=1)).isoformat()
     conn = _setup(tmp_path, tipoff)
 
     summary = analyze_open_matches(conn, CFG, NOW)

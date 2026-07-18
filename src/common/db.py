@@ -111,6 +111,20 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 
+-- Traçabilité des collectes auto-ordonnancées (Lot 2, architecture par vague).
+-- Déduplication par (match_id, target_hours) : une cible ne peut être servie qu'une
+-- fois par match. La vague (wave_label) regroupe les appels API mais n'est pas la clé.
+CREATE TABLE IF NOT EXISTS collection_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id TEXT NOT NULL,
+    target_hours REAL NOT NULL,
+    target_timestamp TEXT NOT NULL,  -- Heure cible calculée (tipoff - hours_before)
+    collected_at TEXT NOT NULL,      -- Heure réelle de collecte
+    markets TEXT NOT NULL,            -- Marchés collectés (csv)
+    credits_used INTEGER NOT NULL,
+    wave_label TEXT NOT NULL          -- Label informatif (pas clé de déduplication)
+);
+
 -- Index pour accélérer les requêtes fréquentes.
 CREATE INDEX IF NOT EXISTS idx_snapshots_match        ON odds_snapshots(match_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_match_market ON odds_snapshots(match_id, market);
@@ -120,6 +134,7 @@ CREATE INDEX IF NOT EXISTS idx_alerts_match           ON alerts(match_id);
 CREATE INDEX IF NOT EXISTS idx_verdicts_match         ON verdicts(match_id);
 CREATE INDEX IF NOT EXISTS idx_positions_verdict      ON positions(verdict_id);
 CREATE INDEX IF NOT EXISTS idx_evaluations_verdict    ON evaluations(verdict_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_match_target     ON collection_log(match_id, target_hours);
 
 -- Garantie append-only : la base rejette physiquement toute modification/suppression
 -- d'un relevé de cotes existant, quelle que soit l'application ou l'outil.
@@ -677,3 +692,65 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+# ─────────────────── Collectes auto-ordonnancées (Lot 2) ───────────────────
+
+
+def get_matches_by_status(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> list[sqlite3.Row]:
+    """Renvoie les matchs dans les statuts donnés, triés par tip-off."""
+    placeholders = ",".join("?" * len(statuses))
+    return conn.execute(
+        f"SELECT * FROM matches WHERE status IN ({placeholders}) ORDER BY tipoff_utc",
+        statuses,
+    ).fetchall()
+
+
+def is_target_served(conn: sqlite3.Connection, match_id: str, target_hours: float) -> bool:
+    """Vérifie si une cible a déjà été servie pour un match donné."""
+    row = conn.execute(
+        "SELECT 1 FROM collection_log WHERE match_id = ? AND target_hours = ?",
+        (match_id, target_hours),
+    ).fetchone()
+    return row is not None
+
+
+def mark_target_served(
+    conn: sqlite3.Connection,
+    *,
+    match_id: str,
+    target_hours: float,
+    target_timestamp: str,
+    collected_at: str,
+    markets: str,
+    credits_used: int,
+    wave_label: str,
+) -> None:
+    """Marque une cible comme servie pour un match (anti-doublon via index unique)."""
+    try:
+        conn.execute(
+            "INSERT INTO collection_log "
+            "(match_id, target_hours, target_timestamp, collected_at, markets, credits_used, wave_label) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (match_id, target_hours, target_timestamp, collected_at, markets, credits_used, wave_label),
+        )
+    except sqlite3.IntegrityError:
+        # Déjà servi (normal si collecte précédente), skip silencieusement
+        pass
+
+
+def get_closing_markets_for_wave(conn: sqlite3.Connection, match_ids: list[str]) -> list[str]:
+    """Union des marchés des verdicts en attente de la vague (pour clôture H-0.25)."""
+    if not match_ids:
+        return []
+    
+    placeholders = ",".join("?" * len(match_ids))
+    rows = conn.execute(
+        f"""SELECT DISTINCT v.market 
+            FROM verdicts v
+            JOIN matches m ON v.match_id = m.match_id
+            WHERE m.match_id IN ({placeholders})
+              AND m.status = 'DECIDE'""",
+        match_ids,
+    ).fetchall()
+    return [row["market"] for row in rows]

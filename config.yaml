@@ -88,7 +88,7 @@ rules:
 # --- Décision finale à H-1 (section 6.4) ---
 decision:
   signal_score_threshold: 6   # score ≥ 6 ET cohérence globale → SIGNAL
-  window_hours: 2.0           # verdict produit si le tip-off est dans cette fenêtre (borne inclusive)
+  window_hours: 2.5           # verdict produit si le tip-off est dans cette fenêtre (borne inclusive)
 
 # --- Notificateur Telegram (section 7) ---
 # Le notificateur lit les alertes/verdicts non envoyés en base et les pousse sur
@@ -120,3 +120,40 @@ results:
 evaluator:
   lookback_days: 3            # fenêtre de rattrapage des matchs clos non encore évalués
   weekly_report_weekday: 0   # jour du rapport hebdo (0 = lundi) — implémenté après le bilan quotidien
+
+# --- Collecteur auto-ordonnancé (Lot 2, architecture par vague) ---
+collector:
+  tick_interval_minutes: 20   # battement cron (72 exécutions/jour)
+  wave_grouping_minutes: 45   # seuil de groupement des matchs en vagues
+  targets:
+    # Matin quotidien (09:00, inconditionnel)
+    - name: morning
+      hours_before: null      # Pas lié aux vagues (horaire fixe)
+      markets: [h2h, spreads, totals]
+      priority: 2
+    # H-6 (6h avant tip-off le plus précoce de la vague)
+    - name: h6
+      hours_before: 6.0
+      markets: [h2h, spreads, totals]
+      priority: 2
+    # H-3 (3h avant tip-off le plus précoce)
+    - name: h3
+      hours_before: 3.0
+      markets: [h2h, spreads, totals]
+      priority: 3
+    # H-2 (verdict, 2h avant tip-off le plus précoce)
+    - name: verdict
+      hours_before: 2.0
+      markets: [h2h, spreads, totals]
+      priority: 1             # Jamais bloqué par la garde de réserve
+    # H-1 (re-décision, 1h avant tip-off le plus précoce)
+    - name: redecision
+      hours_before: 1.0
+      markets: [h2h, spreads, totals]
+      priority: 1             # Jamais bloqué
+    # H-0.25 (clôture, 15 min avant tip-off de CHAQUE match)
+    - name: closing
+      hours_before: 0.25
+      markets: dynamic        # Union des marchés des verdicts
+      priority: 1             # Jamais bloqué
+      per_match: true         # Cible calculée par match (pas sur earliest)
