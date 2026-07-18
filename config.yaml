@@ -151,9 +151,12 @@ collector:
       hours_before: 1.0
       markets: [h2h, spreads, totals]
       priority: 1             # Jamais bloqué
-    # H-0.25 (clôture, 15 min avant tip-off de CHAQUE match)
+    # H-0.4 (clôture, 24 min avant tip-off de CHAQUE match)
+    # ⚠️ Fenêtre (24 min) > tick_interval_minutes (20 min) : contrainte VALIDÉE au
+    # démarrage (validate_collector_config). À 0.25 (15 min < 20), les tip-offs à
+    # minute ronde (:00/:20/:40) n'étaient jamais captés (simulation 2026-07-18).
     - name: closing
-      hours_before: 0.25
+      hours_before: 0.4
       markets: dynamic        # Union des marchés des verdicts
       priority: 1             # Jamais bloqué
       per_match: true         # Cible calculée par match (pas sur earliest)

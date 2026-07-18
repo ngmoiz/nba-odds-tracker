@@ -43,11 +43,50 @@ META_RESERVE_ALERTED = "reserve_alerted"
 
 class ConfigurationError(Exception):
     """Levée lorsque la configuration du collecteur est invalide ou absente.
-    
+
     Séparation des responsabilités : la logique métier lève une exception,
     le point d'entrée (__main__.py) décide du sort du processus (exit code).
     """
     pass
+
+
+def validate_collector_config(config: dict) -> None:
+    """Valide la cohérence tick/fenêtre des cibles (échec bruyant au démarrage).
+
+    Invariant d'ordonnancement : la fenêtre de captation d'une cible
+    (``hours_before`` convertie en minutes) doit être **strictement supérieure**
+    à l'intervalle de tick. Sinon un tick peut « sauter » la fenêtre et la cible
+    n'est jamais servie pour les tip-offs alignés sur une minute de tick — c'est
+    le bug closing H-0.25 (15 min) contre un tick */20 (20 min) mis en évidence
+    par la simulation du 2026-07-18 (m1/m4/m5 à minute ronde non captés).
+
+    La contrainte est **dérivée de la config** (``tick_interval_minutes``) et non
+    d'une valeur en dur : un futur changement de tick ou de cible qui recréerait
+    silencieusement le trou échoue ici, au démarrage, plutôt que de rater des
+    clôtures en production.
+
+    Ne valide rien si ``tick_interval_minutes`` est absent (configs de test
+    minimales) : la garde vise le déploiement réel (config.yaml).
+    """
+    collector = config.get("collector", {})
+    tick = collector.get("tick_interval_minutes")
+    if tick is None:
+        return
+
+    for target in collector.get("targets", []):
+        hours_before = target.get("hours_before")
+        if hours_before is None:
+            continue  # cible non liée aux vagues (matin, horaire fixe) : pas de fenêtre
+        window_minutes = hours_before * 60
+        if window_minutes <= tick:
+            min_hours = (tick + 1) / 60
+            raise ConfigurationError(
+                f"Cible '{target.get('name', '?')}' : fenêtre de {window_minutes:.0f} min "
+                f"≤ intervalle de tick ({tick} min). Un tick peut sauter la fenêtre → "
+                f"cible jamais servie pour les tip-offs à minute ronde. "
+                f"Augmenter hours_before à ≥ {min_hours:.3f} h (> {tick} min) "
+                f"ou réduire collector.tick_interval_minutes."
+            )
 
 
 def _record_snapshots(conn: sqlite3.Connection, event: OddsEvent, snapshot_at: str) -> int:
@@ -461,8 +500,14 @@ def _collect_and_record(
         snapshots += _record_snapshots(conn, event, snapshot_at)
         collected_match_ids.add(event.id)
     
-    # Marque chaque match collecté comme servi pour cette cible
-    for match_id in collected_match_ids:
+    # Marque chaque match collecté comme servi pour cette cible.
+    # Comptabilité des crédits : le coût est attribué à l'APPEL, pas au match. Un
+    # seul `get_odds` couvre toute la vague (l'API renvoie tous les matchs à venir),
+    # donc coût plein sur la première ligne, 0 sur les suivantes. Sans cela,
+    # `SUM(collection_log.credits_used)` sur-compte (coût × matchs/vague) et la ligne
+    # « crédits » du bilan quotidien serait fausse.
+    call_cost = int(cost) if cost != "?" else 0
+    for idx, match_id in enumerate(sorted(collected_match_ids)):
         db.mark_target_served(
             conn,
             match_id=match_id,
@@ -471,7 +516,7 @@ def _collect_and_record(
             target_timestamp=target_timestamp,
             collected_at=snapshot_at,
             markets=",".join(markets),
-            credits_used=int(cost) if cost != "?" else 0,
+            credits_used=call_cost if idx == 0 else 0,
             wave_label=wave_label,
         )
     
@@ -514,10 +559,16 @@ def run_collection(
     """
     if config is None:
         config = {}
-    
+
     if now is None:
         now = datetime.now(timezone.utc)
-    
+
+    # Garde d'ordonnancement (échec bruyant) : la fenêtre de chaque cible doit être
+    # strictement supérieure au tick, sinon des clôtures sont ratées silencieusement.
+    # Placée ici (pas seulement dans __main__) pour couvrir TOUS les appelants
+    # (simulations, tests d'intégration, futur code) : aucun chemin non protégé.
+    validate_collector_config(config)
+
     # ═══════════════════════════════════════════════════════════════════════════
     # MODE FORCE : Collecte complète inconditionnelle (tests / usage manuel)
     # ═══════════════════════════════════════════════════════════════════════════

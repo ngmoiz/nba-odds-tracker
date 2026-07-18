@@ -23,7 +23,11 @@ import os
 from datetime import datetime, timezone
 
 from analyzer.analyzer import analyze_open_matches
-from collector.collector import run_collection
+from collector.collector import (
+    ConfigurationError,
+    run_collection,
+    validate_collector_config,
+)
 from common.config import load_config, load_settings
 from common.db import get_connection, init_db
 from common.logging_config import configure_logging, get_logger
@@ -57,6 +61,15 @@ def main() -> None:
     config = load_config()
     configure_logging(settings.log_level)
     logger = get_logger("collector")
+
+    # Validation au démarrage : contrainte fenêtre/tick des cibles (échec bruyant).
+    # Empêche de recréer silencieusement le trou de captation des clôtures.
+    try:
+        validate_collector_config(config)
+    except ConfigurationError as exc:
+        logger.error("Configuration collecteur invalide : %s", exc)
+        import sys
+        sys.exit(1)
 
     sport = args.sport or config["api"]["sport"]
     
@@ -105,7 +118,6 @@ def main() -> None:
                 result = run_collection(conn, client, sport, config, settings=settings, now=now)
             except Exception as exc:
                 # Attrape ConfigurationError (et autres exceptions métier)
-                from collector.collector import ConfigurationError
                 if isinstance(exc, ConfigurationError):
                     logger.error("Configuration invalide : %s", exc)
                     # Notification déjà envoyée par run_collection si possible

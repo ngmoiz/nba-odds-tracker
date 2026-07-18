@@ -13,7 +13,9 @@ import pytest
 from collector.collector import (
     META_CREDITS_REMAINING,
     META_RESERVE_ALERTED,
+    ConfigurationError,
     run_collection,
+    validate_collector_config,
 )
 from common import db
 from common.db import get_connection, get_match, init_db
@@ -518,9 +520,10 @@ def test_dedup_stable_when_wave_composition_changes(conn):
 
 def test_targets_on_earliest_tipoff_closing_per_match(conn):
     """Cibles sur earliest_tipoff, SAUF closing (per_match: true).
-    
+
     Décision verrouillée : Vague à tip-offs échelonnés (40 min) → 2 clôtures distinctes
-    (H-0.25 de chaque match), aucun snapshot après le 1er coup d'envoi.
+    (H-0.4 de chaque match), aucun snapshot après le 1er coup d'envoi.
+    Fenêtre closing 0.4 (24 min) > tick : conforme à validate_collector_config.
     """
     # Vague : 2 matchs espacés de 40 min (même vague, seuil 45 min)
     # m1 à H+0, m2 à H+0.67 (40 min plus tard)
@@ -541,12 +544,12 @@ def test_targets_on_earliest_tipoff_closing_per_match(conn):
         "collector": {
             "wave_grouping_minutes": 45,
             "targets": [
-                {"name": "closing", "hours_before": 0.25, "per_match": True, "priority": 1}
+                {"name": "closing", "hours_before": 0.4, "per_match": True, "priority": 1}
             ]
         }
     }
 
-    # Tick à H-0.25 de m1 (m2 encore à H-1.05)
+    # Tick à H-0.25 de m1 : dans sa fenêtre closing [H-0.4, tip-off), m2 pas encore
     tick_time = datetime.fromisoformat(tipoff_m1.replace("Z", "+00:00")) - timedelta(hours=0.25)
     
     summary = run_collection(
@@ -1059,3 +1062,131 @@ def test_no_snapshots_after_tipoff(conn):
         "SELECT COUNT(*) AS n FROM odds_snapshots WHERE match_id = 'past'"
     ).fetchone()["n"]
     assert count == 0
+
+
+# ─── Correctifs Lot 2 (revue simulation 2026-07-18) ───
+
+
+def test_validate_collector_config_rejects_narrow_window():
+    """Fenêtre ≤ intervalle de tick → ConfigurationError au démarrage.
+
+    Garde contre la régression du bug closing H-0.25 (15 min) < tick */20 (20 min).
+    """
+    config = {
+        "collector": {
+            "tick_interval_minutes": 20,
+            "targets": [{"name": "closing", "hours_before": 0.25, "per_match": True}],
+        }
+    }
+    with pytest.raises(ConfigurationError):
+        validate_collector_config(config)
+
+
+def test_validate_collector_config_accepts_wide_window():
+    """Fenêtre > intervalle de tick (0.4h = 24 min > 20) → aucune erreur.
+
+    Une cible sans hours_before (matin) est ignorée par la validation.
+    """
+    config = {
+        "collector": {
+            "tick_interval_minutes": 20,
+            "targets": [
+                {"name": "morning", "hours_before": None},
+                {"name": "closing", "hours_before": 0.4, "per_match": True},
+                {"name": "verdict", "hours_before": 2.0},
+            ],
+        }
+    }
+    validate_collector_config(config)  # ne lève pas
+
+
+def test_validate_collector_config_skips_without_tick():
+    """tick_interval_minutes absent (config de test minimale) → pas de validation."""
+    config = {"collector": {"targets": [{"name": "closing", "hours_before": 0.1}]}}
+    validate_collector_config(config)  # ne lève pas
+
+
+def test_credits_attributed_to_call_not_per_match(conn):
+    """Comptabilité crédits : le coût d'un appel de vague est attribué à l'APPEL,
+    pas dupliqué par match. SUM(credits_used) == coût réel de l'appel unique.
+
+    Régression du sur-comptage révélé par la simulation (75 loggés / 45 réels).
+    """
+    now = datetime.now(timezone.utc)
+    t1 = (now + timedelta(hours=6)).isoformat()
+    t2 = (now + timedelta(hours=6, minutes=30)).isoformat()  # même vague (≤ 45 min)
+    db.insert_match(conn, match_id="m1", sport="basketball_wnba", home_team="A", away_team="B", tipoff_utc=t1, status="SUIVI", created_at=now.isoformat())
+    db.insert_match(conn, match_id="m2", sport="basketball_wnba", home_team="C", away_team="D", tipoff_utc=t2, status="SUIVI", created_at=now.isoformat())
+    conn.commit()
+
+    config = {
+        "quota": {"reserve": 50},
+        "collector": {
+            "wave_grouping_minutes": 45,
+            "targets": [{"name": "H-6", "hours_before": 6.0, "markets": ["h2h", "spreads"], "priority": 2}],
+        },
+    }
+    # H-6 de earliest (t1) atteint pile à `now`.
+    summary = run_collection(
+        conn, FakeClient([make_event("m1", t1), make_event("m2", t2)]),
+        "basketball_wnba", config, force=False, now=now,
+    )
+
+    assert summary["targets_collected"] == 1  # un seul appel groupé pour la vague
+    rows = conn.execute(
+        "SELECT match_id, credits_used FROM collection_log WHERE target_hours = 6.0 ORDER BY match_id"
+    ).fetchall()
+    assert len(rows) == 2  # les 2 matchs de la vague sont servis (tracés)
+    total = sum(r["credits_used"] for r in rows)
+    assert total == 3  # coût réel de l'appel unique (FakeClient cost=3), PAS 6
+    # Le coût est porté par une seule ligne, 0 sur l'autre.
+    assert sorted(r["credits_used"] for r in rows) == [0, 3]
+
+
+def test_closing_served_for_round_minute_tipoffs(conn):
+    """Fenêtre closing 0.4h (24 min) > tick 20 min : une clôture servie pour CHAQUE
+    tip-off, y compris les minutes rondes :00/:20/:40 (bug simulation 2026-07-18).
+
+    Ticks en phase de production :00/:20/:40 ; clôture attendue à < 25 min du tip-off,
+    sur le marché du verdict de chaque match.
+    """
+    base = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+    specs = [
+        ("m00", base, "h2h"),                              # tip-off à minute ronde :00
+        ("m20", base + timedelta(minutes=20), "spreads"),  # :20
+        ("m30", base + timedelta(minutes=30), "h2h"),      # :30
+        ("m40", base + timedelta(minutes=40), "spreads"),  # :40
+    ]
+    for mid, tip, mkt in specs:
+        db.insert_match(conn, match_id=mid, sport="basketball_wnba", home_team="Chicago Sky", away_team="Seattle Storm", tipoff_utc=tip.isoformat(), status="DECIDE", created_at=(base - timedelta(hours=12)).isoformat())
+        line = None if mkt == "h2h" else -2.5
+        odds = 1.74 if mkt == "h2h" else 1.93
+        db.insert_verdict(conn, match_id=mid, verdict="SIGNAL", selection="Chicago Sky", market=mkt, line=line, odds_at_verdict=odds, signal_score=8, rules_triggered="[]", rationale="t", decided_at=(base - timedelta(hours=2)).isoformat(), logic_version=2)
+    conn.commit()
+
+    config = {
+        "quota": {"reserve": 50},
+        "collector": {
+            "tick_interval_minutes": 20,
+            "wave_grouping_minutes": 45,
+            "targets": [{"name": "closing", "hours_before": 0.4, "per_match": True, "priority": 1}],
+        },
+    }
+    events = [make_event(mid, tip.isoformat()) for mid, tip, _ in specs]
+
+    # Ticks phase :00/:20/:40, de H-1 à H+0.67 : 11:00 11:20 11:40 12:00 12:20 12:40
+    for off in range(0, 101, 20):
+        tick = base - timedelta(minutes=60) + timedelta(minutes=off)
+        run_collection(conn, FakeClient(events), "basketball_wnba", config, force=False, now=tick)
+
+    # Chaque match : exactement une clôture, sur son marché de verdict, à < 25 min du tip-off.
+    for mid, tip, mkt in specs:
+        rows = conn.execute(
+            "SELECT * FROM collection_log WHERE match_id = ? AND target_name = 'closing'", (mid,)
+        ).fetchall()
+        assert len(rows) == 1, f"{mid} : {len(rows)} clôture(s) (attendu 1)"
+        r = rows[0]
+        assert r["markets"] == mkt, f"{mid} : marché {r['markets']} (attendu {mkt})"
+        ct = datetime.fromisoformat(r["collected_at"])
+        delta_min = (tip - ct).total_seconds() / 60
+        assert 0 < delta_min < 25, f"{mid} : clôture à {delta_min:.0f} min du tip-off"
