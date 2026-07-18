@@ -174,15 +174,19 @@ class OddsApiClient:
         params = {"all": "true"} if include_out_of_season else {}
         return self._get("/v4/sports/", params)
 
-    def get_odds(self) -> list[OddsEvent]:
+    def get_odds(self, markets: list[str] | None = None) -> list[OddsEvent]:
         """Récupère les cotes de tous les matchs à venir du sport configuré.
 
         Coût : nb de marchés × nb de régions (ici 3 × 1 = 3 crédits).
         Une réponse vide (hors saison) ne coûte aucun crédit.
+        
+        Paramètres :
+            markets : liste des marchés à collecter. Si None, utilise self._markets.
         """
+        markets_to_use = markets if markets is not None else self._markets
         params = {
             "regions": self._region,
-            "markets": ",".join(self._markets),
+            "markets": ",".join(markets_to_use),
             "oddsFormat": self._odds_format,
             "dateFormat": "iso",
         }

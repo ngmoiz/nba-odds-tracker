@@ -4,6 +4,34 @@
 
 ---
 
+## Invariants
+
+**Décisions qui ne se rediscutent jamais :**
+
+1. **Re-décision H-1** : implémentée et branchée par C1 (correctif revue externe 2026-07-17) — les matchs DECIDE sont réanalysés à chaque collecte tant qu'ils sont dans la fenêtre, le verdict est mis à jour en place jusqu'au tip-off ou à la prise de position.
+2. **Déduplication (match_id, target_hours)** : un match ne génère qu'une seule collecte par créneau cible ; la déduplication des alertes se fait par `state_key` (market/selection|signe|ampleur).
+3. **Cibles de collecte** : tip-off le plus précoce de la journée NBA, sauf pour la cote de clôture qui est per-match (dernier snapshot avant chaque tip-off).
+4. **`window_hours = 2.5`** : fenêtre de décision H-1 fixée à 2,5 heures avant le tip-off (configurable mais valeur de référence validée).
+5. **Jamais de valeur par défaut masquant une donnée absente** : `None` explicite obligatoire (ex. `outcome='push'` au lieu de `NULL`, `line=NULL` pour h2h au lieu de 0).
+6. **Échec bruyant obligatoire** : jamais de no-op silencieux — tout échec est loggé (warning minimum), toute anomalie de parsing génère une mention dans les rapports (ex. « ⚠️ N verdict(s) à règles illisibles »).
+7. **Append-only sur `odds_snapshots`** : on invalide (statut, `superseded_message_id`), on ne supprime jamais les relevés de cotes ; les autres tables ont un cycle de vie normal.
+8. **Rituel de déploiement** : `docker compose build` + `docker compose up -d --force-recreate` + vérification (logs, base, message Telegram test) — jamais de déploiement sans preuve observée.
+
+---
+
+## Définition de terminé
+
+**Une tâche est terminée quand :**
+
+1. **Suite complète relancée avec son total réel** : `pytest` exécuté sur l'ensemble des tests (jamais une addition de sous-ensembles ou un test isolé) avec le décompte total affiché.
+2. **`ruff check` passe** : aucune violation de lint non justifiée.
+3. **`git status` propre ou commit effectué** : les changements sont versionnés, pas de fichiers modifiés non commités (sauf `.env` et fichiers gitignorés).
+4. **Preuve observée pour toute affirmation factuelle** : sortie de commande collée telle quelle (logs, résultat de test, message Telegram, requête SQL) — **le mot « déjà » est interdit sans extrait de code à l'appui**.
+5. **Un test qui casse pose la question « la garantie tient-elle ? »** : il n'appelle jamais un champ de compatibilité ascendante sans justification explicite — un test rouge est un signal, pas un obstacle à contourner.
+6. **`scripts/check.sh` lancé avant tout rapport de fin de lot** : sortie collée dans le rapport (preuve que les 3 vérifications — tests, lint, git — ont été faites).
+
+---
+
 ## 0. Consignes pour Claude Code (à lire en premier)
 
 ### 0.1 Rôle et posture

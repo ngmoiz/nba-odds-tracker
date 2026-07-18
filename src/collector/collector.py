@@ -1,5 +1,15 @@
-"""Collecteur : interroge The Odds API, enregistre les relevés, fait avancer la
-machine à états des matchs.
+"""Collecteur auto-ordonnancé : interroge The Odds API par vagues, enregistre les
+relevés, fait avancer la machine à états des matchs.
+
+Architecture Lot 2 (auto-ordonnancement) :
+- Tick anonyme toutes les 20 min (cron battement)
+- Groupement des matchs en vagues (seuil 45 min)
+- 6 cibles par vague : matin (quotidien), H-6, H-3, H-2 (verdict), H-1 (re-décision),
+  H-0.25 (clôture per-match avec union des marchés des verdicts)
+- Déduplication par (match_id, target_hours) : une cible ne peut être servie qu'une
+  fois par match (wave_label informatif, pas clé de dédup)
+- Garde de réserve par priorités : priorité 1 (verdict/re-décision/clôture) jamais
+  bloquée, priorités 2-3 (matin/H-6/H-3) bloquables
 
 Transitions gérées ici :
     (inconnu)   --découverte-->  DECOUVERT   (+ cotes d'ouverture)
@@ -8,25 +18,16 @@ Transitions gérées ici :
 
 Les états DECIDE (analyseur) et EVALUE (évaluateur) sont hors de ce composant.
 
-Collectes conditionnelles (post-1.7) :
-- Le créneau du matin (``force=True``) est **inconditionnel** : l'API peut renvoyer
-  de nouveaux matchs non encore en base, on doit toujours interroger.
-- Les autres créneaux (``force=False``) sont **conditionnels** : si aucun match
-  actif n'est en base, la collecte est sautée (zéro crédit consommé).
-
-Garde de réserve (post-1.7) :
-- Le dernier quota connu (``x-requests-remaining``) est persisté dans ``meta``.
-- Avant une collecte conditionnelle, si le quota restant est sous ``quota.reserve``,
-  la collecte est sautée et une notification Telegram avertit le développeur (une
-  seule fois par franchissement, déduplication via ``meta['reserve_alerted']``).
-- La collecte du matin (inconditionnelle) rafraîchit le quota : si celui-ci repasse
-  au-dessus du seuil, la garde est levée (``reserve_alerted`` remis à false) et une
-  notification de levée est envoyée.
+Collecte du matin (critique pour éviter le gel du système) :
+- Évaluée AVANT toute garde conditionnelle (skip si aucun match actif)
+- Exemptée de la garde de réserve (priorité implicite 1)
+- Idempotente via meta['daily_morning_collected_YYYY-MM-DD']
+- Sans cela : base vide → pas de collecte → pas de découverte → gel définitif
 """
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from common import db
 from common.config import Settings
@@ -38,6 +39,15 @@ logger = get_logger("collector")
 # Clés de la table `meta` pour la persistance du quota et de la garde de réserve.
 META_CREDITS_REMAINING = "credits_remaining"
 META_RESERVE_ALERTED = "reserve_alerted"
+
+
+class ConfigurationError(Exception):
+    """Levée lorsque la configuration du collecteur est invalide ou absente.
+    
+    Séparation des responsabilités : la logique métier lève une exception,
+    le point d'entrée (__main__.py) décide du sort du processus (exit code).
+    """
+    pass
 
 
 def _record_snapshots(conn: sqlite3.Connection, event: OddsEvent, snapshot_at: str) -> int:
@@ -177,59 +187,207 @@ def _persist_credits(conn: sqlite3.Connection, client) -> None:
         db.set_meta(conn, META_CREDITS_REMAINING, str(credits))
 
 
-def run_collection(
+# ─────────────────── Fonctions de base (Lot 2, auto-ordonnancement) ───────────────────
+
+
+def group_into_waves(
+    matches: list[sqlite3.Row], threshold_minutes: int
+) -> list[list[sqlite3.Row]]:
+    """Groupe les matchs en vagues selon leur tip-off (seuil configurable).
+    
+    Matchs dont les tip-offs sont espacés de ≤ threshold_minutes → même vague.
+    Renvoie une liste de vagues (chaque vague = liste de matchs).
+    """
+    if not matches:
+        return []
+    
+    waves = []
+    current_wave = [matches[0]]
+    
+    for match in matches[1:]:
+        prev_tipoff = datetime.fromisoformat(current_wave[-1]["tipoff_utc"].replace("Z", "+00:00"))
+        curr_tipoff = datetime.fromisoformat(match["tipoff_utc"].replace("Z", "+00:00"))
+        gap_minutes = (curr_tipoff - prev_tipoff).total_seconds() / 60
+        
+        if gap_minutes <= threshold_minutes:
+            current_wave.append(match)
+        else:
+            waves.append(current_wave)
+            current_wave = [match]
+    
+    waves.append(current_wave)
+    return waves
+
+
+def compute_wave_earliest_tipoff(wave: list[sqlite3.Row]) -> datetime:
+    """Renvoie le tip-off le plus précoce de la vague (min des tip-offs)."""
+    tipoffs = [
+        datetime.fromisoformat(m["tipoff_utc"].replace("Z", "+00:00"))
+        for m in wave
+    ]
+    return min(tipoffs)
+
+
+def compute_wave_label(wave: list[sqlite3.Row]) -> str:
+    """Génère un label lisible pour la vague (date_heure-heure_Nm).
+    
+    Exemple : "2026-01-10_01:00-01:30_3m" (3 matchs entre 01:00 et 01:30 UTC).
+    """
+    tipoffs = [
+        datetime.fromisoformat(m["tipoff_utc"].replace("Z", "+00:00"))
+        for m in wave
+    ]
+    earliest = min(tipoffs)
+    latest = max(tipoffs)
+    return f"{earliest.strftime('%Y-%m-%d_%H:%M')}-{latest.strftime('%H:%M')}_{len(wave)}m"
+
+
+def compute_due_targets(
+    wave: list[sqlite3.Row],
+    targets: list[dict],
+    now: datetime,
+    conn: sqlite3.Connection,
+) -> list[dict]:
+    """Calcule les cibles dues pour une vague (atteintes ET non servies).
+    
+    Une cible est due si :
+    - now >= (earliest_tipoff - hours_before) [cible atteinte]
+    - ET pas encore servie pour TOUS les matchs de la vague (dédup par match_id)
+    
+    Renvoie une liste de dicts avec :
+    - target (config de la cible)
+    - target_timestamp (heure cible calculée)
+    - matches_needing_collection (matchs de la vague pas encore servis pour cette cible)
+    """
+    earliest_tipoff = compute_wave_earliest_tipoff(wave)
+    due = []
+    
+    for target in targets:
+        # Skip cibles non liées aux vagues (ex: morning avec hours_before: null)
+        if target.get("hours_before") is None:
+            continue
+        
+        hours_before = target["hours_before"]
+        target_timestamp = earliest_tipoff - timedelta(hours=hours_before)
+        
+        # Cible atteinte ?
+        if now < target_timestamp:
+            continue
+        
+        # Cible per-match (closing) : calculée par match, pas sur earliest
+        if target.get("per_match"):
+            matches_needing = []
+            for match in wave:
+                match_tipoff = datetime.fromisoformat(match["tipoff_utc"].replace("Z", "+00:00"))
+                match_target_timestamp = match_tipoff - timedelta(hours=hours_before)
+                
+                # Garde anti-post-tip-off per-match
+                if now >= match_tipoff:
+                    continue
+                
+                # Cible atteinte pour ce match ?
+                if now < match_target_timestamp:
+                    continue
+                
+                # Déjà servie pour ce match ?
+                if db.is_target_served(conn, match["match_id"], hours_before):
+                    continue
+                
+                matches_needing.append(match)
+            
+            if matches_needing:
+                due.append({
+                    "target": target,
+                    "target_timestamp": target_timestamp.isoformat(),  # informatif (earliest)
+                    "matches_needing_collection": matches_needing,
+                    "per_match": True,
+                })
+        else:
+            # Cible sur earliest : vérifier dédup pour tous les matchs de la vague
+            matches_needing = [
+                m for m in wave
+                if not db.is_target_served(conn, m["match_id"], hours_before)
+            ]
+            
+            if matches_needing:
+                due.append({
+                    "target": target,
+                    "target_timestamp": target_timestamp.isoformat(),
+                    "matches_needing_collection": matches_needing,
+                    "per_match": False,
+                })
+    
+    return due
+
+
+def _is_morning_time(now: datetime, config: dict) -> bool:
+    """Vérifie si l'heure actuelle correspond au créneau du matin (09:00 ±10min).
+    
+    Tolérance de ±10 min pour absorber les décalages de tick (20 min).
+    """
+    # Récupère le fuseau d'affichage (config.yaml display.timezone)
+    # Pour simplifier V1 : on suppose que le matin = 09:00 UTC (à ajuster si besoin)
+    # TODO : utiliser pytz si besoin de gérer les fuseaux proprement
+    morning_hour = 9  # 09:00 UTC (à paramétrer si besoin)
+    return morning_hour - 1 <= now.hour <= morning_hour + 1
+
+
+def _should_collect_morning(conn: sqlite3.Connection, now: datetime) -> bool:
+    """Vérifie si la collecte du matin doit être exécutée (idempotence quotidienne).
+    
+    Renvoie True si :
+    - On est dans le créneau du matin (09:00 ±10min)
+    - ET la collecte du matin n'a pas déjà été faite aujourd'hui
+    
+    Déduplication via meta['daily_morning_collected_YYYY-MM-DD'].
+    """
+    today = now.strftime("%Y-%m-%d")
+    meta_key = f"daily_morning_collected_{today}"
+    already_collected = db.get_meta(conn, meta_key) == "true"
+    
+    return _is_morning_time(now, {}) and not already_collected
+
+
+def _mark_morning_collected(conn: sqlite3.Connection, now: datetime) -> None:
+    """Marque la collecte du matin comme effectuée pour aujourd'hui."""
+    today = now.strftime("%Y-%m-%d")
+    meta_key = f"daily_morning_collected_{today}"
+    db.set_meta(conn, meta_key, "true")
+
+
+def _collect_and_record(
     conn: sqlite3.Connection,
     client,
     sport: str,
-    config: dict | None = None,
-    *,
-    force: bool = False,
-    settings: Settings | None = None,
-    telegram_client=None,
-) -> dict[str, int | bool]:
-    """Exécute une collecte complète pour le sport donné.
-
-    Une collecte = une transaction : on ne committe qu'à la fin, pour que la base
-    reste cohérente même en cas d'erreur au milieu.
-
-    Paramètres :
-        force : si True, la collecte est inconditionnelle (créneau du matin).
-                Si False, la collecte est sautée si aucun match actif en base ou si
-                la garde de réserve est déclenchée.
-        config : configuration du projet (config.yaml). Requis pour la garde de réserve.
-        settings : secrets (pour la notification Telegram de réserve). Optionnel.
+    markets: list[str],
+    match_ids: list[str],
+    target_hours: float,
+    target_timestamp: str,
+    wave_label: str,
+    now: datetime,
+) -> dict[str, int]:
+    """Exécute un appel API et enregistre les snapshots pour les matchs donnés.
+    
+    Renvoie un dict avec discovered, newly_tracked, snapshots.
+    Marque chaque match comme servi pour cette cible (anti-doublon).
     """
-    # --- Collectes conditionnelles : skip si aucun match actif ---
-    if not force:
-        if not db.has_active_matches(conn):
-            logger.info("Collecte sautée : aucun match à l'horizon (zéro crédit consommé).")
-            return {"skipped": True, "reason": "no_active_matches"}
-
-        # --- Garde de réserve ---
-        if config is not None and not _check_reserve(conn, config, settings, telegram_client):
-            return {"skipped": True, "reason": "reserve"}
-
-    now = datetime.now(timezone.utc)
     snapshot_at = now.isoformat()
-
-    # --- Clôture en tête de traitement : passe en CLOS les matchs dont le tip-off
-    # est passé AVANT de stocker les snapshots. Sans cela, l'API renvoie encore des
-    # matchs en cours (cotes live) qui seraient stockés en violation de la règle
-    # « CLOS au tip-off, plus aucune collecte » (bug révélé par la simulation du 17/07).
-    closed = db.close_finished_matches(conn, now)
-
-    events = client.get_odds()
+    
+    # Appel API avec les marchés configurés
+    events = client.get_odds(markets=markets)
     credits = getattr(client, "credits_remaining", None) or "?"
     cost = getattr(client, "last_request_cost", None) or "?"
+    
     logger.info(
-        "Collecte %s : %d match(s) à venir — crédits restants : %s (coût de la requête : %s).",
-        sport, len(events), credits, cost,
+        "Collecte %s (cible H-%.2f, vague %s) : %d match(s) — crédits : %s (coût : %s).",
+        sport, target_hours, wave_label, len(events), credits, cost,
     )
-
+    
     discovered = newly_tracked = snapshots = 0
+    collected_match_ids = set()
+    
     for event in events:
-        # Garde tip-off : exclut tout match dont le tip-off est passé. L'API peut
-        # encore renvoyer des matchs en cours (cotes live) — on ne les stocke pas.
+        # Garde tip-off : exclut tout match dont le tip-off est passé
         tipoff = datetime.fromisoformat(event.commence_time.replace("Z", "+00:00"))
         if tipoff <= now:
             logger.info(
@@ -237,10 +395,14 @@ def run_collection(
                 event.id, event.commence_time,
             )
             continue
-
+        
+        # Ne traiter que les matchs de la vague (filtre côté client)
+        if event.id not in match_ids:
+            continue
+        
         existing = db.get_match(conn, event.id)
         if existing is None:
-            # Nouveau match : on l'enregistre et ce premier relevé = cotes d'ouverture.
+            # Nouveau match : on l'enregistre (cotes d'ouverture)
             db.insert_match(
                 conn,
                 match_id=event.id,
@@ -257,29 +419,368 @@ def run_collection(
                 event.away_team, event.home_team, event.id,
             )
         elif existing["status"] == "DECOUVERT":
-            # 2e relevé d'un match déjà connu : il entre en phase de suivi.
+            # 2e relevé : passage en SUIVI
             db.update_match_status(conn, event.id, "SUIVI")
             newly_tracked += 1
-
+        
         snapshots += _record_snapshots(conn, event, snapshot_at)
-
-    # Persiste le quota rafraîchi pour la garde de réserve.
-    if config is not None:
-        _persist_credits(conn, client)
-
-    conn.commit()
-
-    # Après persistance : lève la garde si le quota repasse au-dessus du seuil
-    # (utile au reset mensuel, rafraîchi par la collecte du matin inconditionnelle).
-    if config is not None and force:
-        _maybe_lift_reserve(conn, config, settings, telegram_client)
-
-    summary = {
+        collected_match_ids.add(event.id)
+    
+    # Marque chaque match collecté comme servi pour cette cible
+    for match_id in collected_match_ids:
+        db.mark_target_served(
+            conn,
+            match_id=match_id,
+            target_hours=target_hours,
+            target_timestamp=target_timestamp,
+            collected_at=snapshot_at,
+            markets=",".join(markets),
+            credits_used=int(cost) if cost != "?" else 0,
+            wave_label=wave_label,
+        )
+    
+    return {
         "discovered": discovered,
         "newly_tracked": newly_tracked,
         "snapshots": snapshots,
-        "closed": closed,
-        "skipped": False,
+        "credits": credits,
+        "cost": cost,
     }
-    logger.info("Collecte terminée : %s — crédits restants : %s.", summary, credits)
+
+
+def run_collection(
+    conn: sqlite3.Connection,
+    client,
+    sport: str,
+    config: dict | None = None,
+    *,
+    force: bool = False,
+    settings: Settings | None = None,
+    telegram_client=None,
+    now: datetime | None = None,
+) -> dict[str, int | bool]:
+    """Exécute une collecte auto-ordonnancée (Lot 2, architecture par vague).
+    
+    Architecture :
+    1. Collecte du matin (si créneau 09:00 ±10min, idempotente quotidienne)
+    2. Clôture en tête (matchs passés → CLOS)
+    3. Groupement des matchs actifs en vagues (seuil 45 min)
+    4. Calcul des cibles dues par vague (atteintes ET non servies)
+    5. Collecte par cible avec garde de réserve par priorité
+    
+    Paramètres :
+        force : Si True, exécute une collecte complète inconditionnelle (tous marchés,
+                tous matchs API, bypass gardes). Usage : tests ou collecte manuelle.
+                En production, utiliser le tick anonyme (force=False).
+        config : configuration du projet (config.yaml). Requis.
+        settings : secrets (pour notifications Telegram). Optionnel.
+        now : heure actuelle (injectable pour tests). Défaut : datetime.now(UTC).
+    """
+    if config is None:
+        config = {}
+    
+    if now is None:
+        now = datetime.now(timezone.utc)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MODE FORCE : Collecte complète inconditionnelle (tests / usage manuel)
+    # ═══════════════════════════════════════════════════════════════════════════
+    if force:
+        logger.info("Mode force : collecte complète inconditionnelle (bypass gardes).")
+        
+        # Clôture en tête
+        closed = db.close_finished_matches(conn, now)
+        
+        # Collecte tous les marchés configurés
+        markets = config.get("api", {}).get("markets", ["h2h", "spreads", "totals"])
+        snapshot_at = now.isoformat()
+        
+        events = client.get_odds(markets=markets)
+        credits = getattr(client, "credits_remaining", None) or "?"
+        cost = getattr(client, "last_request_cost", None) or "?"
+        
+        logger.info(
+            "Collecte force %s : %d match(s) — crédits : %s (coût : %s).",
+            sport, len(events), credits, cost,
+        )
+        
+        discovered = newly_tracked = snapshots = 0
+        for event in events:
+            tipoff = datetime.fromisoformat(event.commence_time.replace("Z", "+00:00"))
+            if tipoff <= now:
+                continue
+            
+            existing = db.get_match(conn, event.id)
+            if existing is None:
+                db.insert_match(
+                    conn,
+                    match_id=event.id,
+                    sport=sport,
+                    home_team=event.home_team,
+                    away_team=event.away_team,
+                    tipoff_utc=event.commence_time,
+                    status="DECOUVERT",
+                    created_at=snapshot_at,
+                )
+                discovered += 1
+                logger.info(
+                    "Nouveau match DECOUVERT : %s @ %s (%s)",
+                    event.away_team, event.home_team, event.id,
+                )
+            elif existing["status"] == "DECOUVERT":
+                db.update_match_status(conn, event.id, "SUIVI")
+                newly_tracked += 1
+            
+            snapshots += _record_snapshots(conn, event, snapshot_at)
+        
+        _persist_credits(conn, client)
+        _maybe_lift_reserve(conn, config, settings, telegram_client)
+        conn.commit()
+        
+        return {
+            "skipped": False,
+            "discovered": discovered,
+            "newly_tracked": newly_tracked,
+            "snapshots": snapshots,
+            "closed": closed,
+        }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 1 : COLLECTE DU MATIN (critique pour éviter le gel du système)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Évaluée AVANT toute garde conditionnelle (skip si aucun match actif).
+    # Exemptée de la garde de réserve (priorité implicite 1).
+    # Idempotente via meta['daily_morning_collected_YYYY-MM-DD'].
+    
+    morning_collected = False
+    if _should_collect_morning(conn, now):
+        logger.info("Créneau du matin détecté : collecte de découverte (inconditionnelle).")
+        
+        # Collecte tous les marchés configurés (découverte complète)
+        markets = config.get("api", {}).get("markets", ["h2h", "spreads", "totals"])
+        snapshot_at = now.isoformat()
+        
+        events = client.get_odds(markets=markets)
+        credits = getattr(client, "credits_remaining", None) or "?"
+        cost = getattr(client, "last_request_cost", None) or "?"
+        
+        logger.info(
+            "Collecte matin %s : %d match(s) — crédits : %s (coût : %s).",
+            sport, len(events), credits, cost,
+        )
+        
+        discovered = newly_tracked = snapshots = 0
+        for event in events:
+            tipoff = datetime.fromisoformat(event.commence_time.replace("Z", "+00:00"))
+            if tipoff <= now:
+                continue
+            
+            existing = db.get_match(conn, event.id)
+            if existing is None:
+                db.insert_match(
+                    conn,
+                    match_id=event.id,
+                    sport=sport,
+                    home_team=event.home_team,
+                    away_team=event.away_team,
+                    tipoff_utc=event.commence_time,
+                    status="DECOUVERT",
+                    created_at=snapshot_at,
+                )
+                discovered += 1
+                logger.info(
+                    "Nouveau match DECOUVERT : %s @ %s (%s)",
+                    event.away_team, event.home_team, event.id,
+                )
+            elif existing["status"] == "DECOUVERT":
+                db.update_match_status(conn, event.id, "SUIVI")
+                newly_tracked += 1
+            
+            snapshots += _record_snapshots(conn, event, snapshot_at)
+        
+        # Persiste crédits + marque matin collecté
+        _persist_credits(conn, client)
+        _mark_morning_collected(conn, now)
+        conn.commit()
+        
+        # Lève la garde de réserve si quota rafraîchi
+        _maybe_lift_reserve(conn, config, settings, telegram_client)
+        
+        morning_collected = True
+        logger.info(
+            "Collecte matin terminée : %d découverts, %d suivis, %d snapshots.",
+            discovered, newly_tracked, snapshots,
+        )
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 2 : CLÔTURE EN TÊTE (bug cotes live du 17/07)
+    # ═══════════════════════════════════════════════════════════════════════════
+    closed = db.close_finished_matches(conn, now)
+    if closed > 0:
+        logger.info("Clôture : %d match(s) passé(s) en CLOS.", closed)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 3 : GROUPEMENT EN VAGUES
+    # ═══════════════════════════════════════════════════════════════════════════
+    active_matches = db.get_matches_by_status(conn, db.ACTIVE_STATUSES)
+    
+    if not active_matches and not morning_collected:
+        logger.info("Aucun match actif : tick sans collecte (zéro crédit consommé).")
+        return {
+            "skipped": True,
+            "reason": "no_active_matches",
+            "morning_collected": False,
+            "closed": closed,
+        }
+    
+    if not active_matches:
+        # Matin collecté mais aucun match actif (rare : tous clôturés entre-temps)
+        # RETOUR IMMÉDIAT : la collecte du matin a réussi, pas besoin de targets
+        return {
+            "skipped": False,
+            "morning_collected": True,
+            "closed": closed,
+            "waves": 0,
+            "targets_collected": 0,
+        }
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 4 : COLLECTE PAR VAGUE + CIBLE
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Groupement en vagues (nécessaire pour le summary même si targets vide)
+    wave_threshold = config.get("collector", {}).get("wave_grouping_minutes", 45)
+    waves = group_into_waves(active_matches, wave_threshold)
+    
+    logger.info(
+        "Tick collecteur : %d match(s) actif(s), %d vague(s) détectée(s).",
+        len(active_matches), len(waves),
+    )
+    
+    # GARDE CRITIQUE : Config targets absente/vide = panne silencieuse → EXIT
+    # Vérifiée ICI (après retour matin) pour ne pas neutraliser la garde anti-gel
+    targets_config = config.get("collector", {}).get("targets", [])
+    
+    if not targets_config:
+        # Si matin collecté, on retourne un summary valide (matin OK, 0 vague)
+        if morning_collected:
+            return {
+                "skipped": False,
+                "morning_collected": True,
+                "closed": closed,
+                "waves": len(waves),
+                "targets_collected": 0,
+                "snapshots": 0,
+            }
+        
+        # Sinon, config invalide → exception
+        logger.error(
+            "ERREUR CRITIQUE : collector.targets absent ou vide dans config.yaml. "
+            "Aucune collecte de vagues ne sera exécutée (72 ticks/jour en silence). "
+            "Vérifier config.yaml section collector.targets."
+        )
+        if settings is not None:
+            try:
+                from notifier.direct import send_direct
+                text = (
+                    "🔴 ERREUR CRITIQUE COLLECTEUR\n"
+                    "collector.targets absent ou vide dans config.yaml\n"
+                    "Aucune collecte de vagues ne sera exécutée.\n"
+                    "Vérifier immédiatement la configuration."
+                )
+                send_direct(settings, text, client=telegram_client)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Notification d'erreur config non envoyée : %s", exc)
+        
+        # Lève une exception : séparation des responsabilités (logique métier vs exit code)
+        raise ConfigurationError(
+            "collector.targets absent ou vide dans config.yaml. "
+            "Aucune collecte de vagues ne sera exécutée."
+        )
+    
+    total_targets_collected = 0
+    total_snapshots = 0
+    
+    for wave in waves:
+        wave_label = compute_wave_label(wave)
+        due_targets = compute_due_targets(wave, targets_config, now, conn)
+        
+        if not due_targets:
+            continue
+        
+        logger.info(
+            "Vague %s : %d cible(s) due(s) sur %d match(s).",
+            wave_label, len(due_targets), len(wave),
+        )
+        
+        for due in due_targets:
+            target = due["target"]
+            target_name = target.get("name", f"H-{target['hours_before']}")
+            priority = target.get("priority", 2)
+            matches_needing = due["matches_needing_collection"]
+            
+            # Garde de réserve par priorité (priorité 1 jamais bloquée)
+            if priority > 1:
+                if not _check_reserve(conn, config, settings, telegram_client):
+                    logger.info(
+                        "Cible %s (priorité %d) sautée : garde de réserve active.",
+                        target_name, priority,
+                    )
+                    continue
+            
+            # Cible per-match (closing) : union des marchés des verdicts
+            if due.get("per_match"):
+                match_ids_needing = [m["match_id"] for m in matches_needing]
+                markets = db.get_closing_markets_for_wave(conn, match_ids_needing)
+                
+                if not markets:
+                    # Aucun verdict en attente : skip closing
+                    logger.info(
+                        "Cible closing : aucun verdict en attente pour %d match(s).",
+                        len(matches_needing),
+                    )
+                    continue
+                
+                logger.info(
+                    "Cible closing : %d match(s), marchés %s (union verdicts).",
+                    len(matches_needing), markets,
+                )
+            else:
+                markets = target.get("markets", ["h2h", "spreads", "totals"])
+            
+            # Collecte + enregistrement
+            match_ids = [m["match_id"] for m in matches_needing]
+            result = _collect_and_record(
+                conn,
+                client,
+                sport,
+                markets,
+                match_ids,
+                target["hours_before"],
+                due["target_timestamp"],
+                wave_label,
+                now,
+            )
+            
+            total_snapshots += result["snapshots"]
+            total_targets_collected += 1
+            
+            # Persiste crédits après chaque collecte
+            _persist_credits(conn, client)
+    
+    conn.commit()
+    
+    summary = {
+        "skipped": False,
+        "morning_collected": morning_collected,
+        "closed": closed,
+        "waves": len(waves),
+        "targets_collected": total_targets_collected,
+        "snapshots": total_snapshots,
+    }
+    
+    logger.info(
+        "Tick terminé : %d vague(s), %d cible(s) collectée(s), %d snapshots.",
+        len(waves), total_targets_collected, total_snapshots,
+    )
+    
     return summary

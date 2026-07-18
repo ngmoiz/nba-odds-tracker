@@ -19,5 +19,9 @@
 - Preuve observée pour toute affirmation factuelle (sortie commande collée) — « déjà » interdit sans extrait code
 - Test qui casse → question « la garantie tient-elle ? » (jamais champ compatibilité sans justification)
 - scripts/check.sh lancé avant rapport fin de lot, sortie collée
+- Interdiction de supprimer, skipper ou réécrire un test pour le faire passer. Un test qui échoue se corrige côté code, ou son échec est signalé tel quel et laissé rouge.
+- Si un bug est identifié en cours de tâche, il est signalé explicitement dans le rapport final, même non corrigé — jamais contourné en silence.
+- Un rapport final ne présente que la sortie brute de pytest -q. Les formulations « X% des tests exécutables », « N tests fonctionnels », ou toute addition de sous-ensembles sont interdites.
+- Manquer de temps ou de contexte n'autorise aucun raccourci : la bonne réponse est de s'arrêter et de rapporter l'état réel.
 
 Voir CLAUDE.md sections « Invariants » et « Définition de terminé » pour contexte complet.
