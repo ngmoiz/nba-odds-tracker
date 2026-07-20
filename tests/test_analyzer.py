@@ -283,6 +283,161 @@ def test_decide_match_in_window_is_redecided_and_superseded(tmp_path):
     conn.close()
 
 
+# ─────────────────── Garde decision_min_hours (correctif 2026-07-20, CLV None) ───────────────────
+
+def _setup_stable(tmp_path, tipoff_iso):
+    """Base avec un match SUIVI et des relevés STABLES (aucun mouvement -> NO_BET)."""
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    conn = get_connection(db_path)
+    db.insert_match(
+        conn, match_id="m1", sport="basketball_wnba", home_team="Home",
+        away_team="Away", tipoff_utc=tipoff_iso, status="SUIVI", created_at=fx.T[0],
+    )
+    rows = []
+    for book in ("a", "b", "c", "d"):
+        rows += fx.spreads(book, "Home", "Away", -3.0, 1.91, 1.91, fx.T[0])
+        rows += fx.spreads(book, "Home", "Away", -3.0, 1.91, 1.91, fx.T[1])  # stable
+        rows += fx.h2h(book, "Home", "Away", 1.90, 1.90, fx.T[0])
+        rows += fx.h2h(book, "Home", "Away", 1.90, 1.90, fx.T[1])  # stable
+    for row in rows:
+        db.insert_snapshot(conn, match_id="m1", **row)
+    conn.commit()
+    return conn
+
+
+def test_no_analysis_within_decision_min_hours(tmp_path):
+    """Tip-off à H-0,4 (< decision_min_hours=0.55) → analyse ENTIÈRE sautée.
+
+    Même un mouvement fort (R1+R4, cf. `_setup`) ne produit plus rien : zéro alerte,
+    zéro verdict. Le snapshot de clôture reste stocké par le collecteur (hors de ce
+    test) ; seule l'ANALYSE est sautée.
+    """
+    tipoff = (NOW + timedelta(hours=0.4)).isoformat()
+    conn = _setup(tmp_path, tipoff)
+
+    summary = analyze_open_matches(conn, CFG, NOW)
+
+    assert summary["alerts"] == 0
+    assert summary["verdicts"] == 0
+    assert conn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"] == "SUIVI"
+    conn.close()
+
+
+def test_verdict_produced_just_above_decision_min_hours(tmp_path):
+    """Tip-off à H-0,6 (> decision_min_hours=0.55, dans la fenêtre 2.5h) → verdict rendu."""
+    tipoff = (NOW + timedelta(hours=0.6)).isoformat()
+    conn = _setup(tmp_path, tipoff)
+
+    summary = analyze_open_matches(conn, CFG, NOW)
+
+    assert summary["verdicts"] == 1
+    assert summary["alerts"] >= 1
+    conn.close()
+
+
+def test_decided_at_frozen_across_nobet_reconfirmations(tmp_path):
+    """NO_BET rendu à H-2, reconfirmé à H-1,5 puis H-0,6 (aucun mouvement) : decided_at inchangé.
+
+    Sans la distinction matériel/non matériel (correctif 2026-07-20), decided_at
+    aurait avancé à chaque passage — faussant systématiquement le CLV, mesuré contre
+    un instant qui n'est pas celui de la vraie décision.
+    """
+    tipoff_dt = NOW + timedelta(hours=2)
+    conn = _setup_stable(tmp_path, tipoff_dt.isoformat())
+
+    analyze_open_matches(conn, CFG, NOW)  # H-2 : entrée en fenêtre, verdict NO_BET créé
+    v1 = conn.execute("SELECT decided_at, verdict FROM verdicts WHERE match_id='m1'").fetchone()
+    assert v1["verdict"] == "NO_BET"
+    decided_at_1 = v1["decided_at"]
+
+    analyze_open_matches(conn, CFG, tipoff_dt - timedelta(hours=1.5))  # re-décision non matérielle
+    v2 = conn.execute("SELECT decided_at, verdict FROM verdicts WHERE match_id='m1'").fetchone()
+    assert v2["verdict"] == "NO_BET"
+    assert v2["decided_at"] == decided_at_1
+
+    analyze_open_matches(conn, CFG, tipoff_dt - timedelta(hours=0.6))  # juste au-dessus du seuil
+    v3 = conn.execute("SELECT decided_at, verdict FROM verdicts WHERE match_id='m1'").fetchone()
+    assert v3["verdict"] == "NO_BET"
+    assert v3["decided_at"] == decided_at_1  # toujours inchangé, 3 confirmations plus tard
+    conn.close()
+
+
+def test_decided_at_updated_on_material_redecision(tmp_path):
+    """NO_BET à H-2 puis SIGNAL matériel à H-1 (mouvement fort) : decided_at avance.
+
+    Contraste avec le test précédent : un changement matériel DOIT ré-ancrer
+    decided_at/odds_at_verdict sur le nouveau prix (nouvelle décision, nouvelle
+    référence de CLV).
+    """
+    tipoff_dt = NOW + timedelta(hours=2)
+    conn = _setup_stable(tmp_path, tipoff_dt.isoformat())
+
+    analyze_open_matches(conn, CFG, NOW)
+    v1 = conn.execute("SELECT decided_at, verdict FROM verdicts WHERE match_id='m1'").fetchone()
+    assert v1["verdict"] == "NO_BET"
+    decided_at_1 = v1["decided_at"]
+
+    # Mouvement fort ajouté avant la 2e analyse (R1 + R4 -> score 6 -> SIGNAL).
+    for book in ("a", "b", "c", "d"):
+        db.insert_snapshot(conn, match_id="m1", **fx.snap(book, "spreads", "Home", 1.70, -7.0, fx.T[2]))
+        db.insert_snapshot(conn, match_id="m1", **fx.snap(book, "spreads", "Away", 2.15, 7.0, fx.T[2]))
+    conn.commit()
+
+    analyze_open_matches(conn, CFG, tipoff_dt - timedelta(hours=1))
+    v2 = conn.execute("SELECT decided_at, verdict FROM verdicts WHERE match_id='m1'").fetchone()
+    assert v2["verdict"] == "SIGNAL"          # changement matériel
+    assert v2["decided_at"] != decided_at_1   # ré-ancré sur la nouvelle décision
+    conn.close()
+
+
+def test_too_close_to_decide_applies_per_match_not_globally(tmp_path):
+    """Deux matchs dans la MÊME exécution : l'un à H-0,3 (sauté), l'autre à H-2 (verdict rendu).
+
+    Preuve que `_too_close_to_decide` s'évalue sur `match["tipoff_utc"]` (par match),
+    pas sur une borne globale de l'exécution : `analyze_open_matches` passe le même
+    `now` aux deux matchs, mais seul celui dont le tip-off est proche est ignoré —
+    l'autre est analysé normalement dans la même passe.
+    """
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    conn = get_connection(db_path)
+
+    tipoff_close = (NOW + timedelta(hours=0.3)).isoformat()  # sous decision_min_hours=0.55
+    tipoff_far = (NOW + timedelta(hours=2)).isoformat()      # dans la fenêtre, au-dessus du seuil
+
+    for match_id, tipoff in (("close", tipoff_close), ("far", tipoff_far)):
+        db.insert_match(
+            conn, match_id=match_id, sport="basketball_wnba", home_team="Home",
+            away_team="Away", tipoff_utc=tipoff, status="SUIVI", created_at=fx.T[0],
+        )
+        # Même mouvement fort (R1 + R4 -> score 6) sur les deux matchs.
+        for book in ("a", "b", "c", "d"):
+            for row in fx.spreads(book, "Home", "Away", -2.0, 1.91, 1.91, fx.T[0]):
+                db.insert_snapshot(conn, match_id=match_id, **row)
+            for row in fx.spreads(book, "Home", "Away", -5.0, 1.91, 1.91, fx.T[1]):
+                db.insert_snapshot(conn, match_id=match_id, **row)
+    conn.commit()
+
+    summary = analyze_open_matches(conn, CFG, NOW)  # UNE SEULE exécution, même `now` pour les deux
+
+    # "close" (H-0.3) : analyse entièrement sautée -> zéro alerte, zéro verdict, reste SUIVI.
+    assert conn.execute("SELECT COUNT(*) n FROM alerts WHERE match_id='close'").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) n FROM verdicts WHERE match_id='close'").fetchone()["n"] == 0
+    assert conn.execute("SELECT status FROM matches WHERE match_id='close'").fetchone()["status"] == "SUIVI"
+
+    # "far" (H-2) : analysé normalement dans la MÊME passe -> alertes + verdict SIGNAL, DECIDE.
+    assert conn.execute("SELECT COUNT(*) n FROM alerts WHERE match_id='far'").fetchone()["n"] >= 1
+    far_verdict = conn.execute("SELECT verdict FROM verdicts WHERE match_id='far'").fetchone()
+    assert far_verdict is not None and far_verdict["verdict"] == "SIGNAL"
+    assert conn.execute("SELECT status FROM matches WHERE match_id='far'").fetchone()["status"] == "DECIDE"
+
+    # Le résumé global reflète le mélange dans une seule exécution.
+    assert summary["analyzed"] == 2
+    assert summary["verdicts"] == 1
+    conn.close()
+
+
 def test_no_alerts_after_tipoff(tmp_path):
     """Un match dont le tip-off est passé → zéro alerte, zéro verdict.
 

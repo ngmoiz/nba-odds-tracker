@@ -421,6 +421,31 @@ def update_verdict_fields(
     )
 
 
+def update_verdict_fields_partial(
+    conn: sqlite3.Connection,
+    verdict_id: int,
+    *,
+    signal_score: int,
+    rules_triggered: str,
+    rationale: str,
+    logic_version: int,
+) -> None:
+    """Re-décision NON matérielle : met à jour le score/justificatif, PAS le prix.
+
+    Ne touche PAS `decided_at`, `odds_at_verdict`, `verdict`, `selection`, `market`,
+    `line` : ce sont les champs qui ancrent le CLV (correctif 2026-07-20 — sans cette
+    distinction, `decided_at` était réécrit à chaque passage de l'analyseur, y compris
+    au tick de clôture, rendant le CLV structurellement non mesurable : verdict et
+    clôture pointaient vers le même snapshot). `logic_version` reste mis à jour pour
+    que la ségrégation de cohorte suive toujours la version de logique courante.
+    """
+    conn.execute(
+        "UPDATE verdicts SET signal_score = ?, rules_triggered = ?, rationale = ?, "
+        "logic_version = ? WHERE id = ?",
+        (signal_score, rules_triggered, rationale, logic_version, verdict_id),
+    )
+
+
 def supersede_verdict(conn: sqlite3.Connection, verdict_id: int, prior_message_id: int | None) -> None:
     """Marque un verdict re-décidé matériellement : l'ancien message devra être édité.
 

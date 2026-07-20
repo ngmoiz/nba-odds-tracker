@@ -1106,6 +1106,65 @@ def test_validate_collector_config_skips_without_tick():
     validate_collector_config(config)  # ne lève pas
 
 
+def _config_with_decision_min_hours(decision_min_hours):
+    return {
+        "collector": {
+            "tick_interval_minutes": 20,
+            "targets": [
+                {"name": "closing", "hours_before": 0.4, "per_match": True},
+                {"name": "redecision", "hours_before": 1.0},
+            ],
+        },
+        "decision": {"decision_min_hours": decision_min_hours},
+    }
+
+
+def test_validate_decision_min_hours_rejects_at_or_below_closing():
+    """decision_min_hours ≤ hours_before(closing) → ConfigurationError.
+
+    Piège géométrique (2026-07-20) : la clôture (servie entre H-0.4 et H-0.067 selon
+    le retard de tick) resterait en zone décidable → verdict rendu sur le même
+    snapshot que la clôture, CLV structurellement non mesurable.
+    """
+    with pytest.raises(ConfigurationError):
+        validate_collector_config(_config_with_decision_min_hours(0.4))
+
+
+def test_validate_decision_min_hours_rejects_at_or_above_redecision_minus_tick():
+    """decision_min_hours ≥ hours_before(redecision) − tick/60 → ConfigurationError.
+
+    Un tick de re-décision retardé (servi dès H-0.667 dans le pire cas) tomberait
+    sous le seuil → une re-décision H-1 légitime serait bloquée à tort.
+    """
+    with pytest.raises(ConfigurationError):
+        validate_collector_config(_config_with_decision_min_hours(0.667))
+
+
+def test_validate_decision_min_hours_accepts_value_in_range():
+    """0.55 h (valeur retenue en config.yaml) → aucune erreur (0.4 < 0.55 < 0.667)."""
+    validate_collector_config(_config_with_decision_min_hours(0.55))  # ne lève pas
+
+
+def test_validate_decision_min_hours_skips_without_value_or_targets():
+    """decision_min_hours absent, ou cibles closing/redecision absentes → pas de validation."""
+    config_no_value = {
+        "collector": {
+            "tick_interval_minutes": 20,
+            "targets": [
+                {"name": "closing", "hours_before": 0.4, "per_match": True},
+                {"name": "redecision", "hours_before": 1.0},
+            ],
+        },
+    }
+    validate_collector_config(config_no_value)  # ne lève pas : pas de decision_min_hours
+
+    config_no_targets = {
+        "collector": {"tick_interval_minutes": 20, "targets": [{"name": "morning", "hours_before": None}]},
+        "decision": {"decision_min_hours": 0.55},
+    }
+    validate_collector_config(config_no_targets)  # ne lève pas : cibles absentes
+
+
 def test_credits_attributed_to_call_not_per_match(conn):
     """Comptabilité crédits : le coût d'un appel de vague est attribué à l'APPEL,
     pas dupliqué par match. SUM(credits_used) == coût réel de l'appel unique.

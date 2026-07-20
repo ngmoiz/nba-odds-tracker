@@ -48,10 +48,17 @@ def _row(conn):
 
 
 def test_non_material_redecision_updates_fields_silently(conn):
-    """Même type + même sélection : mise à jour des champs, aucune supersession."""
+    """Même type + même sélection : score/justificatif mis à jour, prix ET decided_at figés.
+
+    Correctif 2026-07-20 : `odds_at_verdict` et `decided_at` ne bougent PAS sur une
+    re-décision non matérielle — sinon le CLV se mesure contre un prix qui n'est pas
+    celui de la vraie décision (bug constaté : verdict et clôture sur le même
+    snapshot quand la re-décision tombait au tick de clôture).
+    """
     _redecide(conn, "m1", _verdict(odds=1.70), "2026-07-16T23:30:00Z")
     row = _row(conn)
-    assert row["odds_at_verdict"] == 1.70
+    assert row["odds_at_verdict"] == 1.91                # figé : PAS 1.70
+    assert row["decided_at"] == "2026-07-16T23:00:00Z"   # figé : PAS la nouvelle heure
     assert row["superseded_message_id"] is None          # pas de supersession
     assert row["notified_at"] is not None                # reste notifié (silencieux)
     assert row["telegram_message_id"] == 100             # message inchangé

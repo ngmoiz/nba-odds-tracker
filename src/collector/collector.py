@@ -88,6 +88,56 @@ def validate_collector_config(config: dict) -> None:
                 f"ou réduire collector.tick_interval_minutes."
             )
 
+    _validate_decision_min_hours(config, tick)
+
+
+def _validate_decision_min_hours(config: dict, tick: int) -> None:
+    """Valide que `decision.decision_min_hours` est calé entre 'closing' et 'redecision'.
+
+    Même piège géométrique que la fenêtre closing vs tick (2026-07-18), transposé à la
+    borne basse de décision (correctif 2026-07-20, CLV toujours None) : un tick est
+    servi avec un retard pouvant aller jusqu'à `tick_interval_minutes` (le tick suivant
+    l'échéance). Donc :
+    - la cible 'closing' (hours_before) peut être servie aussi tard que
+      `now = tipoff - closing.hours_before + retard`, i.e. au plus tôt à
+      `hours_before` du tip-off (retard nul) ;
+    - la cible 'redecision' peut être servie aussi tard que
+      `hours_before(redecision) - tick/60` du tip-off (pire retard).
+
+    Si `decision_min_hours` n'est pas strictement compris entre les deux, un tick
+    retardé peut soit laisser passer un verdict/re-décision sur la clôture (CLV non
+    mesurable), soit bloquer à tort une re-décision H-1 légitime. Ne valide rien si
+    l'une des cibles ou `decision_min_hours` est absente (configs de test minimales).
+    """
+    decision = config.get("decision", {})
+    decision_min_hours = decision.get("decision_min_hours")
+    if decision_min_hours is None:
+        return
+
+    targets = {t.get("name"): t for t in config.get("collector", {}).get("targets", [])}
+    closing = targets.get("closing")
+    redecision = targets.get("redecision")
+    if closing is None or redecision is None:
+        return
+
+    closing_hours = closing.get("hours_before")
+    redecision_hours = redecision.get("hours_before")
+    if closing_hours is None or redecision_hours is None:
+        return
+
+    tick_hours = tick / 60
+    upper_bound = redecision_hours - tick_hours
+
+    if not (closing_hours < decision_min_hours < upper_bound):
+        raise ConfigurationError(
+            f"decision.decision_min_hours ({decision_min_hours} h) doit être strictement "
+            f"compris entre hours_before de 'closing' ({closing_hours} h) et hours_before "
+            f"de 'redecision' moins le pire retard de tick ({redecision_hours} h − "
+            f"{tick_hours:.3f} h = {upper_bound:.3f} h). Sinon un tick retardé peut faire "
+            f"basculer une clôture en zone décidable (CLV non mesurable) ou bloquer une "
+            f"re-décision H-1 légitime."
+        )
+
 
 def _record_snapshots(conn: sqlite3.Connection, event: OddsEvent, snapshot_at: str) -> int:
     """Aplatit un match en lignes de relevés (bookmaker × marché × sélection)."""

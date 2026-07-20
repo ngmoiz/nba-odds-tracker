@@ -72,9 +72,21 @@ rules:
   movement_negligible_line: 0.25     # 0,25 pt de ligne (spreads)
 
 # --- Décision finale à H-1 (section 6.4) ---
+# La fenêtre de décision va désormais de H-2,5 à H-0,55 : sous decision_min_hours,
+# l'analyseur ne produit plus ni alerte ni verdict (snapshot de clôture stocké, point).
 decision:
   signal_score_threshold: 6   # score ≥ 6 ET cohérence globale → SIGNAL
-  window_hours: 2.5           # verdict produit si le tip-off est dans cette fenêtre (borne inclusive)
+  window_hours: 2.5           # borne haute : verdict/re-décision produits si le tip-off est dans cette fenêtre
+  decision_min_hours: 0.55    # borne basse : sous ce délai, analyse ENTIÈRE sautée (alertes + verdict/
+                              # re-décision) — garantit que le verdict n'est jamais rendu sur le même
+                              # snapshot que la clôture (CLV non mesurable, cf. journal 2026-07-20).
+                              # Piège géométrique (même famille que closing 0.25 vs tick 20 min,
+                              # 2026-07-18) : doit rester STRICTEMENT compris entre hours_before de la
+                              # cible 'closing' (0.4 h) et hours_before de 'redecision' (1.0 h) moins le
+                              # pire retard de tick (20 min = 0,333 h), soit strictement entre 0.4 et
+                              # 0.667 h. Retenu : 0.55 h (33 min). Contrainte VALIDÉE au démarrage
+                              # (validate_collector_config) : un futur changement de tick ou de cible
+                              # qui recréerait silencieusement l'un des deux pièges échoue ici.
 
 # --- Notificateur Telegram (section 7) ---
 # Le notificateur lit les alertes/verdicts non envoyés en base et les pousse sur

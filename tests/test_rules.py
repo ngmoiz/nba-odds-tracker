@@ -576,10 +576,13 @@ def test_format_movement_proba_at_exact_boundary():
 # ─────────────────── Formatage totals : ligne avant → après ───────────────────
 
 def test_format_movement_totals_with_line():
-    """totals : la ligne du total est affichée avant → après (ex. « ligne 163,5 → 162,5 »).
+    """totals : la ligne du total est affichée avant → après (ex. « ligne 163,5 → 162,5 »),
+    ET la direction se lit désormais sur la LIGNE, pas sur la proba (correctif 2026-07-20).
 
-    Défaut de complétude constaté en réel : les alertes totals n'affichaient pas
-    la ligne, contrairement aux spreads. La donnée existe dans ConsensusPoint.line.
+    Ligne EN BAISSE (163,5 → 162,5) → argent vers l'Under, MÊME SI la proba Over
+    montait sur ce relevé (avant correctif, ce test asseyait « hausse vers l'Over »
+    en figeant le bug : la direction suivait la proba de la sélection passée en
+    paramètre, décorrélée du sens réel de la ligne).
     """
     from analyzer.rules import _format_movement
     from analyzer.preprocessing import ConsensusPoint
@@ -590,14 +593,128 @@ def test_format_movement_totals_with_line():
     )
     after = ConsensusPoint(
         market="totals", selection="Over", snapshot_at=fx.T[1],
-        line=162.5, prob=0.520, odds=1.85, n_books=1,  # ligne baisse, proba hausse
+        line=162.5, prob=0.520, odds=1.85, n_books=1,  # ligne baisse, proba hausse (décorrélées)
     )
     detail = _format_movement(
         _data(fx.totals("dk", 163.5, 1.91, 1.91, fx.T[0]) + fx.totals("dk", 162.5, 1.85, 1.97, fx.T[1])),
         "totals", "Over", before, after, "test",
     )
     assert "ligne 163,5 → 162,5" in detail
+    assert "📉 baisse" in detail
+    assert "l'argent va vers l'Under" in detail  # ligne fait foi, pas la proba Over
+
+
+# ─────────── Reproduction des 2 alertes réelles du 19/07 (correctif direction totals) ───────────
+
+def test_format_movement_totals_direction_reads_line_case_10h00():
+    """Reproduction de l'alerte réelle du 19/07 10:00 : ligne 177,5 → 180,5 (HAUSSE).
+
+    Avant correctif : affichait « 📉 baisse ... vers l'Under » car la règle avait
+    déclenché sur la sélection Over dont la proba baissait (0,52 → 0,48) MALGRÉ la
+    ligne montante — contradiction observée en production.
+    Après correctif : la ligne monte → « 📈 hausse ... vers l'Over », quelle que
+    soit la sélection/proba qui a déclenché la règle.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[0],
+        line=177.5, prob=0.52, odds=1.83, n_books=4,
+    )
+    after = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[1],
+        line=180.5, prob=0.48, odds=2.05, n_books=4,  # proba BAISSE malgré ligne HAUSSE
+    )
+    detail = _format_movement(
+        _data(fx.totals("dk", 177.5, 1.83, 1.99, fx.T[0]) + fx.totals("dk", 180.5, 2.05, 1.78, fx.T[1])),
+        "totals", "Over", before, after, "test",
+    )
+    assert "ligne 177,5 → 180,5" in detail
     assert "📈 hausse" in detail
+    assert "l'argent va vers l'Over" in detail
+    assert "Under" not in detail
+
+
+def test_format_movement_totals_direction_reads_line_case_13h00():
+    """Reproduction de l'alerte réelle du 19/07 13:00 : ligne 181,5 → 183,5 (HAUSSE).
+
+    Ce cas s'affichait déjà correctement AVANT correctif (la proba Over montait
+    aussi) — mais par coïncidence. Ce test prouve l'absence de régression sur le
+    cas qui « marchait déjà » une fois la logique basée sur la ligne.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[0],
+        line=181.5, prob=0.48, odds=2.05, n_books=4,
+    )
+    after = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[1],
+        line=183.5, prob=0.52, odds=1.83, n_books=4,  # proba monte aussi (cohérente ici)
+    )
+    detail = _format_movement(
+        _data(fx.totals("dk", 181.5, 2.05, 1.78, fx.T[0]) + fx.totals("dk", 183.5, 1.83, 1.99, fx.T[1])),
+        "totals", "Over", before, after, "test",
+    )
+    assert "ligne 181,5 → 183,5" in detail
+    assert "📈 hausse" in detail
+    assert "l'argent va vers l'Over" in detail
+
+
+def test_format_movement_totals_direction_independent_of_triggering_selection():
+    """La direction totals ne dépend plus de la sélection qui a déclenché la règle.
+
+    Que `_format_movement` soit appelée avec selection="Over" ou selection="Under"
+    (selon quelle série a fait franchir le seuil de la règle), une ligne qui monte
+    pointe TOUJOURS vers l'Over : c'est la ligne qui fait foi, pas le paramètre
+    `selection` d'entrée.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    data = _data(fx.totals("dk", 177.5, 1.90, 1.90, fx.T[0]) + fx.totals("dk", 180.5, 1.90, 1.90, fx.T[1]))
+
+    before_over = ConsensusPoint(market="totals", selection="Over", snapshot_at=fx.T[0],
+                                  line=177.5, prob=0.5, odds=1.90, n_books=1)
+    after_over = ConsensusPoint(market="totals", selection="Over", snapshot_at=fx.T[1],
+                                 line=180.5, prob=0.5, odds=1.90, n_books=1)
+    detail_over = _format_movement(data, "totals", "Over", before_over, after_over, "test")
+
+    before_under = ConsensusPoint(market="totals", selection="Under", snapshot_at=fx.T[0],
+                                   line=177.5, prob=0.5, odds=1.90, n_books=1)
+    after_under = ConsensusPoint(market="totals", selection="Under", snapshot_at=fx.T[1],
+                                  line=180.5, prob=0.5, odds=1.90, n_books=1)
+    detail_under = _format_movement(data, "totals", "Under", before_under, after_under, "test")
+
+    assert "l'argent va vers l'Over" in detail_over
+    assert "l'argent va vers l'Over" in detail_under  # même conclusion, sélection déclenchante différente
+
+
+def test_format_movement_totals_odds_only_interpreted_when_line_stable():
+    """totals : quand la ligne est INCHANGÉE, la proba fait foi (repli explicite).
+
+    Cas complémentaire du correctif : la cote ne s'interprète que si la ligne n'a
+    pas bougé (mouvement à ligne fixe). Reproduit le comportement pré-existant pour
+    ce cas précis (ligne stable), qui reste correct et n'a pas besoin de changer.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[0],
+        line=224.5, prob=0.500, odds=1.90, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="totals", selection="Over", snapshot_at=fx.T[1],
+        line=224.5, prob=0.520, odds=1.83, n_books=1,  # ligne inchangée, proba monte
+    )
+    detail = _format_movement(
+        _data(fx.totals("dk", 224.5, 1.90, 1.90, fx.T[0]) + fx.totals("dk", 224.5, 1.83, 1.99, fx.T[1])),
+        "totals", "Over", before, after, "test",
+    )
+    assert "ligne 224,5 (inchangée)" in detail
     assert "l'argent va vers l'Over" in detail
 
 
@@ -620,3 +737,61 @@ def test_format_movement_totals_line_stable():
     )
     assert "ligne 162,5" in detail
     assert "→" not in detail.split("ligne")[1].split(",")[0]  # pas de flèche après "ligne 162,5"
+
+
+# ─────── Non-régression h2h/spreads : le correctif totals ne touche QUE totals ───────
+
+def test_format_movement_h2h_unaffected_by_totals_fix():
+    """Non-régression : h2h reste piloté par la proba, sortie EXACTE inchangée.
+
+    Le correctif totals (2026-07-20) ajoute une branche `elif market == "totals"`
+    dans `_format_movement`, entre la branche `spreads` et le `else`. Le `else`
+    (qui gère h2h) n'a reçu aucune modification de logique — seul un commentaire a
+    changé. Ce test fige la sortie complète (pas juste une sous-chaîne) pour un cas
+    h2h type : toute régression sur cette branche le ferait échouer immédiatement.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[0],
+        line=None, prob=0.500, odds=1.90, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="h2h", selection="Home", snapshot_at=fx.T[1],
+        line=None, prob=0.520, odds=1.80, n_books=1,
+    )
+    detail = _format_movement(
+        _data(fx.h2h("dk", "Home", "Away", 1.90, 1.90)), "h2h", "Home", before, after, "test",
+    )
+    assert detail == "📈 hausse, cote méd. 1,90 → 1,80, Δproba +2,0 pts, (test), l'argent va vers Home"
+
+
+def test_format_movement_spreads_unaffected_by_totals_fix():
+    """Non-régression : spreads reste piloté par la ligne, sortie EXACTE inchangée.
+
+    La branche `market == "spreads"` de `_format_movement` (première branche du
+    if/elif/else) n'a pas été touchée par l'ajout de la branche `totals` : ce test
+    fige la sortie complète pour un cas spreads type, en plus des tests existants
+    (`test_format_movement_above_negligible_line`, etc.) qui continuent de passer
+    sans avoir été modifiés par ce correctif.
+    """
+    from analyzer.rules import _format_movement
+    from analyzer.preprocessing import ConsensusPoint
+
+    before = ConsensusPoint(
+        market="spreads", selection="Home", snapshot_at=fx.T[0],
+        line=-2.0, prob=0.5, odds=1.91, n_books=1,
+    )
+    after = ConsensusPoint(
+        market="spreads", selection="Home", snapshot_at=fx.T[1],
+        line=-5.0, prob=0.55, odds=1.75, n_books=1,
+    )
+    detail = _format_movement(
+        _data(fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[0])),
+        "spreads", "Home", before, after, "test",
+    )
+    assert detail == (
+        "📉 baisse : ligne -2,0 → -5,0, cote méd. 1,91 → 1,75, Δproba +5,0 pts, "
+        "(test), l'argent va vers Home"
+    )

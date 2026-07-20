@@ -41,6 +41,23 @@ def _tipoff_passed(tipoff_utc: str, now: datetime) -> bool:
     return now >= tipoff
 
 
+def _too_close_to_decide(tipoff_utc: str, now: datetime, config: dict) -> bool:
+    """Vrai si l'on est trop près du tip-off pour qu'une analyse soit actionnable.
+
+    Sous `decision.decision_min_hours`, l'analyseur ne produit RIEN — ni alerte
+    (R1-R6, non actionnable à quelques dizaines de minutes du tip-off) ni
+    verdict/re-décision. Choix documenté (correctif 2026-07-20, exception au gel) :
+    sans cette garde, la collecte de clôture (H-0.4) déclenchait immédiatement une
+    re-décision dont `decided_at` tombait à moins d'une seconde du snapshot de
+    clôture → CLV structurellement non mesurable (verdict et clôture sur le même
+    snapshot, cf. garde de `evaluator/clv.py`). Le snapshot de clôture, lui, est
+    toujours stocké par le collecteur : seule l'ANALYSE est sautée ici.
+    """
+    min_delay = timedelta(hours=config["decision"]["decision_min_hours"])
+    tipoff = datetime.fromisoformat(tipoff_utc.replace("Z", "+00:00"))
+    return (tipoff - now) <= min_delay
+
+
 def analyze_match(conn: sqlite3.Connection, match: sqlite3.Row, config: dict, now: datetime) -> dict:
     """Analyse un match : alertes temps réel + verdict si dans la fenêtre de décision.
 
@@ -53,6 +70,13 @@ def analyze_match(conn: sqlite3.Connection, match: sqlite3.Row, config: dict, no
     match_id = match["match_id"]
     if _tipoff_passed(match["tipoff_utc"], now):
         logger.info("Match %s ignoré : tip-off passé, aucune analyse.", match_id)
+        return {"alerts": 0, "verdict": None, "score": 0}
+    if _too_close_to_decide(match["tipoff_utc"], now, config):
+        logger.info(
+            "Match %s : analyse sautée (trop proche du tip-off, < decision_min_hours). "
+            "Snapshot de clôture stocké, aucune alerte ni verdict/re-décision émis.",
+            match_id,
+        )
         return {"alerts": 0, "verdict": None, "score": 0}
     data = preprocess(conn, match_id)
     results = evaluate_rules(data, config, ALL_RULES)
@@ -131,9 +155,16 @@ def _redecide(conn: sqlite3.Connection, match_id: str, new: Verdict, now_iso: st
 
     - **Gel** : si une position a déjà été prise sur ce verdict, on n'y touche plus
       (le développeur s'est engagé sur cette décision).
-    - **Changement matériel** (le type OU la sélection change) → l'ancien message devient
-      obsolète : `supersede_verdict` le marque pour édition et re-met le verdict en file.
-    - Changement non matériel (cote/score/justificatif) → mise à jour silencieuse.
+    - **Changement matériel** (le type OU la sélection change) → prix ré-ancré
+      (`decided_at`/`odds_at_verdict` mis à jour sur le nouveau prix) ET l'ancien
+      message devient obsolète : `supersede_verdict` le marque pour édition et
+      re-met le verdict en file.
+    - **Changement non matériel** (score/règles/justificatif inchangés dans leur
+      substance, seule la cote ou le libellé évoluent) → mise à jour silencieuse du
+      score/justificatif SEULEMENT. `decided_at` et `odds_at_verdict` restent figés
+      sur la VRAIE décision (correctif 2026-07-20) : les réécrire à chaque passage
+      de l'analyseur — y compris au tick de clôture — rendait le CLV structurellement
+      non mesurable (verdict et clôture sur le même snapshot, cf. `evaluator/clv.py`).
     """
     current = db.get_current_verdict(conn, match_id)
     if current is None:
@@ -142,25 +173,35 @@ def _redecide(conn: sqlite3.Connection, match_id: str, new: Verdict, now_iso: st
         return current["verdict"]  # gelé : décision engagée
 
     material = (new.verdict != current["verdict"]) or (new.selection != current["selection"])
-    db.update_verdict_fields(
-        conn,
-        current["id"],
-        verdict=new.verdict,
-        selection=new.selection,
-        market=new.market,
-        line=new.line,
-        odds_at_verdict=new.odds_at_verdict,
-        signal_score=new.signal_score,
-        rules_triggered=json.dumps(new.rules_triggered),
-        rationale=new.rationale,
-        decided_at=now_iso,
-        logic_version=DECISION_LOGIC_VERSION,
-    )
+
     if material:
+        db.update_verdict_fields(
+            conn,
+            current["id"],
+            verdict=new.verdict,
+            selection=new.selection,
+            market=new.market,
+            line=new.line,
+            odds_at_verdict=new.odds_at_verdict,
+            signal_score=new.signal_score,
+            rules_triggered=json.dumps(new.rules_triggered),
+            rationale=new.rationale,
+            decided_at=now_iso,
+            logic_version=DECISION_LOGIC_VERSION,
+        )
         db.supersede_verdict(conn, current["id"], current["telegram_message_id"])
         logger.info(
             "Re-décision matérielle du verdict %s (%s) : %s → %s.",
             current["id"], match_id, current["verdict"], new.verdict,
+        )
+    else:
+        db.update_verdict_fields_partial(
+            conn,
+            current["id"],
+            signal_score=new.signal_score,
+            rules_triggered=json.dumps(new.rules_triggered),
+            rationale=new.rationale,
+            logic_version=DECISION_LOGIC_VERSION,
         )
     return new.verdict
 

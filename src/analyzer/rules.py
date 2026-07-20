@@ -177,7 +177,49 @@ def _format_movement(
         parts.append(
             f"{emoji} {direction} : ligne {_fr_signed(before.line)} → {_fr_signed(after.line)}"
         )
+    elif market == "totals" and before.line is not None and after.line is not None:
+        # Correctif 2026-07-20 (Lot A, affichage uniquement) : la direction totals se
+        # lit sur la LIGNE (le total lui-même), pas sur la proba d'une sélection
+        # arbitraire. Une ligne qui monte = argent vers l'Over (le book relève le
+        # total, typiquement en réponse à de l'argent Over) ; une ligne qui baisse =
+        # argent vers l'Under. Avant ce correctif, la direction dépendait de la proba
+        # de la sélection ayant déclenché la règle (Over ou Under), décorrélée du
+        # sens de la ligne — cf. preuve de production 19/07 (deux alertes, même sens
+        # de ligne montante, direction affichée opposée selon la sélection déclenchante).
+        # La cote ne s'interprète (repli sur la proba) que si la ligne est INCHANGÉE.
+        delta_line = after.line - before.line
+        abs_delta_line = abs(delta_line)
+        if abs_delta_line < _EPS:
+            # Ligne inchangée : mouvement à ligne fixe, la proba fait foi.
+            delta_prob = after.prob - before.prob
+            abs_delta_prob = abs(delta_prob)
+            if abs_delta_prob < _EPS:
+                emoji, direction, target = "→", "stable", None
+            elif abs_delta_prob < negligible_prob:
+                emoji, direction, target = "≈", "quasi stable", None
+            elif delta_prob > _EPS:
+                emoji, direction, target = "📈", "hausse", selection
+            else:
+                emoji, direction = "📉", "baisse"
+                target = _opponent(data, market, selection)
+            parts.append(f"{emoji} {direction} : ligne {_fr_num(before.line)} (inchangée)")
+        elif abs_delta_line < negligible_line:
+            emoji, direction, target = "≈", "quasi stable", None
+            parts.append(
+                f"{emoji} {direction} : ligne {_fr_num(before.line)} → {_fr_num(after.line)}"
+            )
+        elif delta_line > _EPS:
+            emoji, direction, target = "📈", "hausse", "Over"
+            parts.append(
+                f"{emoji} {direction} : ligne {_fr_num(before.line)} → {_fr_num(after.line)}"
+            )
+        else:
+            emoji, direction, target = "📉", "baisse", "Under"
+            parts.append(
+                f"{emoji} {direction} : ligne {_fr_num(before.line)} → {_fr_num(after.line)}"
+            )
     else:
+        # h2h uniquement (spreads et totals traités ci-dessus).
         delta_prob = after.prob - before.prob
         abs_delta = abs(delta_prob)
         if abs_delta < _EPS:
@@ -189,16 +231,7 @@ def _format_movement(
         else:
             emoji, direction = "📉", "baisse"
             target = _opponent(data, market, selection)
-        # Pour totals, afficher la ligne avant → après (ex. « ligne 163,5 → 162,5 »).
-        if market == "totals" and before.line is not None and after.line is not None:
-            if abs(after.line - before.line) < _EPS:
-                parts.append(f"{emoji} {direction} : ligne {_fr_num(before.line)}")
-            else:
-                parts.append(
-                    f"{emoji} {direction} : ligne {_fr_num(before.line)} → {_fr_num(after.line)}"
-                )
-        else:
-            parts.append(f"{emoji} {direction}")
+        parts.append(f"{emoji} {direction}")
 
     # Cote médiane avant → après (médiane des books US).
     parts.append(f"cote méd. {_fr_num(before.odds, 2)} → {_fr_num(after.odds, 2)}")
