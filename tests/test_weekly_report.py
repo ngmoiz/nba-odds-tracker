@@ -64,18 +64,26 @@ def _add_verdict(
     )
 
 
-def _add_eval(conn, verdict_id, *, outcome, clv, evaluated_at):
+def _add_eval(conn, verdict_id, *, outcome, clv, evaluated_at, clv_unit="line"):
+    """`clv_unit` défaut à 'line' : les verdicts de ce fichier sont par défaut sur
+    `market="spreads"` (défaut de `_add_verdict`), donc leur CLV est en points de ligne."""
     conn.execute(
         "INSERT INTO evaluations (verdict_id, home_score, away_score, outcome, "
-        "closing_odds, clv, evaluated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (verdict_id, 110, 100, outcome, 1.85, clv, evaluated_at),
+        "closing_odds, clv, clv_unit, evaluated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (verdict_id, 110, 100, outcome, 1.85, clv, clv_unit, evaluated_at),
     )
 
 
-def _row(verdict_id, logic_version, market, rules, outcome, clv):
-    """Fabrique une ligne type sqlite3.Row pour les tests d'agrégation pure."""
+def _row(verdict_id, logic_version, market, rules, outcome, clv, clv_unit=None):
+    """Fabrique une ligne type sqlite3.Row pour les tests d'agrégation pure.
+
+    `clv_unit` par défaut dérivé de `market` (comme le ferait le rétro-remplissage
+    réel en base) : 'prob' pour h2h, 'line' sinon.
+    """
+    if clv_unit is None:
+        clv_unit = "prob" if market == "h2h" else "line"
     return {"verdict_id": verdict_id, "logic_version": logic_version, "market": market,
-            "rules_triggered": rules, "outcome": outcome, "clv": clv}
+            "rules_triggered": rules, "outcome": outcome, "clv": clv, "clv_unit": clv_unit}
 
 
 def _nobet_row(logic_version, outcome):
@@ -96,7 +104,7 @@ def test_aggregate_signal_by_market_basic():
     spread = next(s for s in stats if s.label == "spreads")
     assert spread.won == 1 and spread.lost == 1 and spread.push == 0
     assert spread.rate == 0.5
-    assert spread.avg_clv == pytest.approx(0.01)  # (0.03 + -0.01) / 2
+    assert spread.avg_clv_line == pytest.approx(0.01)  # (0.03 + -0.01) / 2, en points de ligne
     h2h = next(s for s in stats if s.label == "h2h")
     assert h2h.rate == 1.0
 
@@ -118,7 +126,8 @@ def test_aggregate_signal_by_market_push_excluded_from_rate():
     ]
     stats = aggregate_signal_by_market(rows, logic_version=2)
     assert stats[0].rate == 1.0  # 1 won / (1 won + 0 lost), push hors dénominateur
-    assert stats[0].avg_clv is None  # tous les clv sont None
+    assert stats[0].avg_clv_line is None  # tous les clv sont None
+    assert stats[0].avg_clv_prob is None  # aucune ligne h2h dans ce panier
 
 
 # ─────────────────────── Agrégation par règle ───────────────────────
@@ -151,6 +160,21 @@ def test_aggregate_signal_by_rule_malformed_json_logs_and_counts(caplog):
     assert unreadable == 1
     # Warning émis avec le verdict_id concerné.
     assert any("verdict 1" in r.message for r in caplog.records)
+
+
+def test_aggregate_signal_by_rule_never_mixes_clv_units():
+    """Correctif 2026-07-21 : un panier de règle peut mélanger h2h (proba) et spreads/totals
+    (ligne) — les deux moyennes doivent rester séparées, jamais moyennées ensemble."""
+    rows = [
+        _row(1, 2, "h2h", '["R1"]', "won", 0.02),       # proba
+        _row(2, 2, "spreads", '["R1"]', "lost", -1.0),  # ligne
+    ]
+    stats, unreadable = aggregate_signal_by_rule(rows, logic_version=2)
+    assert len(stats) == 1
+    r1 = stats[0]
+    assert r1.avg_clv_prob == pytest.approx(0.02)
+    assert r1.avg_clv_line == pytest.approx(-1.0)
+    assert unreadable == 0
 
 
 # ─────────────────────── NO_BET pressentis ───────────────────────
@@ -229,6 +253,21 @@ def test_format_weekly_report_nobet_section():
     msg = format_weekly_report("7 jours", [], nobet, total_evals=5, v2_evals=5)
     assert "faux négatifs" in msg
     assert "1 auraient gagné" in msg
+
+
+def test_format_weekly_report_shows_both_clv_units_separately_for_mixed_rule():
+    """Un panier de règle mélangeant h2h et spreads affiche les 2 CLV moyens séparément,
+    jamais combinés en un seul nombre (correctif 2026-07-21)."""
+    signal = [
+        _row(1, 2, "h2h", '["R1"]', "won", 0.02),
+        _row(2, 2, "spreads", '["R1"]', "lost", -1.0),
+    ]
+    msg = format_weekly_report("7 jours", signal, [], total_evals=5, v2_evals=5)
+    assert "pts de proba" in msg
+    assert "pt(s) de ligne" in msg
+    # Les deux valeurs apparaissent, sans avoir été moyennées ensemble.
+    assert "+2,0 pts de proba" in msg
+    assert "-1,0 pt(s) de ligne" in msg
 
 
 def test_format_weekly_report_unreadable_mention():

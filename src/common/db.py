@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
     outcome      TEXT CHECK (outcome IN ('won', 'lost', 'push')),
     closing_odds REAL,                     -- cote de clôture (dernier snapshot avant tip-off)
     clv          REAL,                     -- Closing Line Value : odds_at_verdict vs closing_odds
+    clv_unit     TEXT,                     -- unité du clv : 'prob' (h2h) ou 'line' (spreads/totals)
     evaluated_at TEXT NOT NULL,
     invalidated  INTEGER DEFAULT 0         -- 1 = évaluation neutralisée (exclue des agrégations)
 );
@@ -180,6 +181,26 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: s
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
+def _backfill_clv_unit(conn: sqlite3.Connection) -> None:
+    """Renseigne `clv_unit` (NULL après l'ALTER) pour les évaluations existantes.
+
+    Dérivé du marché du verdict : 'prob' pour h2h, 'line' pour spreads/totals.
+    Idempotent — ne touche que les lignes où `clv_unit IS NULL` ; les nouvelles
+    évaluations reçoivent toujours `clv_unit` explicitement via `insert_evaluation`,
+    donc elles ne sont jamais NULL et jamais re-touchées ici.
+    """
+    conn.execute(
+        """
+        UPDATE evaluations
+        SET clv_unit = (
+            SELECT CASE WHEN v.market = 'h2h' THEN 'prob' ELSE 'line' END
+            FROM verdicts v WHERE v.id = evaluations.verdict_id
+        )
+        WHERE clv_unit IS NULL
+        """
+    )
+
+
 def _migrate_evaluations_outcome(conn: sqlite3.Connection) -> None:
     """Migre `evaluations.verdict_won` (1/0/NULL) vers `outcome` ('won'/'lost'/'push').
 
@@ -238,6 +259,10 @@ def init_db(db_path: Path) -> None:
         _ensure_column(conn, "verdicts", "superseded_message_id", "INTEGER")
         # Correctif J0 (18/07/2026) : colonne invalidated pour neutraliser évaluations erronées.
         _ensure_column(conn, "evaluations", "invalidated", "INTEGER DEFAULT 0")
+        # Correctif CLV ligne/proba (21/07/2026) : clv_unit distingue les marchés à ligne
+        # (spreads/totals) des marchés à proba (h2h) — jamais de moyenne mixte en aval.
+        _ensure_column(conn, "evaluations", "clv_unit", "TEXT")
+        _backfill_clv_unit(conn)
         # Lot 2 : migration collection_log (match_id, target_hours) → (match_id, target_name)
         _ensure_column(conn, "collection_log", "target_name", "TEXT NOT NULL DEFAULT ''")
         conn.commit()
@@ -608,14 +633,21 @@ def insert_evaluation(
     outcome: str,
     closing_odds: float | None,
     clv: float | None,
+    clv_unit: str | None,
     evaluated_at: str,
 ) -> int:
-    """Enregistre l'évaluation d'un verdict. `outcome` ∈ {'won','lost','push'} (état explicite)."""
+    """Enregistre l'évaluation d'un verdict. `outcome` ∈ {'won','lost','push'} (état explicite).
+
+    `clv_unit` ∈ {'prob','line'} (ou None si le marché du verdict est inconnu) : indique
+    dans quelle unité `clv` est exprimé. Obligatoire (pas de défaut) — le seul appelant
+    (`evaluator.evaluate_pending`) le connaît toujours via `compute_clv`, et un défaut
+    silencieux irait contre l'invariant « échec bruyant obligatoire ».
+    """
     cursor = conn.execute(
         "INSERT INTO evaluations "
-        "(verdict_id, home_score, away_score, outcome, closing_odds, clv, evaluated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (verdict_id, home_score, away_score, outcome, closing_odds, clv, evaluated_at),
+        "(verdict_id, home_score, away_score, outcome, closing_odds, clv, clv_unit, evaluated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (verdict_id, home_score, away_score, outcome, closing_odds, clv, clv_unit, evaluated_at),
     )
     return cursor.lastrowid
 
@@ -655,14 +687,17 @@ def count_evaluations_by_logic_version(
 def get_weekly_signal_evals(conn: sqlite3.Connection, since_iso: str) -> list[sqlite3.Row]:
     """Lignes évaluées SIGNAL sur la période, avec les champs nécessaires à l'agrégation.
 
-    Retourne : verdict_id, logic_version, market, rules_triggered (JSON texte), outcome, clv.
-    L'agrégation par marché et par règle se fait en Python (parsing JSON fiable).
-    `verdict_id` est inclus pour logger les règles illisibles (parsing défensif non silencieux).
-    
+    Retourne : verdict_id, logic_version, market, rules_triggered (JSON texte), outcome,
+    clv, clv_unit. L'agrégation par marché et par règle se fait en Python (parsing JSON
+    fiable). `verdict_id` est inclus pour logger les règles illisibles (parsing défensif
+    non silencieux). `clv_unit` permet de ne jamais moyenner un CLV en points de ligne
+    avec un CLV en points de probabilité (correctif 21/07/2026).
+
     Correctif 3c : exclut les évaluations invalidées.
     """
     return conn.execute(
-        "SELECT e.verdict_id, v.logic_version, v.market, v.rules_triggered, e.outcome, e.clv "
+        "SELECT e.verdict_id, v.logic_version, v.market, v.rules_triggered, e.outcome, "
+        "e.clv, e.clv_unit "
         "FROM evaluations e "
         "JOIN verdicts v ON v.id = e.verdict_id "
         "WHERE v.verdict = 'SIGNAL' AND e.evaluated_at >= ? AND e.invalidated = 0 "

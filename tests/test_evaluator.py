@@ -169,21 +169,27 @@ def _snap(conn, *, book, sel, line, odds, at, market="spreads"):
 
 
 def test_compute_clv_uses_demargined_consensus(conn):
-    """CLV = proba dé-marginée clôture − proba dé-marginée verdict (deux books)."""
+    """CLV h2h = proba dé-marginée clôture − proba dé-marginée verdict (deux books).
+
+    Marché h2h (pas de ligne) : seul marché où le CLV reste un delta de probabilité
+    (correctif 2026-07-21 — spreads/totals utilisent désormais un delta de ligne,
+    cf. les 8 cas chiffrés plus bas).
+    """
     from analyzer.preprocessing import preprocess
     # Verdict (t0) : Boston/Miami cotés 1.91/1.91 → proba dé-marginée 0.5.
-    for sel, ln, od in [("Boston Celtics", -5.0, 1.91), ("Miami Heat", 5.0, 1.91)]:
-        _snap(conn, book="pinnacle", sel=sel, line=ln, odds=od, at="2026-01-16T22:00:00Z")
+    for sel, od in [("Boston Celtics", 1.91), ("Miami Heat", 1.91)]:
+        _snap(conn, book="pinnacle", sel=sel, line=None, odds=od, at="2026-01-16T22:00:00Z", market="h2h")
     # Clôture (t1) : Boston se raccourcit (1.60), Miami s'allonge (2.40) → proba Boston monte.
-    for sel, ln, od in [("Boston Celtics", -5.0, 1.60), ("Miami Heat", 5.0, 2.40)]:
-        _snap(conn, book="pinnacle", sel=sel, line=ln, odds=od, at="2026-01-17T00:00:00Z")
+    for sel, od in [("Boston Celtics", 1.60), ("Miami Heat", 2.40)]:
+        _snap(conn, book="pinnacle", sel=sel, line=None, odds=od, at="2026-01-17T00:00:00Z", market="h2h")
     conn.commit()
 
     data = preprocess(conn, "m1")
-    closing_odds, clv = compute_clv(data, market="spreads", selection="Boston Celtics",
+    closing_odds, clv, clv_unit = compute_clv(data, market="h2h", selection="Boston Celtics",
                                     decided_at="2026-01-16T22:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
     assert closing_odds == 1.60
     assert clv is not None and clv > 0     # la proba de Boston a monté → CLV positif
+    assert clv_unit == "prob"  # marché h2h → unité en points de probabilité
 
 
 def test_compute_clv_none_when_selection_not_quoted(conn):
@@ -191,9 +197,10 @@ def test_compute_clv_none_when_selection_not_quoted(conn):
     _snap(conn, book="pinnacle", sel="Miami Heat", line=5.0, odds=1.91, at="2026-01-17T00:00:00Z")
     conn.commit()
     data = preprocess(conn, "m1")
-    closing_odds, clv = compute_clv(data, market="spreads", selection="Boston Celtics",
+    closing_odds, clv, clv_unit = compute_clv(data, market="spreads", selection="Boston Celtics",
                                     decided_at="2026-01-16T22:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
     assert closing_odds is None and clv is None
+    assert clv_unit == "line"  # unité connue (propriété du marché) même si le calcul échoue
 
 
 def test_compute_clv_none_when_same_snapshot(conn):
@@ -210,11 +217,118 @@ def test_compute_clv_none_when_same_snapshot(conn):
     conn.commit()
     data = preprocess(conn, "m1")
     # Verdict à 23:05, clôture à 00:20 → les deux pointent vers le snapshot 23:00.
-    closing_odds, clv = compute_clv(data, market="spreads", selection="Boston Celtics",
+    closing_odds, clv, clv_unit = compute_clv(data, market="spreads", selection="Boston Celtics",
                                     decided_at="2026-01-16T23:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
     # closing_odds est renvoyé (1.91), mais CLV est None (non mesurable).
     assert closing_odds == 1.91
     assert clv is None  # Garde-fou : même snapshot → CLV non mesurable
+    assert clv_unit == "line"
+
+
+# ─────────────── CLV en points de ligne (spreads/totals) — 8 cas chiffrés ───────────────
+# Correctif 2026-07-21. Valeurs exactes confirmées par le développeur (cf. CLAUDE.md §12).
+# Cotes fixées à 1.91 des deux côtés/instants pour isoler le calcul de ligne du calcul de
+# proba (le prix ne bouge pas, seule la ligne bouge).
+
+def test_clv_line_favorite_line_deepens(conn):
+    """Favori −5,5 → −7,5 (la ligne se creuse) : le parieur a un meilleur numéro → +2,0."""
+    from analyzer.preprocessing import preprocess
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-5.5, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Miami Heat", line=5.5, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-7.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    _snap(conn, book="pinnacle", sel="Miami Heat", line=7.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    conn.commit()
+    data = preprocess(conn, "m1")
+    closing_odds, clv, clv_unit = compute_clv(data, market="spreads", selection="Boston Celtics",
+                                    decided_at="2026-01-16T22:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
+    assert clv == pytest.approx(2.0)
+    assert clv_unit == "line"
+
+
+def test_clv_line_favorite_line_retracts(conn):
+    """Favori −5,5 → −4,5 (la ligne se rétracte) : pire numéro → −1,0 (cas réel NY Liberty)."""
+    from analyzer.preprocessing import preprocess
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-5.5, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Miami Heat", line=5.5, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-4.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    _snap(conn, book="pinnacle", sel="Miami Heat", line=4.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    conn.commit()
+    data = preprocess(conn, "m1")
+    closing_odds, clv, clv_unit = compute_clv(data, market="spreads", selection="Boston Celtics",
+                                    decided_at="2026-01-16T22:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
+    assert clv == pytest.approx(-1.0)
+    assert clv_unit == "line"
+
+
+def test_clv_line_underdog_line_narrows(conn):
+    """Outsider +6,5 → +4,5 (la ligne se resserre) : le parieur gardait plus de coussin → +2,0."""
+    from analyzer.preprocessing import preprocess
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-6.5, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Miami Heat", line=6.5, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-4.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    _snap(conn, book="pinnacle", sel="Miami Heat", line=4.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    conn.commit()
+    data = preprocess(conn, "m1")
+    closing_odds, clv, clv_unit = compute_clv(data, market="spreads", selection="Miami Heat",
+                                    decided_at="2026-01-16T22:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
+    assert clv == pytest.approx(2.0)
+    assert clv_unit == "line"
+
+
+def test_clv_line_underdog_line_widens(conn):
+    """Outsider +4,5 → +6,5 (la ligne s'élargit) : la clôture offre un meilleur numéro → −2,0."""
+    from analyzer.preprocessing import preprocess
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-4.5, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Miami Heat", line=4.5, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-6.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    _snap(conn, book="pinnacle", sel="Miami Heat", line=6.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    conn.commit()
+    data = preprocess(conn, "m1")
+    closing_odds, clv, clv_unit = compute_clv(data, market="spreads", selection="Miami Heat",
+                                    decided_at="2026-01-16T22:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
+    assert clv == pytest.approx(-2.0)
+    assert clv_unit == "line"
+
+
+@pytest.mark.parametrize(
+    "selection,opening,closing,expected",
+    [
+        ("Over", 177.5, 180.5, 3.0),
+        ("Over", 177.5, 174.5, -3.0),
+        ("Under", 177.5, 174.5, 3.0),
+        ("Under", 177.5, 180.5, -3.0),
+    ],
+)
+def test_clv_line_totals_over_under(conn, selection, opening, closing, expected):
+    """Totals : la ligne est partagée Over/Under, le signe dépend du côté parié."""
+    from analyzer.preprocessing import preprocess
+    _snap(conn, book="pinnacle", sel="Over", line=opening, odds=1.91, at="2026-01-16T22:00:00Z", market="totals")
+    _snap(conn, book="pinnacle", sel="Under", line=opening, odds=1.91, at="2026-01-16T22:00:00Z", market="totals")
+    _snap(conn, book="pinnacle", sel="Over", line=closing, odds=1.91, at="2026-01-17T00:00:00Z", market="totals")
+    _snap(conn, book="pinnacle", sel="Under", line=closing, odds=1.91, at="2026-01-17T00:00:00Z", market="totals")
+    conn.commit()
+    data = preprocess(conn, "m1")
+    closing_odds, clv, clv_unit = compute_clv(data, market="totals", selection=selection,
+                                    decided_at="2026-01-16T22:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
+    assert clv == pytest.approx(expected)
+    assert clv_unit == "line"
+
+
+def test_clv_line_unit_kept_even_when_line_missing(conn):
+    """Ligne manquante sur un marché à ligne (anomalie défensive, ex. donnée API incomplète) :
+    clv=None, mais clv_unit='line' quand même — l'unité reste une propriété du marché."""
+    from analyzer.preprocessing import preprocess
+    # Anomalie : un relevé spreads sans ligne (ne devrait pas arriver en production, mais
+    # le schéma l'autorise — `line` est nullable). Le verdict n'a donc pas de ligne au
+    # moment de la décision.
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=None, odds=1.91, at="2026-01-16T22:00:00Z")
+    _snap(conn, book="pinnacle", sel="Boston Celtics", line=-4.5, odds=1.91, at="2026-01-17T00:00:00Z")
+    conn.commit()
+    data = preprocess(conn, "m1")
+    closing_odds, clv, clv_unit = compute_clv(data, market="spreads", selection="Boston Celtics",
+                                    decided_at="2026-01-16T22:05:00Z", tipoff_utc="2026-01-17T00:20:00Z")
+    assert clv is None
+    assert clv_unit == "line"
 
 
 def test_end_to_end_verdict_to_closing_clv_is_measurable(tmp_path):
@@ -281,11 +395,15 @@ def test_end_to_end_verdict_to_closing_clv_is_measurable(tmp_path):
 
     # Le CLV se mesure enfin contre le VRAI verdict (H-2), pas contre la clôture.
     data = preprocess(conn, "m1")
-    closing_odds, clv = compute_clv(data, market="spreads", selection=BOS,
+    closing_odds, clv, clv_unit = compute_clv(data, market="spreads", selection=BOS,
                                     decided_at=decided_at, tipoff_utc=tipoff.isoformat())
     assert closing_odds == 1.55
     assert clv is not None
-    assert clv > 0   # Boston continue de se raccourcir après le verdict -> CLV positif
+    # Ligne au verdict (H-2) : -5.0. Ligne à la clôture (H-0.4) : -6.0 (se creuse encore)
+    # → clv = ligne_verdict - ligne_clôture = -5.0 - (-6.0) = +1.0 : positif, meilleur
+    # numéro qu'à la clôture (correctif CLV ligne/proba du 2026-07-21).
+    assert clv == pytest.approx(1.0)
+    assert clv_unit == "line"
     conn.close()
 
 
@@ -414,18 +532,44 @@ def test_success_rate_excludes_push_from_denominator():
 def test_format_daily_report_shows_outcome_clv_rate_and_guardrail():
     lines = [
         EvalLine(home_team=BOS, away_team=MIA, verdict="SIGNAL", selection="Boston Celtics",
-                 home_score=110, away_score=100, outcome="won", clv=0.03, position_action="take"),
+                 home_score=110, away_score=100, outcome="won", clv=0.03, position_action="take",
+                 clv_unit="prob"),
         EvalLine(home_team="Lakers", away_team="Suns", verdict="SIGNAL", selection="Lakers",
-                 home_score=100, away_score=100, outcome="push", clv=None, position_action=None),
+                 home_score=100, away_score=100, outcome="push", clv=None, position_action=None,
+                 clv_unit="prob"),
     ]
     msg = format_daily_report("17/01/2026", lines, total_evals=12)
     assert "Bilan du 17/01/2026" in msg
     assert "✅ gagné" in msg and "➖ push" in msg
-    assert "CLV +3,0 pts" in msg
+    assert "CLV +3,0 pts de proba" in msg
     assert "ta prise" in msg
     # Taux hors push : 1 gagné, 0 perdu, 1 push → 100 %.
     assert "taux 100 % (hors push)" in msg
     assert "bruit statistique" in msg  # garde-fou < 50 évaluations
+
+
+def test_format_daily_report_clv_line_unit_no_x100_scaling():
+    """Correctif 2026-07-21 : CLV en points de ligne affiché sans ×100 et avec son unité."""
+    lines = [
+        EvalLine(home_team=BOS, away_team=MIA, verdict="SIGNAL", selection="Boston Celtics",
+                 home_score=110, away_score=100, outcome="lost", clv=-1.0, position_action="take",
+                 clv_unit="line"),
+    ]
+    msg = format_daily_report("21/07/2026", lines, total_evals=12)
+    assert "CLV -1,0 pt(s) de ligne" in msg
+    assert "-100,0" not in msg  # pas de mise à l'échelle ×100 sur une unité ligne
+
+
+def test_format_daily_report_clv_non_none_without_unit_shows_nd():
+    """État incohérent (clv non-None sans unité reconnue) : jamais un nombre nu, toujours 'n/d'."""
+    lines = [
+        EvalLine(home_team=BOS, away_team=MIA, verdict="SIGNAL", selection="Boston Celtics",
+                 home_score=110, away_score=100, outcome="won", clv=0.03, position_action=None,
+                 clv_unit=None),
+    ]
+    msg = format_daily_report("21/07/2026", lines, total_evals=12)
+    assert "CLV n/d" in msg
+    assert "0,03" not in msg and "3,0" not in msg
 
 
 def test_format_daily_report_nobet_display_without_symbols():
@@ -437,11 +581,14 @@ def test_format_daily_report_nobet_display_without_symbols():
     """
     lines = [
         EvalLine(home_team=BOS, away_team=MIA, verdict="SIGNAL", selection="Boston Celtics",
-                 home_score=110, away_score=100, outcome="won", clv=0.03, position_action=None),
+                 home_score=110, away_score=100, outcome="won", clv=0.03, position_action=None,
+                 clv_unit="prob"),
         EvalLine(home_team="Lakers", away_team="Suns", verdict="NO_BET", selection="Lakers",
-                 home_score=105, away_score=100, outcome="won", clv=0.01, position_action=None),
+                 home_score=105, away_score=100, outcome="won", clv=0.01, position_action=None,
+                 clv_unit="prob"),
         EvalLine(home_team="Nets", away_team="Heat", verdict="NO_BET", selection="Nets",
-                 home_score=95, away_score=100, outcome="lost", clv=-0.01, position_action=None),
+                 home_score=95, away_score=100, outcome="lost", clv=-0.01, position_action=None,
+                 clv_unit="prob"),
     ]
     msg = format_daily_report("18/07/2026", lines, total_evals=25)
     
@@ -581,11 +728,11 @@ def test_invalidated_evaluations_excluded_from_aggregations(conn):
     # Crée 3 évaluations : 2 valides + 1 invalidée
     now_iso = datetime(2026, 1, 17, 12, 0, tzinfo=timezone.utc).isoformat()
     db.insert_evaluation(conn, verdict_id=v1_id, home_score=110, away_score=100,
-                        outcome="won", closing_odds=1.85, clv=0.03, evaluated_at=now_iso)
+                        outcome="won", closing_odds=1.85, clv=0.03, clv_unit="line", evaluated_at=now_iso)
     db.insert_evaluation(conn, verdict_id=v2_id, home_score=110, away_score=100,
-                        outcome="lost", closing_odds=2.05, clv=-0.02, evaluated_at=now_iso)
+                        outcome="lost", closing_odds=2.05, clv=-0.02, clv_unit="prob", evaluated_at=now_iso)
     db.insert_evaluation(conn, verdict_id=v3_id, home_score=110, away_score=100,
-                        outcome="won", closing_odds=1.80, clv=0.01, evaluated_at=now_iso)
+                        outcome="won", closing_odds=1.80, clv=0.01, clv_unit="line", evaluated_at=now_iso)
     
     # Invalide la 2e évaluation (verdict_id=v2_id)
     conn.execute("UPDATE evaluations SET invalidated = 1 WHERE verdict_id = ?", (v2_id,))
@@ -649,7 +796,7 @@ def test_clv_ignores_post_tipoff_snapshot(conn):
     conn.commit()
 
     data = preprocess(conn, "m_clv")
-    closing_odds, clv = compute_clv(
+    closing_odds, clv, clv_unit = compute_clv(
         data, market="h2h", selection="Home",
         decided_at=T1, tipoff_utc=T2,
     )

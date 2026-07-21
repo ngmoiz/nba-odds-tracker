@@ -7,7 +7,10 @@ sur `evaluated_at` (aucun trou entre deux rapports consécutifs).
 Métriques :
 - **Taux de réussite des SIGNAL** par marché et par règle déclenchante (pushes hors
   dénominateur, via le helper `success_rate` partagé avec le bilan quotidien).
-- **CLV moyen** des SIGNAL (moyenne des `clv` non-None).
+- **CLV moyen** des SIGNAL (moyenne des `clv` non-None), **séparé par unité**
+  (`clv_unit`) : points de probabilité (h2h) et points de ligne (spreads/totals) ne
+  sont jamais moyennés ensemble, même au sein d'un même panier de règle déclenchante
+  (correctif 2026-07-21, cf. `evaluator/clv.py`).
 - **Performance des NO_BET pressentis** (faux négatifs : la sélection pressentie
   aurait-elle gagné ?).
 - **Cumul d'évaluations** + rappel du garde-fou règle 11 tant que la **cohorte de
@@ -37,6 +40,7 @@ import json
 from dataclasses import dataclass, field
 
 from common.logging_config import get_logger
+from evaluator.clv_format import format_signed
 from evaluator.grading import LOST, PUSH, WON
 from evaluator.reporting import success_rate
 
@@ -58,7 +62,11 @@ class SignalStats:
     won: int = 0
     lost: int = 0
     push: int = 0
-    clv_values: tuple[float, ...] = field(default_factory=tuple)
+    # Deux pistes parallèles, jamais moyennées ensemble : un panier « par règle » peut
+    # contenir à la fois des SIGNAL h2h (proba) et spreads/totals (ligne) — cf. correctif
+    # CLV ligne/proba du 2026-07-21.
+    clv_prob_values: tuple[float, ...] = field(default_factory=tuple)
+    clv_line_values: tuple[float, ...] = field(default_factory=tuple)
 
     @property
     def total(self) -> int:
@@ -71,11 +79,18 @@ class SignalStats:
         return success_rate(outcomes)
 
     @property
-    def avg_clv(self) -> float | None:
-        """Moyenne des CLV non-None (en points de probabilité)."""
-        if not self.clv_values:
+    def avg_clv_prob(self) -> float | None:
+        """Moyenne des CLV non-None en points de probabilité (marché h2h)."""
+        if not self.clv_prob_values:
             return None
-        return sum(self.clv_values) / len(self.clv_values)
+        return sum(self.clv_prob_values) / len(self.clv_prob_values)
+
+    @property
+    def avg_clv_line(self) -> float | None:
+        """Moyenne des CLV non-None en points de ligne (marchés spreads/totals)."""
+        if not self.clv_line_values:
+            return None
+        return sum(self.clv_line_values) / len(self.clv_line_values)
 
 
 @dataclass(frozen=True)
@@ -134,16 +149,15 @@ def aggregate_signal_by_market(
     """Agrège les SIGNAL par marché pour une cohorte donnée.
 
     `rows` : lignes brutes avec colonnes `verdict_id`, `logic_version`, `market`,
-    `rules_triggered`, `outcome`, `clv`.
+    `rules_triggered`, `outcome`, `clv`, `clv_unit`.
     """
     buckets: dict[str, SignalStats] = {}
     for row in rows:
         if row["logic_version"] != logic_version:
             continue
         market = row["market"] or "n/d"
-        clv = row["clv"]
         prev = buckets.get(market, SignalStats(logic_version=logic_version, label=market))
-        buckets[market] = _accumulate(prev, row["outcome"], clv)
+        buckets[market] = _accumulate(prev, row["outcome"], row["clv"], row["clv_unit"])
     return sorted(buckets.values(), key=lambda s: s.label)
 
 
@@ -167,10 +181,9 @@ def aggregate_signal_by_rule(
         if not rules:
             unreadable += 1
             continue
-        clv = row["clv"]
         for rule in rules:
             prev = buckets.get(rule, SignalStats(logic_version=logic_version, label=rule))
-            buckets[rule] = _accumulate(prev, row["outcome"], clv)
+            buckets[rule] = _accumulate(prev, row["outcome"], row["clv"], row["clv_unit"])
     return sorted(buckets.values(), key=lambda s: s.label), unreadable
 
 
@@ -191,17 +204,31 @@ def aggregate_nobet(rows: list, *, logic_version: int) -> NoBetStats | None:
     return NoBetStats(logic_version=logic_version, won=won, lost=lost, push=push)
 
 
-def _accumulate(stats: SignalStats, outcome: str, clv: float | None) -> SignalStats:
-    """Renvoie un nouveau SignalStats incrémenté d'une issue."""
+def _accumulate(
+    stats: SignalStats, outcome: str, clv: float | None, clv_unit: str | None
+) -> SignalStats:
+    """Renvoie un nouveau SignalStats incrémenté d'une issue.
+
+    `clv` n'alimente que la piste correspondant à `clv_unit` ('prob' ou 'line') —
+    jamais les deux, jamais une piste par défaut si l'unité est absente/inconnue
+    (auquel cas la valeur est simplement ignorée, comme un CLV None).
+    """
     won = stats.won + (1 if outcome == WON else 0)
     lost = stats.lost + (1 if outcome == LOST else 0)
     push = stats.push + (1 if outcome == PUSH else 0)
-    clv_values = stats.clv_values + ((clv,) if clv is not None else ())
+    clv_prob_values = stats.clv_prob_values
+    clv_line_values = stats.clv_line_values
+    if clv is not None:
+        if clv_unit == "prob":
+            clv_prob_values = clv_prob_values + (clv,)
+        elif clv_unit == "line":
+            clv_line_values = clv_line_values + (clv,)
     return SignalStats(
         logic_version=stats.logic_version,
         label=stats.label,
         won=won, lost=lost, push=push,
-        clv_values=clv_values,
+        clv_prob_values=clv_prob_values,
+        clv_line_values=clv_line_values,
     )
 
 
@@ -212,11 +239,18 @@ def _pct(rate: float | None) -> str:
     return "n/d" if rate is None else f"{rate * 100:.1f} %".replace(".", ",")
 
 
-def _clv_label(avg: float | None) -> str:
-    if avg is None:
-        return "CLV n/d"
-    signe = "+" if avg >= 0 else ""
-    return f"CLV moy. {signe}{avg * 100:.1f} pts".replace(".", ",")
+def _clv_label(stats: SignalStats) -> str:
+    """Affiche les CLV moyens présents, séparément par unité — jamais combinés.
+
+    Un panier « par règle » peut mélanger des SIGNAL h2h (proba) et spreads/totals
+    (ligne) : les deux moyennes, si présentes, sont rendues côte à côte.
+    """
+    parts = []
+    if stats.avg_clv_prob is not None:
+        parts.append(f"CLV moy. {format_signed(stats.avg_clv_prob * 100, 1)} pts de proba")
+    if stats.avg_clv_line is not None:
+        parts.append(f"CLV moy. {format_signed(stats.avg_clv_line, 1)} pt(s) de ligne")
+    return " / ".join(parts) if parts else "CLV n/d"
 
 
 def _format_signal_section(
@@ -235,7 +269,7 @@ def _format_signal_section(
     for s in stats:
         lines.append(
             f"  • {html.escape(s.label)} : {s.won} gagné(s), {s.lost} perdu(s), "
-            f"{s.push} push — taux {_pct(s.rate)} (hors push) — {_clv_label(s.avg_clv)}"
+            f"{s.push} push — taux {_pct(s.rate)} (hors push) — {_clv_label(s)}"
         )
     return lines
 

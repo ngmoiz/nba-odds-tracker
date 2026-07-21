@@ -122,7 +122,7 @@ def evaluate_pending(
                 summary["ungradable"] += 1
                 continue
 
-            closing_odds, clv = compute_clv(
+            closing_odds, clv, clv_unit = compute_clv(
                 data,
                 market=verdict["market"],
                 selection=verdict["selection"],
@@ -137,6 +137,7 @@ def evaluate_pending(
                 outcome=outcome,
                 closing_odds=closing_odds,
                 clv=clv,
+                clv_unit=clv_unit,
                 evaluated_at=now_iso,
             )
             position = db.get_position(conn, verdict["id"])
@@ -150,6 +151,7 @@ def evaluate_pending(
                     away_score=result.away_score,
                     outcome=outcome,
                     clv=clv,
+                    clv_unit=clv_unit,
                     position_action=position["action"] if position else None,
                 )
             )

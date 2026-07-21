@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 from dataclasses import dataclass
 
+from evaluator.clv_format import clv_label
 from evaluator.grading import LOST, PUSH, WON
 
 # En dessous de ce nombre d'évaluations cumulées, les taux sont du bruit (section 11).
@@ -33,6 +34,7 @@ class EvalLine:
     outcome: str                 # 'won' / 'lost' / 'push' (état explicite)
     clv: float | None
     position_action: str | None  # 'take' / 'pass' / None (pas de clic)
+    clv_unit: str | None = None  # 'prob' (h2h) / 'line' (spreads/totals), cf. clv_format
 
 
 def success_rate(outcomes: list[str]) -> float | None:
@@ -44,13 +46,6 @@ def success_rate(outcomes: list[str]) -> float | None:
     if not decisive:
         return None
     return sum(o == WON for o in decisive) / len(decisive)
-
-
-def _clv_label(clv: float | None) -> str:
-    if clv is None:
-        return "CLV n/d"
-    signe = "+" if clv >= 0 else ""
-    return f"CLV {signe}{clv * 100:.1f} pts".replace(".", ",")
 
 
 def _position_label(action: str | None, outcome: str) -> str:
@@ -97,7 +92,7 @@ def format_daily_report(day_label: str, lines: list[EvalLine], total_evals: int)
         
         body.append(
             f"• {match} ({score}) — {html.escape(ln.verdict)}{cible} : "
-            f"{outcome_text}, {_clv_label(ln.clv)}"
+            f"{outcome_text}, {clv_label(ln.clv, ln.clv_unit)}"
             f"{_position_label(ln.position_action, ln.outcome)}"
         )
 
