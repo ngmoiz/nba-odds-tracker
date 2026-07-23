@@ -624,10 +624,15 @@ def run_collection(
     # ═══════════════════════════════════════════════════════════════════════════
     if force:
         logger.info("Mode force : collecte complète inconditionnelle (bypass gardes).")
-        
-        # Clôture en tête
+
+        # Clôture en tête. Commit immédiat (correctif 2026-07-23) : une transition
+        # d'état (actif → CLOS) doit être durable indépendamment de ce qui suit dans
+        # la fonction — ce chemin n'a aujourd'hui pas de retour anticipé avant le
+        # commit final (ligne ~675), mais en dépendre serait fragile face à un futur
+        # refactor (cf. bug symétrique corrigé sur le chemin principal ci-dessous).
         closed = db.close_finished_matches(conn, now)
-        
+        conn.commit()
+
         # Collecte tous les marchés configurés
         markets = config.get("api", {}).get("markets", ["h2h", "spreads", "totals"])
         snapshot_at = now.isoformat()
@@ -752,7 +757,25 @@ def run_collection(
     # ═══════════════════════════════════════════════════════════════════════════
     # ÉTAPE 2 : CLÔTURE EN TÊTE (bug cotes live du 17/07)
     # ═══════════════════════════════════════════════════════════════════════════
+    # Correctif 2026-07-23 (incident réel : Dallas Wings @ Portland Fire, dernier
+    # match d'une soirée). `close_finished_matches` ne committait pas ici : la
+    # transition CLOS ne survivait que si l'exécution atteignait le commit final de
+    # la fonction (ligne ~940), ce qui dépend de conditions sans rapport avec cette
+    # étape (matchs actifs restants, config des cibles). Trois chemins de sortie
+    # anticipée (§ÉTAPE 3/4 ci-dessous) retournaient sans commit : la mise à jour
+    # était silencieusement annulée par `conn.close()` (le module `sqlite3` fait un
+    # rollback implicite d'une transaction non commitée à la fermeture). Conséquence
+    # observée en production : le dernier match d'une soirée restait re-« clôturé »
+    # (log répété) à chaque tick pendant des heures sans jamais être persisté, et
+    # l'évaluateur du lendemain matin (qui filtre sur status='CLOS') le ratait.
+    # Le commit est désormais immédiat : une transition d'état doit être durable
+    # indépendamment de ce qui suit dans la fonction, jamais couplée au commit
+    # d'un autre composant (analyseur/notificateur) qui pourrait tourner ensuite
+    # sur la même connexion.
     closed = db.close_finished_matches(conn, now)
+    conn.commit()
+    # Le log n'annonce la clôture qu'une fois le commit effectif (si `commit()`
+    # levait, le journal ne doit pas affirmer une persistance qui n'a pas eu lieu).
     if closed > 0:
         logger.info("Clôture : %d match(s) passé(s) en CLOS.", closed)
     

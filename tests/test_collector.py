@@ -284,6 +284,80 @@ def test_conditional_skip_when_no_active_matches(conn):
     assert summary["reason"] == "no_active_matches"
 
 
+def test_closure_of_last_active_match_is_persisted_across_connections(tmp_path):
+    """Reproduction du bug de persistance (incident réel 2026-07-23, Dallas Wings @
+    Portland Fire) : le dernier match actif d'une soirée dont le tip-off vient de passer
+    doit voir son passage en CLOS survivre à la fermeture de la connexion — pas seulement
+    visible sur la connexion qui l'a écrit.
+
+    Avant correctif : `close_finished_matches` (étape 2) écrit l'UPDATE, mais le tick
+    retombe aussitôt dans la branche "aucun match actif" qui retourne sans `commit()`.
+    `conn.close()` sans commit préalable annule la transaction (comportement documenté
+    du module `sqlite3`) : une connexion fraîche (nouveau conteneur/process, comme
+    l'évaluateur du lendemain matin) revoit le match dans son ancien statut actif, et
+    `get_matches_to_evaluate()` (filtré sur status='CLOS') le rate silencieusement.
+    """
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    conn = get_connection(db_path)
+
+    # Dernier match de la soirée : tip-off tout juste dépassé, aucun autre match actif.
+    now = datetime(2026, 7, 23, 2, 0, 2, tzinfo=timezone.utc)  # hors créneau matin (9h±1)
+    tipoff = (now - timedelta(minutes=2)).isoformat()
+    db.insert_match(conn, match_id="m1", sport="basketball_wnba", home_team="Portland Fire",
+                     away_team="Dallas Wings", tipoff_utc=tipoff, status="DECIDE",
+                     created_at=tipoff)
+    conn.commit()
+
+    summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG, now=now)
+    # Le tick observe bien la clôture avant de constater qu'il n'y a plus rien à collecter.
+    assert summary["skipped"] is True
+    assert summary["reason"] == "no_active_matches"
+    assert summary["closed"] == 1
+
+    conn.close()  # comme le fait collector/__main__.py (finally: conn.close(), sans commit englobant)
+
+    # Nouvelle connexion (simule le conteneur suivant, ex. l'évaluateur du lendemain).
+    reconn = get_connection(db_path)
+    status = reconn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"]
+    reconn.close()
+
+    assert status == "CLOS"
+
+
+def test_closure_persisted_when_morning_collected_but_no_active_match_remains(tmp_path):
+    """Même bug (audit complet, correctif 2026-07-23), autre branche de sortie
+    anticipée : collecte du matin exécutée (aucun nouvel événement) puis clôture d'un
+    match déjà en base sans qu'il ne reste de match actif ensuite. Avant correctif,
+    cette branche (« matin collecté mais aucun match actif ») retournait elle aussi
+    sans commit — seules les écritures du matin (déjà commitées à l'étape 1) étaient
+    sûres, la clôture elle-même restait perdue à la fermeture de connexion."""
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    conn = get_connection(db_path)
+
+    now = datetime(2026, 7, 23, 9, 0, 2, tzinfo=timezone.utc)  # créneau du matin (9h±1)
+    tipoff = (now - timedelta(minutes=2)).isoformat()
+    db.insert_match(conn, match_id="m1", sport="basketball_wnba", home_team="Portland Fire",
+                     away_team="Dallas Wings", tipoff_utc=tipoff, status="DECIDE",
+                     created_at=tipoff)
+    conn.commit()
+
+    # FakeClient([]) : la collecte du matin ne découvre aucun nouveau match.
+    summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG, now=now)
+    assert summary["skipped"] is False
+    assert summary["morning_collected"] is True
+    assert summary["closed"] == 1
+
+    conn.close()
+
+    reconn = get_connection(db_path)
+    status = reconn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"]
+    reconn.close()
+
+    assert status == "CLOS"
+
+
 def test_conditional_collect_when_active_matches_exist(conn):
     """Collecte conditionnelle exécutée s'il y a des matchs actifs en base."""
     # Prépare un match en SUIVI en base.
