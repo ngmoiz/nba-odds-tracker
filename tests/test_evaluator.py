@@ -14,9 +14,9 @@ import httpx
 import pytest
 
 from common import db
-from common.config import Settings
+from common.config import Settings, load_config
 from common.db import get_connection, init_db
-from common.results_api_client import GameResult, ResultsApiClient
+from common.results_api_client import GameResult, ResultsApiClient, ResultsApiError
 from evaluator.clv import compute_clv
 from evaluator.evaluator import evaluate_pending
 from evaluator.grading import grade_verdict
@@ -121,6 +121,12 @@ def test_find_result_flexible_matching_reversed_partial():
 # ─────────────────────────── client balldontlie ───────────────────────────
 
 def test_results_client_parses_and_paginates():
+    """Pagination par curseur + URL et query params réellement envoyés.
+
+    Le handler inspecte `request.url` : sans cela le chemin passé au constructeur
+    serait inerte (dette relevée en session 2 — un mauvais chemin de ligue serait
+    passé inaperçu).
+    """
     pages = [
         {"data": [{"date": "2026-01-16", "status": "Final",
                    "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
@@ -131,19 +137,133 @@ def test_results_client_parses_and_paginates():
                    "home_score": 99, "away_score": 98}],
          "meta": {"next_cursor": None}},
     ]
-    calls = {"n": 0}
+    seen: list[httpx.URL] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        resp = pages[calls["n"]]
-        calls["n"] += 1
-        return httpx.Response(200, json=resp)
+        seen.append(request.url)
+        assert request.headers["Authorization"] == "key"   # auth sans préfixe Bearer
+        return httpx.Response(200, json=pages[len(seen) - 1])
 
-    client = ResultsApiClient("key", "https://api.balldontlie.io", "/v1/games",
+    client = ResultsApiClient("key", "https://api.balldontlie.io", "/wnba/v1/games",
                               transport=httpx.MockTransport(handler))
     games = client.get_games("2026-01-16", "2026-01-16")
     assert len(games) == 2                       # deux pages agrégées
     assert games[0].is_final and games[0].home_score == 110
     assert games[1].game_date == "2026-01-16"    # date tronquée à YYYY-MM-DD
+
+    # Le chemin du constructeur est bien celui appelé, sur les deux pages.
+    assert [u.path for u in seen] == ["/wnba/v1/games", "/wnba/v1/games"]
+    # Plage inclusive + per_page au maximum autorisé (100) dès le premier appel.
+    assert seen[0].params["start_date"] == "2026-01-16"
+    assert seen[0].params["end_date"] == "2026-01-16"
+    assert seen[0].params["per_page"] == "100"
+    assert "cursor" not in seen[0].params        # pas de curseur sur la 1re page
+    assert seen[1].params["cursor"] == "90"      # curseur de la page 1 propagé
+
+
+def test_results_client_parses_both_league_schemas():
+    """NBA et WNBA n'exposent pas les mêmes clés de score (payloads réels 2026-08-07).
+
+    NBA : `home_team_score`/`visitor_team_score`, date calendaire pure, statut 'Final'.
+    WNBA : `home_score`/`away_score`, date-time UTC, statut 'post'. Le client doit
+    lire les deux — le lire à moitié levait un KeyError sur chaque match NBA.
+    """
+    nba = {"date": "2026-01-16", "status": "Final", "postseason": False,
+           "home_team": {"full_name": "Brooklyn Nets"},
+           "visitor_team": {"full_name": "Miami Heat"},
+           "home_team_score": 112, "visitor_team_score": 109}
+    wnba = {"date": "2026-08-05T02:00:00.000Z", "status": "post",
+            "home_team": {"full_name": "Las Vegas Aces"},
+            "visitor_team": {"full_name": "Seattle Storm"},
+            "home_score": 92, "away_score": 81}
+
+    for payload, home, away in ((nba, 112, 109), (wnba, 92, 81)):
+        def handler(request: httpx.Request, _p=payload) -> httpx.Response:
+            return httpx.Response(200, json={"data": [_p], "meta": {"next_cursor": None}})
+
+        client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                                  transport=httpx.MockTransport(handler))
+        game = client.get_games("2026-01-16", "2026-01-16")[0]
+        assert (game.home_score, game.away_score) == (home, away)
+        assert game.is_final                     # 'Final' (NBA) et 'post' (WNBA)
+
+
+def test_results_client_missing_score_keys_fail_loudly():
+    """Aucune clé de score reconnue → `ResultsApiError`, jamais un score par défaut.
+
+    Invariant 5 : une donnée absente ne doit jamais être masquée par une valeur
+    par défaut (le 0-0 gradé « push » est le bug d'origine du projet).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{
+            "date": "2026-01-16", "status": "Final",
+            "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+        }], "meta": {"next_cursor": None}})
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler))
+    with pytest.raises(ResultsApiError, match="Aucune clé de score"):
+        client.get_games("2026-01-16", "2026-01-16")
+
+
+def test_results_client_null_score_fails_loudly():
+    """Score `null` (match programmé/reporté) → erreur explicite, pas un int(None).
+
+    Un backfill sur une plage large en croisera : mieux vaut l'erreur nommée que
+    le `TypeError` brut.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{
+            "date": "2026-01-16", "status": "Scheduled",
+            "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+            "home_team_score": None, "visitor_team_score": None,
+        }], "meta": {"next_cursor": None}})
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler))
+    with pytest.raises(ResultsApiError, match="null"):
+        client.get_games("2026-01-16", "2026-01-16")
+
+
+def test_from_config_routes_by_sport():
+    """Le chemin balldontlie est dérivé d'`api.sport`, jamais codé en dur.
+
+    C'est le filet qui garantit que le backfill Elo tapera la bonne ligue : un
+    sport sans chemin configuré doit échouer bruyamment (invariant 6), pas retomber
+    silencieusement sur la NBA.
+    """
+    settings = Settings(odds_api_key="", balldontlie_api_key="k", telegram_bot_token="",
+                        telegram_chat_id="", database_path=Path("x.db"), log_level="INFO")
+    results = {"base_url": "https://api.balldontlie.io",
+               "games_paths": {"basketball_nba": "/nba/v1/games",
+                               "basketball_wnba": "/wnba/v1/games"}}
+
+    def path_for(sport: str) -> str:
+        client = ResultsApiClient.from_config(
+            settings, {"api": {"sport": sport}, "results": results})
+        client.close()
+        return client._games_path
+
+    assert path_for("basketball_wnba") == "/wnba/v1/games"
+    assert path_for("basketball_nba") == "/nba/v1/games"
+
+    with pytest.raises(ResultsApiError, match="basketball_ncaab"):
+        ResultsApiClient.from_config(
+            settings, {"api": {"sport": "basketball_ncaab"}, "results": results})
+
+
+def test_config_yaml_declares_a_path_for_every_supported_league():
+    """La vraie `config.yaml` route les deux ligues vers les chemins documentés.
+
+    Les deux chemins NBA (`/v1/games` legacy et `/nba/v1/games`) répondent 200 avec
+    un payload identique (appel réel 2026-08-07) ; on suit la doc courante.
+    """
+    config = load_config()
+    paths = config["results"]["games_paths"]
+    assert paths["basketball_nba"] == "/nba/v1/games"
+    assert paths["basketball_wnba"] == "/wnba/v1/games"
+    # Le sport actif doit toujours avoir un chemin, sinon l'évaluateur casse au run.
+    assert config["api"]["sport"] in paths
 
 
 # ─────────────────────── CLV (proba dé-marginée) ───────────────────────

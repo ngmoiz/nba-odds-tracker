@@ -146,7 +146,10 @@ results:
   # Chemin balldontlie par ligue : le namespace est dans le CHEMIN, pas un paramètre.
   # Le chemin est sélectionné automatiquement selon api.sport (règle 0.4.7).
   games_paths:
-    basketball_nba:  /v1/games        # namespace NBA
+    # Chemin documenté (spec OpenAPI courante). Le legacy `/v1/games` reste servi
+    # et renvoie un payload identique (vérifié par appel réel le 2026-08-07), mais
+    # il n'est plus documenté : on suit la doc.
+    basketball_nba:  /nba/v1/games    # namespace NBA
     basketball_wnba: /wnba/v1/games   # namespace WNBA
   # Fuseau de référence des dates de match côté balldontlie (calendrier US).
   calendar_timezone: America/New_York

@@ -291,7 +291,7 @@ def _settings() -> Settings:
 CONFIG = {
     "display": {"timezone": "Europe/Paris"},
     "results": {"calendar_timezone": "America/New_York",
-                "base_url": "https://api.balldontlie.io", "games_path": "/v1/games"},
+                "base_url": "https://api.balldontlie.io"},
     "evaluator": {"lookback_days": 3, "weekly_report_weekday": 0},
 }
 

@@ -4,9 +4,10 @@ Réservé aux **scores officiels** (utilisé par l'évaluateur). The Odds API re
 seule source de cotes : balldontlie n'entame pas son quota. Le plan gratuit couvre
 la NBA et la WNBA.
 
-Le chemin d'endpoint (`/v1/games` pour NBA, `/wnba/v1/games` pour WNBA) est dérivé
-automatiquement du sport configuré dans `api.sport` (règle 0.4.7 : pas de constante
-codée en dur).
+Le chemin d'endpoint (`/nba/v1/games` pour NBA, `/wnba/v1/games` pour WNBA) est
+dérivé automatiquement du sport configuré dans `api.sport` (règle 0.4.7 : pas de
+constante codée en dur). Les deux ligues n'exposent pas le même schéma de match —
+voir `_parse_game`.
 
 Comme le client The Odds API, on encapsule l'HTTP, on parse le JSON en objets typés,
 et on injecte un `transport` httpx pour tester sans réseau.
@@ -140,20 +141,54 @@ class ResultsApiClient:
         return response.json()
 
 
+def _score(game: dict, *keys: str) -> int:
+    """Lit un score en essayant les conventions de nommage par ligue, dans l'ordre.
+
+    Aucun défaut silencieux (invariant 5 « `None` explicite obligatoire ») : si
+    aucune clé n'est présente, ou si la valeur est `None` (match programmé ou
+    reporté, jamais joué), on lève `ResultsApiError` avec les clés réellement
+    reçues. Un score par défaut serait exactement le bug d'origine du projet
+    (0-0 gradé « push » au lieu d'être traité comme résultat absent).
+    """
+    for key in keys:
+        if key in game:
+            value = game[key]
+            if value is None:
+                raise ResultsApiError(
+                    f"Score '{key}' absent (null) — match non joué ou en cours : "
+                    f"status={game.get('status')!r}, date={game.get('date')!r}"
+                )
+            return int(value)
+    raise ResultsApiError(
+        f"Aucune clé de score parmi {list(keys)} dans la réponse balldontlie. "
+        f"Clés reçues : {sorted(game.keys())}"
+    )
+
+
 def _parse_game(game: dict) -> GameResult:
     """Convertit un match brut balldontlie en `GameResult`.
 
     La date renvoyée par l'API est une chaîne ISO (parfois avec l'heure) : on ne
     conserve que la partie calendaire 'YYYY-MM-DD'.
-    
-    Compatible NBA et WNBA : les scores sont dans `home_score` / `away_score` (pas
-    `home_team_score` / `visitor_team_score`).
+
+    ⚠️ Les deux ligues n'exposent pas le même schéma (vérifié par appel réel le
+    2026-08-07, cf. journal des décisions) :
+
+    - NBA  : `home_team_score` / `visitor_team_score`, `date` = date calendaire US
+      pure ('2026-01-16'), `status` = 'Final' ;
+    - WNBA : `home_score` / `away_score`, `date` = date-**time** UTC
+      ('2026-08-05T02:00:00.000Z'), `status` = 'post'.
+
+    On lit donc les deux conventions. La troncature `[:10]` reste **exacte pour la
+    NBA** (date déjà calendaire) mais **décale d'un jour les matchs WNBA en soirée
+    US** (02:00 UTC = veille à New York) : réserve connue, traitée dans la session
+    backfill, pas ici.
     """
     return GameResult(
         game_date=str(game["date"])[:10],
         status=str(game.get("status", "")),
         home_team=game["home_team"]["full_name"],
         away_team=game["visitor_team"]["full_name"],
-        home_score=int(game["home_score"]),
-        away_score=int(game["away_score"]),
+        home_score=_score(game, "home_score", "home_team_score"),
+        away_score=_score(game, "away_score", "visitor_team_score"),
     )
