@@ -88,6 +88,43 @@ decision:
                               # (validate_collector_config) : un futur changement de tick ou de cible
                               # qui recréerait silencieusement l'un des deux pièges échoue ici.
 
+# ─────────────────────────────────────────────────────────────
+# --- Modèle de force Elo (V1.1, chantier B5) ---
+#
+# ⚠️ BLOC INERTE — AUCUN LECTEUR EN PRODUCTION tant que B5 n'est pas activé.
+#
+# Seul `analyzer/model.py` (fonctions pures) lit ces valeurs, et il n'est appelé
+# par aucun composant du pipeline : ni le collecteur, ni l'analyseur, ni le
+# notificateur, ni l'évaluateur. Aucune décision (verdict, alerte, score) ne
+# dépend de ce bloc aujourd'hui. Il est présent pour que `params_from_config`
+# soit testable sur la vraie configuration plutôt que sur un dict fabriqué.
+#
+# Le branchement se fera en deux temps, dans des sessions ultérieures :
+#   1. mode shadow  — `edge` calculé et loggé, JAMAIS bloquant, logic_version inchangée
+#   2. activation   — règle hybride bloquante, bump DECISION_LOGIC_VERSION → 4, nouveau J0
+# Tant que ces sessions n'ont pas eu lieu, modifier une valeur ici ne change
+# RIEN au comportement de l'outil. Ne pas en déduire que le modèle tourne.
+# ─────────────────────────────────────────────────────────────
+model:
+  enabled: false              # INERTE : aucun code ne lit ce drapeau pour l'instant
+  elo:
+    initial_rating: 1500      # note de départ d'une équipe inconnue
+    k_factor: 20              # facteur d'apprentissage de base
+    k_factor_burnin: 40       # facteur accéléré tant que games_played < burnin_games
+    burnin_games: 10          # nb de matchs avant de repasser au K nominal
+    home_advantage_elo: 62    # avantage terrain en points Elo (~2,5 pt WNBA ; ~75 pour la NBA)
+    elo_points_per_spread: 25 # 25 pts Elo ≈ 1 pt de spread (conversion note ↔ ligne)
+    rest_adjustment_elo:      # ajustements de fraîcheur, en points Elo
+      back_to_back: -50       # match la veille (~ −2 pt de spread)
+      three_in_four: -25      # 3 matchs en 4 nuits — CUMULATIF avec back_to_back
+      rested: 0               # ≥ 2 jours de repos = référence
+  decision:                   # INERTE : lu par aucun code (sessions shadow/activation)
+    min_games_for_edge: 10    # ratings « mûrs » avant que l'edge puisse bloquer
+    edge_threshold_prob: 0.02 # τ : edge minimal (2 pts de proba) pour autoriser un SIGNAL
+  sigma_by_league:            # σ pour Φ(spread/σ) — conversion spread ↔ probabilité
+    basketball_nba: 11.5
+    basketball_wnba: 10.5     # à calibrer sur données
+
 # --- Notificateur Telegram (section 7) ---
 # Le notificateur lit les alertes/verdicts non envoyés en base et les pousse sur
 # Telegram. NO_BET reste enregistré en base pour l'évaluation des faux négatifs,
