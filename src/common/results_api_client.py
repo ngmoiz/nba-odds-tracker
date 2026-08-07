@@ -11,9 +11,15 @@ voir `_parse_game`.
 
 Comme le client The Odds API, on encapsule l'HTTP, on parse le JSON en objets typés,
 et on injecte un `transport` httpx pour tester sans réseau.
+
+⚠️ `get_games` ne renvoie que les matchs **terminés**. Une requête par plage de dates
+renvoie aussi les matchs programmés ou en cours (scores `null`) : c'est le cas normal,
+pas une anomalie — ils sont filtrés et comptés, jamais parsés. Un score absent sur un
+match *déclaré terminé* reste une donnée incohérente et lève. Voir `get_games`.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 
 import httpx
@@ -25,6 +31,21 @@ logger = get_logger("results_api")
 DEFAULT_TIMEOUT = 20.0
 # balldontlie plafonne per_page à 100 ; une journée NBA compte ~15 matchs.
 _PER_PAGE = 100
+
+# Statuts signalant un match terminé (score officiel exploitable). Les deux ligues
+# n'emploient pas le même vocabulaire : NBA → 'Final', WNBA → 'post' (schémas vérifiés
+# par appel réel le 2026-08-07, cf. journal des décisions). Tout autre statut
+# ('Scheduled', 'pre', 'in', quart en cours…) désigne un match non terminé.
+_FINAL_STATUSES = ("final", "post")
+
+
+def _status_is_final(status: str) -> bool:
+    """Vrai si le statut brut désigne un match terminé.
+
+    Fonction unique consultée par le filtre de `get_games` (avant parsing) et par
+    `GameResult.is_final` (après parsing) : les deux ne peuvent pas diverger.
+    """
+    return status.strip().lower() in _FINAL_STATUSES
 
 
 class ResultsApiError(Exception):
@@ -45,11 +66,12 @@ class GameResult:
     @property
     def is_final(self) -> bool:
         """Vrai si le match est terminé (score officiel exploitable).
-        
-        Accepte 'Final' (NBA) et 'post' (WNBA) comme statuts de match terminé.
+
+        Accepte 'Final' (NBA) et 'post' (WNBA). Toujours vrai sur un objet issu de
+        `get_games`, qui filtre en amont ; conservé pour les `GameResult` construits
+        directement (tests, futurs appelants).
         """
-        status_lower = self.status.strip().lower()
-        return status_lower in ("final", "post")
+        return _status_is_final(self.status)
 
 
 class ResultsApiClient:
@@ -109,11 +131,28 @@ class ResultsApiClient:
         self._client.close()
 
     def get_games(self, start_date: str, end_date: str) -> list[GameResult]:
-        """Récupère les matchs entre deux dates incluses ('YYYY-MM-DD').
+        """Récupère les matchs **terminés** entre deux dates incluses ('YYYY-MM-DD').
 
         Suit la pagination par curseur de balldontlie jusqu'à épuisement.
+
+        Filtrage par statut **avant** parsing, et c'est la raison d'être de l'ordre :
+        une plage de dates inclut presque toujours des matchs programmés ou en cours,
+        dont les scores valent `null`. Les parser lèverait `ResultsApiError` (garde de
+        `_score`) et ferait échouer toute la requête à cause d'un match dont l'absence
+        de score est parfaitement normale — l'évaluateur, qui interroge
+        `[aujourd'hui − lookback, aujourd'hui]`, en rencontre à chaque exécution.
+
+        Les deux natures d'absence sont donc séparées :
+
+        - **non terminé** → match ignoré, compté, loggé (fonctionnement normal) ;
+        - **terminé mais sans score** → `ResultsApiError` (donnée incohérente).
+
+        Le décompte des ignorés est ventilé par statut : un statut inattendu d'une
+        future ligue apparaît dans les logs au lieu de disparaître en silence
+        (invariant 6, « jamais de no-op silencieux »).
         """
         games: list[GameResult] = []
+        skipped: Counter[str] = Counter()
         cursor: str | None = None
         while True:
             params: dict[str, object] = {
@@ -124,11 +163,24 @@ class ResultsApiClient:
             if cursor is not None:
                 params["cursor"] = cursor
             payload = self._get(params)
-            games.extend(_parse_game(g) for g in payload.get("data", []))
+            for raw in payload.get("data", []):
+                status = str(raw.get("status", ""))
+                if not _status_is_final(status):
+                    skipped[status or "(statut absent)"] += 1
+                    continue
+                games.append(_parse_game(raw))
             cursor = (payload.get("meta") or {}).get("next_cursor")
             if not cursor:
                 break
-        logger.info("Résultats récupérés : %d matchs entre %s et %s.", len(games), start_date, end_date)
+        if skipped:
+            detail = ", ".join(f"{status}×{count}" for status, count in sorted(skipped.items()))
+            logger.info(
+                "Matchs non terminés ignorés : %d (%s).", sum(skipped.values()), detail
+            )
+        logger.info(
+            "Résultats récupérés : %d matchs terminés entre %s et %s.",
+            len(games), start_date, end_date,
+        )
         return games
 
     def _get(self, params: dict) -> dict:
@@ -145,18 +197,22 @@ def _score(game: dict, *keys: str) -> int:
     """Lit un score en essayant les conventions de nommage par ligue, dans l'ordre.
 
     Aucun défaut silencieux (invariant 5 « `None` explicite obligatoire ») : si
-    aucune clé n'est présente, ou si la valeur est `None` (match programmé ou
-    reporté, jamais joué), on lève `ResultsApiError` avec les clés réellement
-    reçues. Un score par défaut serait exactement le bug d'origine du projet
-    (0-0 gradé « push » au lieu d'être traité comme résultat absent).
+    aucune clé n'est présente, ou si la valeur est `None`, on lève `ResultsApiError`
+    avec les clés réellement reçues. Un score par défaut serait exactement le bug
+    d'origine du projet (0-0 gradé « push » au lieu d'être traité comme absent).
+
+    ⚠️ N'est atteint que pour un match **déclaré terminé** (`get_games` filtre les
+    autres en amont) : un score `null` ici n'est donc pas un match à venir, c'est
+    une incohérence de la source — d'où la levée plutôt qu'un saut silencieux.
     """
     for key in keys:
         if key in game:
             value = game[key]
             if value is None:
                 raise ResultsApiError(
-                    f"Score '{key}' absent (null) — match non joué ou en cours : "
-                    f"status={game.get('status')!r}, date={game.get('date')!r}"
+                    f"Score '{key}' absent (null) sur un match déclaré terminé — "
+                    f"donnée incohérente : status={game.get('status')!r}, "
+                    f"date={game.get('date')!r}"
                 )
             return int(value)
     raise ResultsApiError(

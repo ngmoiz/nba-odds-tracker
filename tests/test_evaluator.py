@@ -7,6 +7,7 @@ totals, et NO_BET (faux négatif). Aucun appel réseau (client balldontlie mock�
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -206,15 +207,52 @@ def test_results_client_missing_score_keys_fail_loudly():
         client.get_games("2026-01-16", "2026-01-16")
 
 
-def test_results_client_null_score_fails_loudly():
-    """Score `null` (match programmé/reporté) → erreur explicite, pas un int(None).
+def test_results_client_skips_unplayed_games_without_failing(caplog):
+    """Match programmé (score `null`) → ignoré et compté, JAMAIS une levée.
 
-    Un backfill sur une plage large en croisera : mieux vaut l'erreur nommée que
-    le `TypeError` brut.
+    Régression de production : l'évaluateur interroge `[aujourd'hui − lookback,
+    aujourd'hui]` à 09:30 Paris, soit 03:30 à New York — les matchs du soir même
+    sont déjà renvoyés au statut programmé. Lever aurait fait échouer toute la
+    requête, donc l'évaluateur entier, donc le bilan quotidien, pour une donnée
+    dont l'absence est parfaitement normale.
+
+    Les DEUX moitiés de la garantie sont vérifiées : le match non terminé est
+    absent du résultat, et le match terminé du **même payload** est bien renvoyé
+    (un filtre trop large casserait la seconde).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [
+            {"date": "2026-01-16", "status": "Scheduled",
+             "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+             "home_team_score": None, "visitor_team_score": None},
+            {"date": "2026-01-16", "status": "Final",
+             "home_team": {"full_name": "Lakers"}, "visitor_team": {"full_name": "Suns"},
+             "home_team_score": 101, "visitor_team_score": 99},
+        ], "meta": {"next_cursor": None}})
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler))
+    with caplog.at_level(logging.INFO, logger="results_api"):
+        games = client.get_games("2026-01-16", "2026-01-16")
+
+    assert len(games) == 1                       # le programmé est écarté…
+    assert games[0].home_team == "Lakers"        # …le terminé passe
+    assert games[0].home_score == 101
+    # Invariant 6 : un match écarté laisse une trace, ventilée par statut.
+    assert any("Scheduled×1" in r.getMessage() for r in caplog.records)
+
+
+def test_results_client_final_game_with_null_score_fails_loudly():
+    """Match **déclaré terminé** mais sans score → `ResultsApiError`.
+
+    C'est l'autre nature d'absence : le statut affirme que le match est joué, donc
+    un score `null` est une incohérence de la source, pas un match à venir. Elle
+    doit rester bruyante (invariant 5) — c'est le pendant du test ci-dessus, et la
+    distinction entre les deux est tout l'objet du correctif.
     """
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": [{
-            "date": "2026-01-16", "status": "Scheduled",
+            "date": "2026-01-16", "status": "Final",
             "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
             "home_team_score": None, "visitor_team_score": None,
         }], "meta": {"next_cursor": None}})
@@ -572,6 +610,43 @@ def test_evaluate_pending_grades_and_marks_evalue(conn):
     ev = conn.execute("SELECT * FROM evaluations").fetchone()
     assert ev["outcome"] == "won" and ev["home_score"] == 110
     assert conn.execute("SELECT status FROM matches WHERE match_id='m1'").fetchone()["status"] == "EVALUE"
+
+
+def test_evaluate_pending_survives_window_containing_a_scheduled_game(conn):
+    """Bout en bout : un match programmé dans la fenêtre ne tue plus l'évaluateur.
+
+    Reproduit la panne de production visée par le correctif : la plage interrogée
+    contient le match clos à évaluer ET un match programmé le soir même (scores
+    `null`). Avant correctif, `get_games` levait sur le second et `evaluate_pending`
+    mourait — sans bilan quotidien, `evaluator/__main__.py` n'attrapant rien.
+
+    Le vrai `ResultsApiClient` est utilisé (transport mocké, aucun réseau) : passer
+    par un faux client sauterait précisément le code corrigé.
+    """
+    db.insert_verdict(conn, match_id="m1", verdict="SIGNAL", selection=BOS,
+                      market="spreads", line=-5.0, odds_at_verdict=1.91, signal_score=6,
+                      rules_triggered=json.dumps(["R1"]), rationale="…",
+                      decided_at="2026-01-16T23:20:00Z")
+    conn.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [
+            {"date": "2026-01-16", "status": "Final",       # le match à évaluer
+             "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+             "home_team_score": 110, "visitor_team_score": 100},
+            {"date": "2026-01-17", "status": "Scheduled",   # ce soir, pas encore joué
+             "home_team": {"full_name": "Lakers"}, "visitor_team": {"full_name": "Suns"},
+             "home_team_score": None, "visitor_team_score": None},
+        ], "meta": {"next_cursor": None}})
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/wnba/v1/games",
+                              transport=httpx.MockTransport(handler))
+    summary = evaluate_pending(conn, _settings(), CONFIG, results_client=client,
+                               now=datetime(2026, 1, 17, 12, 0, tzinfo=timezone.utc))
+
+    assert summary["evaluated"] == 1               # le bilan a bien été produit
+    ev = conn.execute("SELECT * FROM evaluations").fetchone()
+    assert ev["outcome"] == "won" and ev["home_score"] == 110
 
 
 def test_evaluate_pending_skips_when_no_result_recent(conn):
