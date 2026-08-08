@@ -445,14 +445,27 @@ def compute_due_targets(
 
 
 def _is_morning_time(now: datetime, config: dict) -> bool:
-    """Vérifie si l'heure actuelle correspond au créneau du matin (09:00 ±10min).
-    
-    Tolérance de ±10 min pour absorber les décalages de tick (20 min).
+    """Vérifie si l'heure courante tombe dans le créneau du matin : 08:00–10:59 **UTC**.
+
+    ⚠️ La fenêtre fait **±1 h** autour de 09:00 UTC, pas les « ±10 min » qu'annonçait
+    cette docstring jusqu'au 2026-08-08 (incohérence présente depuis l'écriture de la
+    fonction). Avec le battement `*/20`, neuf ticks tombent dedans — sans conséquence :
+    `_should_collect_morning` porte une clé d'idempotence quotidienne, donc seul le
+    **premier** tick de la fenêtre collecte et les huit suivants sont des no-op.
+
+    Conséquence pratique, vérifiée en production : la collecte du matin part à
+    **08:00 UTC** (08:00:02 chaque jour dans `logs/nba-collector.log`), pas à 09:00.
+
+    Divergence connue et NON tranchée (journal du 2026-08-08) : `morning_hour` est
+    exprimé en UTC alors que CLAUDE.md §4.3/§6.1 documente « 09:00 Paris ». La collecte
+    a donc lieu à 10:00 Paris. Resserrer la fenêtre à ±10 min la **retarderait** à
+    09:00 UTC (11:00 Paris), soit l'inverse de ce que recherche §6.1 — une ouverture
+    plus précoce, pour réduire le biais de lookahead du relevé de référence. Le
+    paramètre à trancher est donc le **fuseau**, pas la largeur.
     """
-    # Récupère le fuseau d'affichage (config.yaml display.timezone)
-    # Pour simplifier V1 : on suppose que le matin = 09:00 UTC (à ajuster si besoin)
-    # TODO : utiliser pytz si besoin de gérer les fuseaux proprement
-    morning_hour = 9  # 09:00 UTC (à paramétrer si besoin)
+    # TODO (journal 2026-08-08) : passer `morning_hour` en config et le résoudre dans
+    # le fuseau de `display.timezone`, plutôt qu'en UTC implicite.
+    morning_hour = 9  # 09:00 UTC — cf. divergence de fuseau ci-dessus
     return morning_hour - 1 <= now.hour <= morning_hour + 1
 
 
