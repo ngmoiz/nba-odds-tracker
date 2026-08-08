@@ -109,6 +109,15 @@ def hours_after(base: datetime, hours: float) -> str:
     return (base + timedelta(hours=hours)).isoformat()
 
 
+# Instant de référence des tests à horloge fabriquée, choisi **hors du créneau du
+# matin**. `_is_morning_time` (collector.py) renvoie vrai pour `8 <= now.hour <= 10`
+# en UTC — soit une fenêtre de trois heures, et non les « ±10 min » qu'annonce sa
+# docstring. Un test qui laisse le collecteur lire l'horloge système déclenche donc
+# une collecte du matin inattendue chaque jour entre 08:00 et 10:59 UTC, et échoue
+# uniquement dans cette tranche : c'est ce qui rendait six tests rouges le matin.
+OUT_OF_MORNING = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+
+
 @pytest.fixture
 def conn(tmp_path):
     db_path = tmp_path / "test.db"
@@ -294,7 +303,8 @@ def test_force_collection_does_not_restore_closed_match(conn):
 
 def test_conditional_skip_when_no_active_matches(conn):
     """Collecte conditionnelle sautée si aucun match actif en base (zéro crédit)."""
-    summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG, force=False)
+    summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG,
+                             force=False, now=OUT_OF_MORNING)
 
     assert summary["skipped"] is True
     assert summary["reason"] == "no_active_matches"
@@ -422,14 +432,15 @@ def test_reserve_skips_when_credits_below_threshold(conn):
         sport="basketball_wnba",
         home_team="A",
         away_team="B",
-        tipoff_utc=in_hours(6),
+        tipoff_utc=hours_after(OUT_OF_MORNING, 6),
         status="SUIVI",
-        created_at=in_hours(12),
+        created_at=hours_after(OUT_OF_MORNING, 12),
     )
     db.set_meta(conn, META_CREDITS_REMAINING, "30")  # sous le seuil de 50
     conn.commit()
 
-    summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG_WITH_TARGETS, force=False)
+    summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG_WITH_TARGETS,
+                             force=False, now=OUT_OF_MORNING)
 
     # Lot 2 : pas de skip global, mais 0 cible collectée (toutes bloquées par priorité)
     assert summary["skipped"] is False
@@ -449,19 +460,21 @@ def test_reserve_alert_is_deduplicated(conn):
         sport="basketball_wnba",
         home_team="A",
         away_team="B",
-        tipoff_utc=in_hours(6),
+        tipoff_utc=hours_after(OUT_OF_MORNING, 6),
         status="SUIVI",
-        created_at=in_hours(12),
+        created_at=hours_after(OUT_OF_MORNING, 12),
     )
     db.set_meta(conn, META_CREDITS_REMAINING, "30")
     conn.commit()
 
     # Première collecte : déclenche la garde (reserve_alerted passe à true).
-    run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG_WITH_TARGETS, force=False)
+    run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG_WITH_TARGETS,
+                   force=False, now=OUT_OF_MORNING)
     assert db.get_meta(conn, META_RESERVE_ALERTED) == "true"
 
     # Deuxième collecte : skip silencieux (reserve_alerted déjà true), 0 cible collectée.
-    summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG_WITH_TARGETS, force=False)
+    summary = run_collection(conn, FakeClient([]), "basketball_wnba", CONFIG_WITH_TARGETS,
+                             force=False, now=OUT_OF_MORNING)
     assert summary["skipped"] is False
     assert summary["targets_collected"] == 0
     # Toujours true, pas de re-notification.
@@ -1078,7 +1091,9 @@ def test_missing_targets_config_raises_error(conn):
     """Config targets absente → ConfigurationError levée."""
     from collector.collector import ConfigurationError
     
-    db.insert_match(conn, match_id="m1", sport="basketball_wnba", home_team="A", away_team="B", tipoff_utc=in_hours(6), status="SUIVI", created_at=in_hours(12))
+    db.insert_match(conn, match_id="m1", sport="basketball_wnba", home_team="A", away_team="B",
+                    tipoff_utc=hours_after(OUT_OF_MORNING, 6), status="SUIVI",
+                    created_at=hours_after(OUT_OF_MORNING, 12))
     conn.commit()
 
     config_no_targets = {"quota": {"reserve": 50}}
@@ -1086,10 +1101,11 @@ def test_missing_targets_config_raises_error(conn):
     with pytest.raises(ConfigurationError, match="collector.targets absent ou vide"):
         run_collection(
             conn,
-            FakeClient([make_event("m1", in_hours(6))]),
+            FakeClient([make_event("m1", hours_after(OUT_OF_MORNING, 6))]),
             "basketball_wnba",
             config_no_targets,
             force=False,
+            now=OUT_OF_MORNING,
         )
 
 
@@ -1097,7 +1113,9 @@ def test_empty_targets_config_raises_error(conn):
     """Config targets vide → ConfigurationError levée."""
     from collector.collector import ConfigurationError
     
-    db.insert_match(conn, match_id="m1", sport="basketball_wnba", home_team="A", away_team="B", tipoff_utc=in_hours(6), status="SUIVI", created_at=in_hours(12))
+    db.insert_match(conn, match_id="m1", sport="basketball_wnba", home_team="A", away_team="B",
+                    tipoff_utc=hours_after(OUT_OF_MORNING, 6), status="SUIVI",
+                    created_at=hours_after(OUT_OF_MORNING, 12))
     conn.commit()
 
     config_empty_targets = {
@@ -1108,10 +1126,11 @@ def test_empty_targets_config_raises_error(conn):
     with pytest.raises(ConfigurationError, match="collector.targets absent ou vide"):
         run_collection(
             conn,
-            FakeClient([make_event("m1", in_hours(6))]),
+            FakeClient([make_event("m1", hours_after(OUT_OF_MORNING, 6))]),
             "basketball_wnba",
             config_empty_targets,
             force=False,
+            now=OUT_OF_MORNING,
         )
 
 
@@ -1156,14 +1175,15 @@ def test_no_snapshots_after_tipoff(conn):
         sport="basketball_wnba",
         home_team="A",
         away_team="B",
-        tipoff_utc=in_hours(-1),  # tip-off il y a 1h
+        tipoff_utc=hours_after(OUT_OF_MORNING, -1),  # tip-off il y a 1h
         status="SUIVI",
-        created_at=in_hours(-12),
+        created_at=hours_after(OUT_OF_MORNING, -12),
     )
     conn.commit()
 
     summary = run_collection(
-        conn, FakeClient([make_event("past", in_hours(-1))]), "basketball_wnba", CONFIG_WITH_TARGETS, force=False
+        conn, FakeClient([make_event("past", hours_after(OUT_OF_MORNING, -1))]),
+        "basketball_wnba", CONFIG_WITH_TARGETS, force=False, now=OUT_OF_MORNING,
     )
 
     # Match clôturé → aucun match actif → skip (pas de champ snapshots en dur)
