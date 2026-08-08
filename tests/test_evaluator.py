@@ -151,11 +151,16 @@ def test_results_client_parses_and_paginates():
         return httpx.Response(200, json=pages[len(seen) - 1])
 
     client = ResultsApiClient("key", "https://api.balldontlie.io", "/wnba/v1/games",
-                              transport=httpx.MockTransport(handler))
+                              transport=httpx.MockTransport(handler),
+                              calendar_timezone="America/New_York")
     games = client.get_games("2026-01-16", "2026-01-16")
     assert len(games) == 2                       # deux pages agrégées
     assert games[0].is_final and games[0].home_score == 110
-    assert games[1].game_date == "2026-01-16"    # date tronquée à YYYY-MM-DD
+    # `2026-01-16T00:00:00Z` vaut le 15 janvier à 19:00 à New York : la date
+    # calendaire de la ligue est donc le 15, pas le 16. Cette assertion attendait
+    # `2026-01-16` avant le correctif de fuseau — le changement est le comportement
+    # recherché, pas un ajustement de complaisance.
+    assert games[1].game_date == "2026-01-15"
 
     # Le chemin du constructeur est bien celui appelé, sur les deux pages.
     assert [u.path for u in seen] == ["/wnba/v1/games", "/wnba/v1/games"]
@@ -188,7 +193,8 @@ def test_results_client_parses_both_league_schemas():
             return httpx.Response(200, json={"data": [_p], "meta": {"next_cursor": None}})
 
         client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
-                                  transport=httpx.MockTransport(handler))
+                                  transport=httpx.MockTransport(handler),
+                                  calendar_timezone="America/New_York")
         game = client.get_games("2026-01-16", "2026-01-16")[0]
         assert (game.home_score, game.away_score) == (home, away)
         assert game.is_final                     # 'Final' (NBA) et 'post' (WNBA)
@@ -305,6 +311,109 @@ def test_results_client_final_game_with_null_score_fails_loudly():
                               transport=httpx.MockTransport(handler))
     with pytest.raises(ResultsApiError, match="null"):
         client.get_games("2026-01-16", "2026-01-16")
+
+
+# ───────── fuseau des dates de match (B5 lot 1b) ─────────
+#
+# Le champ `date` de balldontlie n'a pas le même sens selon la ligue : date
+# calendaire US pure côté NBA, date-time UTC côté WNBA. La troncature `[:10]`
+# d'origine décalait donc d'un jour les matchs WNBA du soir — 28 des 55 matchs
+# joués de la base locale au 2026-08-08.
+
+
+def _one_game(payload: dict, tz: str | None):
+    """Passe un payload brut dans le client et renvoie le `GameResult` produit."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [payload], "meta": {"next_cursor": None}})
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler),
+                              calendar_timezone=tz)
+    return client.get_games("2026-08-01", "2026-08-10")[0]
+
+
+WNBA_EVENING = {"date": "2026-08-05T02:00:00.000Z", "status": "post",
+                "home_team": {"full_name": "Las Vegas Aces"},
+                "visitor_team": {"full_name": "Seattle Storm"},
+                "home_score": 92, "away_score": 81}
+
+
+def test_wnba_evening_game_is_dated_in_league_calendar():
+    """Match WNBA du soir : 02:00 UTC = la VEILLE à New York.
+
+    C'est le cas majoritaire du décalage — un tip-off à 22:00 ET apparaît le
+    lendemain en UTC. Sur la base locale, 28 des 55 matchs joués sont dans ce cas.
+    """
+    assert _one_game(WNBA_EVENING, "America/New_York").game_date == "2026-08-04"
+
+
+def test_wnba_afternoon_game_keeps_its_day():
+    """Match WNBA d'après-midi : 19:00 UTC = le même jour à New York.
+
+    Le complément indispensable du test précédent : le décalage n'est PAS
+    systématique, il est **inconsistant**. C'est ce qui le rendait destructeur pour
+    le calcul de repos — un enchaînement après-midi → soir (1 jour réel) en
+    paraissait 2, faisant disparaître le malus back-to-back du modèle Elo.
+    """
+    afternoon = dict(WNBA_EVENING, date="2026-08-05T19:00:00.000Z")
+    assert _one_game(afternoon, "America/New_York").game_date == "2026-08-05"
+
+
+def test_nba_calendar_date_is_untouched_and_needs_no_timezone():
+    """Date NBA déjà calendaire : rendue telle quelle, sans fuseau requis."""
+    nba = {"date": "2026-01-16", "status": "Final",
+           "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+           "home_team_score": 112, "visitor_team_score": 109}
+    assert _one_game(nba, None).game_date == "2026-01-16"
+
+
+def test_datetime_without_timezone_fails_loudly():
+    """Date-time sans fuseau configuré → levée, JAMAIS un repli sur UTC.
+
+    UTC *est* l'ancien comportement fautif : un défaut silencieux reproduirait
+    exactement le bug corrigé (invariant 6).
+    """
+    with pytest.raises(ResultsApiError, match="fuseau"):
+        _one_game(WNBA_EVENING, None)
+
+
+def test_utc_timezone_reproduces_the_pre_fix_truncation():
+    """`calendar_timezone='UTC'` redonne l'ancienne troncature, à l'identique.
+
+    Propriété utilisée par `scripts/verify_game_date_timezone.py` pour afficher la
+    colonne « avant » sans conserver la moindre ligne de code mort : sur un
+    date-time déjà en UTC, convertir vers UTC est l'identité.
+    """
+    assert _one_game(WNBA_EVENING, "UTC").game_date == "2026-08-05"       # ancien
+    assert _one_game(WNBA_EVENING, "America/New_York").game_date == "2026-08-04"  # nouveau
+
+
+def test_from_config_passes_the_calendar_timezone():
+    """Le fuseau vient de `results.calendar_timezone`, jamais d'une constante."""
+    config = load_config()
+    settings = Settings(odds_api_key="", balldontlie_api_key="k", telegram_bot_token="",
+                        telegram_chat_id="", database_path=Path("x.db"), log_level="INFO")
+    client = ResultsApiClient.from_config(settings, config)
+    try:
+        assert client._calendar_tz == config["results"]["calendar_timezone"]
+    finally:
+        client.close()
+
+
+def test_find_result_matches_evening_game_with_zero_gap_after_fix():
+    """L'appariement de l'évaluateur reste bon, et devient EXACT.
+
+    Avant correctif, un match WNBA du soir n'était apparié que grâce à la tolérance
+    ±1 jour de `find_result` — elle était *porteuse*. Après, l'écart tombe à 0 et
+    la tolérance redevient une marge de sécurité.
+    """
+    tipoff = "2026-08-05T02:00:00Z"          # 4 août, 22:00 à New York
+    game = _one_game(WNBA_EVENING, "America/New_York")
+
+    assert game.game_date == tipoff_calendar_date(tipoff, "America/New_York").isoformat()
+    found = find_result([game], home_team="Las Vegas Aces", away_team="Seattle Storm",
+                        tipoff_utc=tipoff, calendar_tz="America/New_York")
+    assert found is game
 
 
 # ───────── étranglement, retry et bornes de pagination (B5 lot 1a) ─────────
@@ -962,6 +1071,38 @@ def test_evaluate_pending_survives_window_containing_a_scheduled_game(conn):
                                now=datetime(2026, 1, 17, 12, 0, tzinfo=timezone.utc))
 
     assert summary["evaluated"] == 1               # le bilan a bien été produit
+    ev = conn.execute("SELECT * FROM evaluations").fetchone()
+    assert ev["outcome"] == "won" and ev["home_score"] == 110
+
+
+def test_evaluate_pending_grades_a_wnba_evening_game(conn):
+    """Bout en bout sur le cas corrigé : match WNBA du soir, date-time UTC.
+
+    Le match de la fixture a un tip-off à `2026-01-17T00:20:00Z`, soit le 16 janvier
+    à 19:20 à New York. balldontlie le date `2026-01-17T00:20:00Z` (UTC) ; après
+    conversion il porte le 16, comme le tip-off. L'évaluation doit aboutir en
+    passant par le VRAI client — un faux client sauterait le code corrigé.
+    """
+    db.insert_verdict(conn, match_id="m1", verdict="SIGNAL", selection=BOS,
+                      market="spreads", line=-5.0, odds_at_verdict=1.91, signal_score=6,
+                      rules_triggered=json.dumps(["R1"]), rationale="…",
+                      decided_at="2026-01-16T23:20:00Z")
+    conn.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{
+            "date": "2026-01-17T00:20:00.000Z", "status": "post",
+            "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+            "home_score": 110, "away_score": 100,
+        }], "meta": {"next_cursor": None}})
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/wnba/v1/games",
+                              transport=httpx.MockTransport(handler),
+                              calendar_timezone="America/New_York")
+    summary = evaluate_pending(conn, _settings(), CONFIG, results_client=client,
+                               now=datetime(2026, 1, 17, 12, 0, tzinfo=timezone.utc))
+
+    assert summary["evaluated"] == 1
     ev = conn.execute("SELECT * FROM evaluations").fetchone()
     assert ev["outcome"] == "won" and ev["home_score"] == 110
 

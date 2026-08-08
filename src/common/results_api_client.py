@@ -12,6 +12,11 @@ voir `_parse_game`.
 Comme le client The Odds API, on encapsule l'HTTP, on parse le JSON en objets typés,
 et on injecte un `transport` httpx pour tester sans réseau.
 
+⚠️ Les dates de match ne sont pas exprimées de la même façon par les deux ligues
+(date calendaire pure côté NBA, date-time UTC côté WNBA) : la conversion vers le
+fuseau du calendrier de la ligue est centralisée dans `_game_date`, et le fuseau
+arrive par `results.calendar_timezone`. Ne jamais retomber sur UTC par défaut.
+
 ⚠️ `get_games` ne renvoie que les matchs **terminés**. Une requête par plage de dates
 renvoie aussi les matchs programmés ou en cours (scores `null`) : c'est le cas normal,
 pas une anomalie — ils sont filtrés et comptés, jamais parsés. Un score absent sur un
@@ -23,6 +28,8 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -96,6 +103,7 @@ class ResultsApiClient:
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.BaseTransport | None = None,
         *,
+        calendar_timezone: str | None = None,
         min_interval_seconds: float = 0.0,
         max_retries: int = 0,
         backoff_base_seconds: float = 2.0,
@@ -118,9 +126,15 @@ class ResultsApiClient:
 
         `sleep` et `monotonic` sont injectables, sur le modèle du `transport` httpx :
         aucun test ne dort réellement.
+
+        `calendar_timezone` est le fuseau du calendrier de la ligue (US). Il n'est
+        consulté que pour les schémas dont la `date` porte une composante horaire —
+        la WNBA — jamais pour la NBA, dont la `date` est déjà calendaire. Voir
+        `_game_date`.
         """
         self._api_key = api_key
         self._games_path = games_path
+        self._calendar_tz = calendar_timezone
         self._min_interval = min_interval_seconds
         self._max_retries = max_retries
         self._backoff_base = backoff_base_seconds
@@ -165,6 +179,10 @@ class ResultsApiClient:
             api_key=settings.balldontlie_api_key,
             base_url=results["base_url"],
             games_path=games_path,
+            # Facultatif ici : une ligue à dates calendaires (NBA) n'en a pas besoin.
+            # L'absence ne se paie qu'au moment où une date-time se présente, et
+            # `_game_date` lève alors explicitement plutôt que de retomber sur UTC.
+            calendar_timezone=results.get("calendar_timezone"),
             min_interval_seconds=float(rate_limit.get("min_interval_seconds", 0.0)),
             max_retries=int(rate_limit.get("max_retries", 0)),
             backoff_base_seconds=float(rate_limit.get("backoff_base_seconds", 2.0)),
@@ -233,7 +251,7 @@ class ResultsApiClient:
                 if not _status_is_final(status):
                     skipped[status or "(statut absent)"] += 1
                     continue
-                games.append(_parse_game(raw))
+                games.append(_parse_game(raw, self._calendar_tz))
 
             if not data:
                 # Page vide : fin réelle, même si l'API annonce encore un curseur.
@@ -351,6 +369,38 @@ class ResultsApiClient:
         self._sleep(delay)
 
 
+def _game_date(raw: str, calendar_tz: str | None) -> str:
+    """Date calendaire du match ('YYYY-MM-DD'), dans le fuseau du calendrier de la ligue.
+
+    Les deux ligues n'expriment pas la même chose dans le champ `date` :
+
+    - **NBA** : date calendaire US déjà pure (`'2026-01-16'`), l'heure vivant dans un
+      champ séparé → rendue telle quelle, aucun fuseau nécessaire ;
+    - **WNBA** : date-**time** UTC (`'2026-08-05T02:00:00.000Z'`) → convertie vers
+      `calendar_tz` avant extraction de la date.
+
+    C'est cette distinction que la troncature `[:10]` d'origine manquait. Le décalage
+    n'était pas systématique mais **inconsistant** : un match d'après-midi (19:00 UTC)
+    gardait la bonne date, un match du soir (02:00 UTC) glissait d'un jour. Un
+    enchaînement après-midi → soir, soit 1 jour de repos réel, en paraissait 2, et le
+    malus `back_to_back` du modèle Elo (−50) disparaissait.
+
+    **Pas de repli sur UTC en l'absence de fuseau** : UTC *est* précisément l'ancien
+    comportement fautif, un défaut silencieux reproduirait donc le bug. Un appelant qui
+    reçoit des date-times sans avoir configuré de fuseau doit trancher (invariant 6).
+    """
+    if len(raw) == 10:
+        return raw                     # date calendaire pure : rien à convertir
+    if calendar_tz is None:
+        raise ResultsApiError(
+            f"Date balldontlie avec composante horaire ({raw!r}) mais aucun fuseau de "
+            f"calendrier configuré. Renseigner `results.calendar_timezone` : convertir "
+            f"vers UTC par défaut reproduirait le décalage d'un jour des matchs du soir."
+        )
+    moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    return moment.astimezone(ZoneInfo(calendar_tz)).date().isoformat()
+
+
 def _score(game: dict, *keys: str) -> int:
     """Lit un score en essayant les conventions de nommage par ligue, dans l'ordre.
 
@@ -379,11 +429,8 @@ def _score(game: dict, *keys: str) -> int:
     )
 
 
-def _parse_game(game: dict) -> GameResult:
+def _parse_game(game: dict, calendar_tz: str | None = None) -> GameResult:
     """Convertit un match brut balldontlie en `GameResult`.
-
-    La date renvoyée par l'API est une chaîne ISO (parfois avec l'heure) : on ne
-    conserve que la partie calendaire 'YYYY-MM-DD'.
 
     ⚠️ Les deux ligues n'exposent pas le même schéma (vérifié par appel réel le
     2026-08-07, cf. journal des décisions) :
@@ -393,13 +440,12 @@ def _parse_game(game: dict) -> GameResult:
     - WNBA : `home_score` / `away_score`, `date` = date-**time** UTC
       ('2026-08-05T02:00:00.000Z'), `status` = 'post'.
 
-    On lit donc les deux conventions. La troncature `[:10]` reste **exacte pour la
-    NBA** (date déjà calendaire) mais **décale d'un jour les matchs WNBA en soirée
-    US** (02:00 UTC = veille à New York) : réserve connue, traitée dans la session
-    backfill, pas ici.
+    Les deux conventions de score sont lues par `_score`, les deux conventions de
+    date par `_game_date` — qui convertit vers `calendar_tz` uniquement quand la
+    date porte une heure. Voir sa docstring pour le défaut corrigé.
     """
     return GameResult(
-        game_date=str(game["date"])[:10],
+        game_date=_game_date(str(game["date"]), calendar_tz),
         status=str(game.get("status", "")),
         home_team=game["home_team"]["full_name"],
         away_team=game["visitor_team"]["full_name"],
