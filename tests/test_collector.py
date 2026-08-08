@@ -89,8 +89,24 @@ def make_event(match_id: str, tipoff: str) -> OddsEvent:
 
 
 def in_hours(hours: int) -> str:
-    """Timestamp ISO UTC décalé de `hours` heures par rapport à maintenant."""
+    """Timestamp ISO UTC décalé de `hours` heures par rapport à maintenant.
+
+    ⚠️ À n'utiliser que dans les tests qui laissent le collecteur lire l'horloge
+    système (pas de `now=` injecté). Mélanger ce helper avec un `now` fabriqué fait
+    dépendre l'écart tip-off ↔ now de l'heure de lancement de la suite : c'est le
+    défaut qui rendait `test_morning_collection_*` rouge le matin et vert le soir.
+    Dans ce cas, utiliser `hours_after(now, …)` — une seule source de temps.
+    """
     return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+
+def hours_after(base: datetime, hours: float) -> str:
+    """Timestamp ISO UTC décalé de `hours` heures par rapport à `base`.
+
+    Pendant du helper ci-dessus pour les tests à horloge fabriquée : le tip-off se
+    cale sur le `now` **injecté**, jamais sur l'horloge système en parallèle.
+    """
+    return (base + timedelta(hours=hours)).isoformat()
 
 
 @pytest.fixture
@@ -933,9 +949,21 @@ def test_priority_ordering_high_to_low(conn):
 
 
 def test_morning_collection_idempotent_daily(conn):
-    """Collecte du matin idempotente : 1 seule fois par jour."""
-    now = datetime.now(timezone.utc).replace(hour=9, minute=0)  # 09:00 UTC
-    
+    """Collecte du matin idempotente : 1 seule fois par jour.
+
+    Horloge entièrement fabriquée (convention du fichier, cf. les tests de créneau
+    matin plus haut) : aucun appel à `datetime.now`, donc résultat indépendant de
+    l'heure à laquelle la suite est lancée.
+
+    Tip-off volontairement à **H-20**, hors de portée de la cible H-6 : une cible
+    est due dès que `now >= tipoff − hours_before`, sans borne supérieure
+    (`compute_due_targets`). À H-6 ou moins, la cible partirait et produirait un
+    second relevé, faisant passer le match en SUIVI — ce test n'a rien à dire sur
+    l'ordonnancement des vagues, il isole le chemin « collecte du matin ».
+    """
+    now = datetime(2026, 7, 19, 9, 0, tzinfo=timezone.utc)   # créneau matin (09:00 UTC)
+    tipoff = hours_after(now, 20)
+
     # Config avec targets minimale (pour que le summary soit complet)
     config = {
         "quota": {"reserve": 50},
@@ -949,7 +977,7 @@ def test_morning_collection_idempotent_daily(conn):
     # Tick 1 à 09:00 : collecte du matin
     summary1 = run_collection(
         conn,
-        FakeClient([make_event("m1", in_hours(6))]),
+        FakeClient([make_event("m1", tipoff)]),
         "basketball_wnba",
         config,
         force=False,
@@ -963,7 +991,7 @@ def test_morning_collection_idempotent_daily(conn):
     # Tick 2 à 09:20 (même jour) : skip (déjà collecté)
     summary2 = run_collection(
         conn,
-        FakeClient([make_event("m1", in_hours(6))]),
+        FakeClient([make_event("m1", tipoff)]),
         "basketball_wnba",
         config,
         force=False,
@@ -973,9 +1001,20 @@ def test_morning_collection_idempotent_daily(conn):
 
 
 def test_morning_collection_exempted_from_reserve(conn):
-    """Collecte du matin exemptée de la garde de réserve (priorité implicite 1)."""
-    now = datetime.now(timezone.utc).replace(hour=9, minute=0)
-    
+    """Collecte du matin exemptée de la garde de réserve (priorité implicite 1).
+
+    Horloge entièrement fabriquée et tip-off hors de portée de la cible H-6, comme
+    ci-dessus : ce test porte sur l'exemption du matin, pas sur l'ordonnancement.
+
+    ⚠️ Limite connue de ce test : il ne peut pas démontrer le *contraste* (cible
+    non essentielle effectivement bloquée) dans la même exécution. `FakeClient`
+    annonce `credits_remaining = "480"` et `_persist_credits` écrase le quota en
+    base dès le premier appel réussi — les 30 crédits posés ici ont donc disparu
+    au moment où les cibles de vague sont évaluées. Démontrer le blocage exigerait
+    un `FakeClient` au quota bas ; hors périmètre, signalé plutôt que bricolé.
+    """
+    now = datetime(2026, 7, 19, 9, 0, tzinfo=timezone.utc)
+
     # Quota sous le seuil
     db.set_meta(conn, META_CREDITS_REMAINING, "30")
     conn.commit()
@@ -992,13 +1031,13 @@ def test_morning_collection_exempted_from_reserve(conn):
 
     summary = run_collection(
         conn,
-        FakeClient([make_event("m1", in_hours(6))]),
+        FakeClient([make_event("m1", hours_after(now, 20))]),
         "basketball_wnba",
         config,
         force=False,
         now=now,
     )
-    
+
     # Matin collecté malgré le seuil
     assert summary["morning_collected"] is True
     # Vérifie qu'un match a été découvert
