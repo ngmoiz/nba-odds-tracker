@@ -17,7 +17,12 @@ import pytest
 from common import db
 from common.config import Settings, load_config
 from common.db import get_connection, init_db
-from common.results_api_client import GameResult, ResultsApiClient, ResultsApiError
+from common.results_api_client import (
+    GameResult,
+    ResultsApiClient,
+    ResultsApiError,
+    _status_is_final,
+)
 from evaluator.clv import compute_clv
 from evaluator.evaluator import evaluate_pending
 from evaluator.grading import grade_verdict
@@ -207,14 +212,36 @@ def test_results_client_missing_score_keys_fail_loudly():
         client.get_games("2026-01-16", "2026-01-16")
 
 
-def test_results_client_skips_unplayed_games_without_failing(caplog):
-    """Match programmé (score `null`) → ignoré et compté, JAMAIS une levée.
+# Vocabulaire des statuts NON terminaux, tel qu'il se présente réellement.
+# `_FINAL_STATUSES` étant une liste BLANCHE ('final', 'post'), tout le reste est
+# non terminal par défaut — ces cas passeraient donc même sans être nommés. Ils
+# sont nommés quand même pour figer le vocabulaire observé : une régression qui
+# transformerait la liste blanche en liste noire les casserait, et c'est
+# exactement ce qui est arrivé en production le 2026-08-08 (cf. 'pre').
+_NON_FINAL_STATUSES = [
+    # Observés en production :
+    pytest.param("pre", id="pre-wnba-observe-2026-08-08"),
+    pytest.param("Scheduled", id="Scheduled-nba"),
+    # Défensifs (vocabulaire plausible, PAS observé à ce jour) :
+    pytest.param("in", id="in-defensif"),
+    pytest.param("In Progress", id="InProgress-defensif"),
+    pytest.param("Halftime", id="Halftime-defensif"),
+    pytest.param("1st Qtr", id="quart-en-cours-defensif"),
+    pytest.param("postponed", id="postponed-defensif"),
+    pytest.param("", id="statut-vide-defensif"),
+]
+
+
+@pytest.mark.parametrize("status", _NON_FINAL_STATUSES)
+def test_results_client_skips_unplayed_games_without_failing(status, caplog):
+    """Match non terminé (score `null`) → ignoré et compté, JAMAIS une levée.
 
     Régression de production : l'évaluateur interroge `[aujourd'hui − lookback,
     aujourd'hui]` à 09:30 Paris, soit 03:30 à New York — les matchs du soir même
-    sont déjà renvoyés au statut programmé. Lever aurait fait échouer toute la
-    requête, donc l'évaluateur entier, donc le bilan quotidien, pour une donnée
-    dont l'absence est parfaitement normale.
+    sont déjà renvoyés non terminés. Lever aurait fait échouer toute la requête,
+    donc l'évaluateur entier, donc le bilan quotidien, pour une donnée dont
+    l'absence est parfaitement normale. Vérifié en production le 2026-08-08 :
+    « Matchs non terminés ignorés : 2 (pre×2) », bilan envoyé normalement.
 
     Les DEUX moitiés de la garantie sont vérifiées : le match non terminé est
     absent du résultat, et le match terminé du **même payload** est bien renvoyé
@@ -222,7 +249,7 @@ def test_results_client_skips_unplayed_games_without_failing(caplog):
     """
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": [
-            {"date": "2026-01-16", "status": "Scheduled",
+            {"date": "2026-01-16", "status": status,
              "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
              "home_team_score": None, "visitor_team_score": None},
             {"date": "2026-01-16", "status": "Final",
@@ -235,11 +262,28 @@ def test_results_client_skips_unplayed_games_without_failing(caplog):
     with caplog.at_level(logging.INFO, logger="results_api"):
         games = client.get_games("2026-01-16", "2026-01-16")
 
-    assert len(games) == 1                       # le programmé est écarté…
+    assert len(games) == 1                       # le non terminé est écarté…
     assert games[0].home_team == "Lakers"        # …le terminé passe
     assert games[0].home_score == 101
-    # Invariant 6 : un match écarté laisse une trace, ventilée par statut.
-    assert any("Scheduled×1" in r.getMessage() for r in caplog.records)
+    # Invariant 6 : un match écarté laisse une trace, ventilée par statut. Un
+    # statut vide est libellé explicitement plutôt que de produire « ×1 » nu.
+    expected = f"{status or '(statut absent)'}×1"
+    assert any(expected in r.getMessage() for r in caplog.records)
+
+
+def test_final_statuses_are_an_allowlist_not_a_denylist():
+    """Un statut inconnu est traité comme NON terminal — propriété de conception.
+
+    C'est ce qui a sauvé le correctif : mes tests employaient `Scheduled`
+    (vocabulaire NBA) alors que la WNBA renvoie `pre`. Une liste noire de statuts
+    « non joués » aurait laissé passer `pre` et serait morte en production dès la
+    première exécution. Ce test verrouille le sens de la liste : seuls les statuts
+    explicitement terminaux le sont, tout le reste est écarté par défaut.
+    """
+    assert _status_is_final("Final") and _status_is_final("post")
+    assert _status_is_final("  FINAL  ")             # insensible casse/espaces
+    for unknown in ("pre", "statut_invente_par_une_future_ligue", "", "42"):
+        assert not _status_is_final(unknown)
 
 
 def test_results_client_final_game_with_null_score_fails_loudly():
