@@ -19,7 +19,9 @@ match *déclaré terminé* reste une donnée incohérente et lève. Voir `get_ga
 """
 from __future__ import annotations
 
+import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
@@ -31,6 +33,8 @@ logger = get_logger("results_api")
 DEFAULT_TIMEOUT = 20.0
 # balldontlie plafonne per_page à 100 ; une journée NBA compte ~15 matchs.
 _PER_PAGE = 100
+# Borne dure du nombre de pages suivies (garde anti-boucle, cf. `get_games`).
+_DEFAULT_MAX_PAGES = 50
 
 # Statuts signalant un match terminé (score officiel exploitable). Les deux ligues
 # n'emploient pas le même vocabulaire : NBA → 'Final', WNBA → 'post' (schémas vérifiés
@@ -62,6 +66,13 @@ class GameResult:
     away_team: str
     home_score: int
     away_score: int
+    # Champs exposés par les deux schémas de ligue, requis par le backfill Elo (B5).
+    # Défaut `None` : une clé absente reste absente (invariant 5). En particulier
+    # `postseason=None` signifie « inconnu », jamais « saison régulière » — affirmer
+    # False sans l'avoir lu serait exactement le défaut par défaut qu'on s'interdit.
+    game_id: str | None = None      # id balldontlie ; clé d'idempotence du rejeu Elo
+    season: int | None = None
+    postseason: bool | None = None
 
     @property
     def is_final(self) -> bool:
@@ -84,9 +95,39 @@ class ResultsApiClient:
         games_path: str,
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.BaseTransport | None = None,
+        *,
+        min_interval_seconds: float = 0.0,
+        max_retries: int = 0,
+        backoff_base_seconds: float = 2.0,
+        max_pages: int = _DEFAULT_MAX_PAGES,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        """Construit le client.
+
+        **Les défauts d'étranglement et de retry sont neutres** : un client construit
+        directement se comporte exactement comme avant l'introduction de ces options
+        (`min_interval_seconds=0` → aucune attente, `max_retries=0` → un 429 lève du
+        premier coup). Seul `from_config` injecte les valeurs réelles, et il ne
+        concerne que l'évaluateur — qui ne tire qu'une page, donc n'attend jamais
+        (la première requête n'est pas retardée).
+
+        `max_pages` est la seule valeur **non neutre**, délibérément : la neutraliser
+        (borne absente) préserverait la boucle non bornée qu'elle corrige. Elle reste
+        inatteignable en pratique (une page pour l'évaluateur, 3 à 5 pour le backfill).
+
+        `sleep` et `monotonic` sont injectables, sur le modèle du `transport` httpx :
+        aucun test ne dort réellement.
+        """
         self._api_key = api_key
         self._games_path = games_path
+        self._min_interval = min_interval_seconds
+        self._max_retries = max_retries
+        self._backoff_base = backoff_base_seconds
+        self._max_pages = max_pages
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._last_request_at: float | None = None
         # balldontlie authentifie par un simple en-tête Authorization.
         self._client = httpx.Client(
             base_url=base_url,
@@ -106,7 +147,7 @@ class ResultsApiClient:
         sport = config["api"]["sport"]
         results = config["results"]
         games_paths = results["games_paths"]
-        
+
         try:
             games_path = games_paths[sport]
         except KeyError:
@@ -114,11 +155,20 @@ class ResultsApiClient:
                 f"Aucun chemin balldontlie configuré pour le sport '{sport}'. "
                 f"Sports disponibles : {list(games_paths.keys())}"
             )
-        
+
+        # Étranglement et pagination : seuls réglages qui activent le comportement
+        # non neutre. Blocs optionnels — une config antérieure garde les défauts.
+        rate_limit = results.get("rate_limit") or {}
+        pagination = results.get("pagination") or {}
+
         return cls(
             api_key=settings.balldontlie_api_key,
             base_url=results["base_url"],
             games_path=games_path,
+            min_interval_seconds=float(rate_limit.get("min_interval_seconds", 0.0)),
+            max_retries=int(rate_limit.get("max_retries", 0)),
+            backoff_base_seconds=float(rate_limit.get("backoff_base_seconds", 2.0)),
+            max_pages=int(pagination.get("max_pages", _DEFAULT_MAX_PAGES)),
         )
 
     def __enter__(self) -> ResultsApiClient:
@@ -150,10 +200,22 @@ class ResultsApiClient:
         Le décompte des ignorés est ventilé par statut : un statut inattendu d'une
         future ligue apparaît dans les logs au lieu de disparaître en silence
         (invariant 6, « jamais de no-op silencieux »).
+
+        **Bornes de la boucle.** `next_cursor` ne suffit pas à décider de la fin :
+        la session 2 a observé un curseur **non nul sur une page pourtant terminale**.
+        Trois gardes, dont deux ne changent que des cas qui bouclaient :
+
+        1. page sans donnée → terminale, quoi que dise le curseur ;
+        2. curseur déjà vu (curseur figé) → sortie avec warning ;
+        3. dépassement de `max_pages` → `ResultsApiError`. **Jamais de troncature
+           silencieuse** : un backfill partiel d'apparence normale produirait des
+           notes Elo fausses sans qu'aucun signal ne le révèle.
         """
         games: list[GameResult] = []
         skipped: Counter[str] = Counter()
         cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages = 0
         while True:
             params: dict[str, object] = {
                 "start_date": start_date,
@@ -163,15 +225,35 @@ class ResultsApiClient:
             if cursor is not None:
                 params["cursor"] = cursor
             payload = self._get(params)
-            for raw in payload.get("data", []):
+            pages += 1
+
+            data = payload.get("data") or []
+            for raw in data:
                 status = str(raw.get("status", ""))
                 if not _status_is_final(status):
                     skipped[status or "(statut absent)"] += 1
                     continue
                 games.append(_parse_game(raw))
+
+            if not data:
+                # Page vide : fin réelle, même si l'API annonce encore un curseur.
+                break
             cursor = (payload.get("meta") or {}).get("next_cursor")
             if not cursor:
                 break
+            if str(cursor) in seen_cursors:
+                logger.warning(
+                    "Pagination balldontlie interrompue : curseur %r déjà vu "
+                    "(curseur figé après %d page(s)).", cursor, pages,
+                )
+                break
+            seen_cursors.add(str(cursor))
+            if pages >= self._max_pages:
+                raise ResultsApiError(
+                    f"Pagination balldontlie : {pages} pages atteintes (max_pages="
+                    f"{self._max_pages}) sans fin de curseur, entre {start_date} et "
+                    f"{end_date}. Arrêt plutôt que résultat tronqué silencieusement."
+                )
         if skipped:
             detail = ", ".join(f"{status}×{count}" for status, count in sorted(skipped.items()))
             logger.info(
@@ -183,14 +265,90 @@ class ResultsApiClient:
         )
         return games
 
+    def _wait_for_slot(self) -> None:
+        """Complète l'intervalle minimal depuis la requête précédente.
+
+        La **première** requête n'attend jamais (aucune précédente) : sur un appel
+        d'une seule page — le cas de l'évaluateur — l'étranglement ne coûte rien.
+        Inerte tant que `min_interval_seconds` vaut 0 (défaut).
+        """
+        if self._min_interval <= 0:
+            return
+        if self._last_request_at is not None:
+            elapsed = self._monotonic() - self._last_request_at
+            remaining = self._min_interval - elapsed
+            if remaining > 0:
+                logger.debug("Étranglement balldontlie : attente de %.1f s.", remaining)
+                self._sleep(remaining)
+        self._last_request_at = self._monotonic()
+
     def _get(self, params: dict) -> dict:
-        try:
-            response = self._client.get(self._games_path, params=params)
-        except httpx.RequestError as exc:
-            raise ResultsApiError(f"Erreur réseau vers balldontlie : {exc}") from exc
-        if response.status_code != 200:
-            raise ResultsApiError(f"HTTP {response.status_code} : {response.text[:200]}")
-        return response.json()
+        """Exécute une requête, étranglée et retentée sur 429 / coupure réseau.
+
+        Le tier gratuit balldontlie plafonne à 5 requêtes/minute. Deux protections
+        distinctes, aux portées volontairement étroites :
+
+        - **429** et erreurs réseau → nouvelle tentative, en honorant `Retry-After`
+          s'il est fourni, sinon backoff exponentiel. Chaque tentative est loggée
+          (invariant 6) : un ralentissement ne doit jamais être invisible.
+        - **tout autre statut ≠ 200** → levée immédiate, sans retry. Un 401 (clé
+          invalide) doit échouer du premier coup, pas au bout de quatre.
+
+        Inerte tant que `max_retries` vaut 0 (défaut) : le comportement est alors
+        exactement celui d'avant l'introduction du retry.
+        """
+        attempts = self._max_retries + 1
+        for attempt in range(attempts):
+            self._wait_for_slot()
+            try:
+                response = self._client.get(self._games_path, params=params)
+            except httpx.RequestError as exc:
+                if attempt + 1 >= attempts:
+                    raise ResultsApiError(
+                        f"Erreur réseau vers balldontlie après {attempts} tentative(s) : {exc}"
+                    ) from exc
+                self._backoff(attempt, reason=f"erreur réseau ({exc})", retry_after=None)
+                continue
+
+            if response.status_code == 429:
+                if attempt + 1 >= attempts:
+                    raise ResultsApiError(
+                        f"HTTP 429 (quota balldontlie) après {attempts} tentative(s) : "
+                        f"{response.text[:200]}"
+                    )
+                self._backoff(
+                    attempt,
+                    reason="HTTP 429 (quota balldontlie)",
+                    retry_after=response.headers.get("Retry-After"),
+                )
+                continue
+
+            if response.status_code != 200:
+                # Pas de retry : une erreur applicative ne se résout pas en attendant.
+                raise ResultsApiError(f"HTTP {response.status_code} : {response.text[:200]}")
+            return response.json()
+
+        # Inatteignable : chaque branche ci-dessus sort ou lève.
+        raise ResultsApiError("Échec inattendu de la boucle de tentatives balldontlie.")
+
+    def _backoff(self, attempt: int, *, reason: str, retry_after: str | None) -> None:
+        """Attend avant une nouvelle tentative, en loggant toujours pourquoi.
+
+        `Retry-After` (en secondes) prime sur le backoff calculé : le serveur sait
+        mieux que nous quand il acceptera de nouveau. Une valeur illisible est
+        ignorée au profit du backoff, avec une trace.
+        """
+        delay = self._backoff_base * (2**attempt)
+        if retry_after is not None:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                logger.warning("En-tête Retry-After illisible (%r) : backoff calculé.", retry_after)
+        logger.warning(
+            "balldontlie : %s — nouvelle tentative dans %.1f s (tentative %d).",
+            reason, delay, attempt + 1,
+        )
+        self._sleep(delay)
 
 
 def _score(game: dict, *keys: str) -> int:
@@ -247,4 +405,17 @@ def _parse_game(game: dict) -> GameResult:
         away_team=game["visitor_team"]["full_name"],
         home_score=_score(game, "home_score", "home_team_score"),
         away_score=_score(game, "away_score", "visitor_team_score"),
+        game_id=_optional(game, "id", str),
+        season=_optional(game, "season", int),
+        postseason=_optional(game, "postseason", bool),
     )
+
+
+def _optional(game: dict, key: str, cast):
+    """Lit une clé facultative, ou `None` si absente/nulle (invariant 5).
+
+    Aucune valeur inventée : `postseason` absent vaut `None` (« inconnu »), jamais
+    `False` (« saison régulière »), qui serait une affirmation non vérifiée.
+    """
+    value = game.get(key)
+    return None if value is None else cast(value)

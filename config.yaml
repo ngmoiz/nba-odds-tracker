@@ -153,6 +153,16 @@ results:
     basketball_wnba: /wnba/v1/games   # namespace WNBA
   # Fuseau de référence des dates de match côté balldontlie (calendrier US).
   calendar_timezone: America/New_York
+  # Étranglement des appels (tier gratuit balldontlie = 5 requêtes/minute).
+  # N'entame JAMAIS le quota The Odds API : source distincte, gratuite.
+  # La première requête n'est jamais retardée — un appel d'une seule page
+  # (cas de l'évaluateur) ne coûte donc aucune latence.
+  rate_limit:
+    min_interval_seconds: 13    # 13 s ≈ 4,6 req/min : marge sous le plafond de 5
+    max_retries: 3              # tentatives supplémentaires sur 429 / coupure réseau
+    backoff_base_seconds: 2     # 2, 4, 8 s — ignoré si l'en-tête Retry-After est fourni
+  pagination:
+    max_pages: 50               # borne dure anti-boucle ; dépassement = erreur, jamais troncature
 
 # --- Évaluateur (étape 1.6) ---
 evaluator:

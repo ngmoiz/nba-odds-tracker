@@ -307,6 +307,279 @@ def test_results_client_final_game_with_null_score_fails_loudly():
         client.get_games("2026-01-16", "2026-01-16")
 
 
+# ───────── étranglement, retry et bornes de pagination (B5 lot 1a) ─────────
+#
+# Tous ces tests injectent `sleep` et `monotonic` : aucun ne dort réellement.
+
+
+def _clock():
+    """Horloge et pause instrumentées : renvoie (sleep, monotonic, appels)."""
+    state = {"t": 1000.0}
+    calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        calls.append(seconds)
+        state["t"] += seconds          # dormir fait avancer l'horloge
+
+    def monotonic() -> float:
+        return state["t"]
+
+    return sleep, monotonic, calls, state
+
+
+def _pages_handler(pages: list[dict], seen: list):
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(200, json=pages[min(len(seen) - 1, len(pages) - 1)])
+    return handler
+
+
+FINAL_GAME = {"date": "2026-01-16", "status": "Final",
+              "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+              "home_team_score": 110, "visitor_team_score": 100}
+
+
+def test_throttle_is_disabled_by_default():
+    """Client construit directement → AUCUN étranglement : preuve de l'inertie du lot.
+
+    C'est la garantie qui rend ce lot déployable sans vérification de production :
+    les ~40 tests existants et tout appelant direct gardent le comportement d'avant.
+    Seul `from_config` active l'étranglement.
+    """
+    sleep, monotonic, calls, _ = _clock()
+    seen: list = []
+    pages = [{"data": [FINAL_GAME], "meta": {"next_cursor": 90}},
+             {"data": [FINAL_GAME], "meta": {"next_cursor": None}}]
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(_pages_handler(pages, seen)),
+                              sleep=sleep, monotonic=monotonic)
+    assert len(client.get_games("2026-01-16", "2026-01-16")) == 2
+    assert calls == []                      # deux requêtes, aucune attente
+
+
+def test_throttle_does_not_delay_the_first_request():
+    """La première requête n'attend jamais : un appel d'une page ne coûte rien.
+
+    C'est ce qui rend l'étranglement gratuit pour l'évaluateur, qui ne tire qu'une
+    page par exécution quotidienne.
+    """
+    sleep, monotonic, calls, _ = _clock()
+    seen: list = []
+    pages = [{"data": [FINAL_GAME], "meta": {"next_cursor": None}}]
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(_pages_handler(pages, seen)),
+                              min_interval_seconds=13.0, sleep=sleep, monotonic=monotonic)
+    client.get_games("2026-01-16", "2026-01-16")
+    assert calls == []
+
+
+def test_throttle_spaces_consecutive_requests():
+    """Deux pages consécutives → attente du complément d'intervalle, une seule fois."""
+    sleep, monotonic, calls, _ = _clock()
+    seen: list = []
+    pages = [{"data": [FINAL_GAME], "meta": {"next_cursor": 90}},
+             {"data": [FINAL_GAME], "meta": {"next_cursor": None}}]
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(_pages_handler(pages, seen)),
+                              min_interval_seconds=13.0, sleep=sleep, monotonic=monotonic)
+    client.get_games("2026-01-16", "2026-01-16")
+
+    # L'horloge instrumentée n'avance que par les pauses : la 2e requête attend
+    # l'intervalle complet.
+    assert calls == [13.0]
+    assert len(seen) == 2
+
+
+def test_retry_recovers_from_429_then_succeeds(caplog):
+    """429 puis 200 → résultat rendu, et la nouvelle tentative est loggée."""
+    sleep, monotonic, calls, _ = _clock()
+    responses = [httpx.Response(429, text="slow down"),
+                 httpx.Response(200, json={"data": [FINAL_GAME], "meta": {"next_cursor": None}})]
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return responses[len(seen) - 1]
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler),
+                              max_retries=3, backoff_base_seconds=2.0,
+                              sleep=sleep, monotonic=monotonic)
+    with caplog.at_level(logging.WARNING, logger="results_api"):
+        games = client.get_games("2026-01-16", "2026-01-16")
+
+    assert len(games) == 1
+    assert calls == [2.0]                   # backoff de base, 2^0
+    assert any("429" in r.getMessage() for r in caplog.records)   # jamais silencieux
+
+
+def test_retry_honours_retry_after_header_over_backoff():
+    """`Retry-After` prime sur le backoff calculé : le serveur sait mieux que nous."""
+    sleep, monotonic, calls, _ = _clock()
+    responses = [httpx.Response(429, headers={"Retry-After": "7"}),
+                 httpx.Response(200, json={"data": [FINAL_GAME], "meta": {"next_cursor": None}})]
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return responses[len(seen) - 1]
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler),
+                              max_retries=3, backoff_base_seconds=2.0,
+                              sleep=sleep, monotonic=monotonic)
+    client.get_games("2026-01-16", "2026-01-16")
+    assert calls == [7.0]                   # 7 s demandées, pas 2 s calculées
+
+
+def test_retry_gives_up_after_max_retries():
+    """429 persistant → `ResultsApiError` nommant le statut, après N+1 tentatives."""
+    sleep, monotonic, calls, _ = _clock()
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(429, text="quota")
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler),
+                              max_retries=2, backoff_base_seconds=2.0,
+                              sleep=sleep, monotonic=monotonic)
+    with pytest.raises(ResultsApiError, match="429"):
+        client.get_games("2026-01-16", "2026-01-16")
+
+    assert len(seen) == 3                   # 1 tentative + 2 retries
+    assert calls == [2.0, 4.0]              # backoff exponentiel
+
+
+def test_no_retry_on_client_error():
+    """401 → levée immédiate, UN seul appel : une clé invalide ne se répare pas en attendant."""
+    sleep, monotonic, calls, _ = _clock()
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(401, text="unauthorized")
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler),
+                              max_retries=3, sleep=sleep, monotonic=monotonic)
+    with pytest.raises(ResultsApiError, match="401"):
+        client.get_games("2026-01-16", "2026-01-16")
+
+    assert len(seen) == 1
+    assert calls == []
+
+
+def test_pagination_stops_on_empty_page_despite_non_null_cursor():
+    """Page vide → fin, même si l'API annonce encore un curseur.
+
+    Cas RÉELLEMENT observé en session 2 : `meta.next_cursor` reste non nul sur une
+    page terminale. Sans cette garde, une saison entière bouclerait indéfiniment.
+    """
+    seen: list = []
+    pages = [{"data": [FINAL_GAME], "meta": {"next_cursor": 90}},
+             {"data": [], "meta": {"next_cursor": 18447401}}]   # vide MAIS curseur non nul
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(_pages_handler(pages, seen)))
+    games = client.get_games("2026-01-16", "2026-01-16")
+
+    assert len(games) == 1
+    assert len(seen) == 2                   # la boucle s'arrête, elle ne tourne pas
+
+
+def test_pagination_stops_when_cursor_does_not_advance(caplog):
+    """Curseur figé (même valeur renvoyée) → sortie avec warning, pas de boucle."""
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(200, json={"data": [FINAL_GAME], "meta": {"next_cursor": 42}})
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler))
+    with caplog.at_level(logging.WARNING, logger="results_api"):
+        games = client.get_games("2026-01-16", "2026-01-16")
+
+    assert len(seen) == 2                   # 1re page, puis 2e qui répète le curseur
+    assert len(games) == 2
+    assert any("curseur" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_pagination_exceeding_max_pages_raises_not_truncates():
+    """Dépassement de `max_pages` → levée. JAMAIS un résultat tronqué en silence.
+
+    Une liste partielle d'apparence normale produirait des notes Elo fausses sans
+    qu'aucun signal ne le révèle — exactement ce que l'invariant 6 interdit.
+    """
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        # Curseur qui progresse indéfiniment : seule `max_pages` peut arrêter.
+        return httpx.Response(200, json={"data": [FINAL_GAME],
+                                         "meta": {"next_cursor": len(seen)}})
+
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(handler), max_pages=3)
+    with pytest.raises(ResultsApiError, match="max_pages"):
+        client.get_games("2026-01-16", "2026-01-16")
+
+    assert len(seen) == 3
+
+
+def test_game_fields_parsed_from_both_league_payloads():
+    """`id`/`season`/`postseason` lus sur les deux schémas ; absents → None, pas False.
+
+    `postseason=None` signifie « inconnu ». Le mettre à `False` par défaut affirmerait
+    « saison régulière » sans l'avoir lu (invariant 5) — et le backfill Elo s'en sert
+    pour décider ce qu'il rejoue.
+    """
+    nba = {"id": 18447401, "date": "2026-01-16", "status": "Final", "season": 2025,
+           "postseason": False,
+           "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+           "home_team_score": 112, "visitor_team_score": 109}
+    minimal = {"date": "2026-01-16", "status": "Final",          # aucun champ facultatif
+               "home_team": {"full_name": BOS}, "visitor_team": {"full_name": MIA},
+               "home_score": 92, "away_score": 81}
+
+    seen: list = []
+    pages = [{"data": [nba, minimal], "meta": {"next_cursor": None}}]
+    client = ResultsApiClient("k", "https://api.balldontlie.io", "/x",
+                              transport=httpx.MockTransport(_pages_handler(pages, seen)))
+    full, bare = client.get_games("2026-01-16", "2026-01-16")
+
+    assert (full.game_id, full.season, full.postseason) == ("18447401", 2025, False)
+    assert (bare.game_id, bare.season, bare.postseason) == (None, None, None)
+
+
+def test_from_config_reads_rate_limit_and_pagination():
+    """Les réglages viennent de la VRAIE `config.yaml` (règle 0.4.7, rien en dur)."""
+    config = load_config()
+    rate_limit = config["results"]["rate_limit"]
+    pagination = config["results"]["pagination"]
+
+    assert rate_limit["min_interval_seconds"] * 5 > 60, (
+        "L'intervalle doit garder une marge sous le plafond de 5 requêtes/minute."
+    )
+    assert rate_limit["max_retries"] >= 1
+    assert pagination["max_pages"] >= 1
+
+    settings = Settings(odds_api_key="", balldontlie_api_key="k", telegram_bot_token="",
+                        telegram_chat_id="", database_path=Path("x.db"), log_level="INFO")
+    client = ResultsApiClient.from_config(settings, config)
+    try:
+        assert client._min_interval == rate_limit["min_interval_seconds"]
+        assert client._max_retries == rate_limit["max_retries"]
+        assert client._max_pages == pagination["max_pages"]
+    finally:
+        client.close()
+
+
 def test_from_config_routes_by_sport():
     """Le chemin balldontlie est dérivé d'`api.sport`, jamais codé en dur.
 
