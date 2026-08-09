@@ -128,6 +128,41 @@ CREATE TABLE IF NOT EXISTS collection_log (
     wave_label TEXT NOT NULL          -- Label informatif (pas clé de déduplication)
 );
 
+-- Notes de force Elo par équipe et par ligue (chantier B5, spec §5.1).
+-- Table DÉRIVÉE : entièrement reconstructible depuis les résultats balldontlie.
+-- Elle n'est donc PAS append-only et ne porte aucun trigger de protection.
+-- `team` est une clé NORMALISÉE (cf. `_require_normalized_team`), `display_name`
+-- conserve le nom tel que reçu pour l'affichage et le débogage.
+CREATE TABLE IF NOT EXISTS team_ratings (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    sport          TEXT NOT NULL,
+    team           TEXT NOT NULL,
+    display_name   TEXT NOT NULL,
+    rating         REAL NOT NULL,
+    games_played   INTEGER NOT NULL DEFAULT 0,
+    last_game_date TEXT,                   -- date calendaire US ; NULL = aucun match intégré
+    updated_at     TEXT NOT NULL,
+    UNIQUE(sport, team)
+);
+
+-- Historique des variations de note : traçabilité, débogage d'un rejeu, et clé
+-- d'idempotence du backfill via (sport, team, source_game_id).
+CREATE TABLE IF NOT EXISTS rating_history (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    sport          TEXT NOT NULL,
+    team           TEXT NOT NULL,
+    game_date      TEXT NOT NULL,          -- date calendaire US du match appliqué
+    source         TEXT NOT NULL CHECK (source IN ('backfill', 'evaluator')),
+    source_game_id TEXT,                   -- id balldontlie
+    match_id       TEXT REFERENCES matches(match_id),  -- id The Odds API ; NULL en backfill
+    opponent       TEXT NOT NULL,          -- informatif (forme d'affichage, non normalisée)
+    is_home        INTEGER NOT NULL CHECK (is_home IN (0, 1)),
+    rating_before  REAL NOT NULL,
+    rating_after   REAL NOT NULL,
+    expected_win   REAL NOT NULL,          -- E avant match (cf. RatingUpdate, traçabilité)
+    created_at     TEXT NOT NULL
+);
+
 -- Index pour accélérer les requêtes fréquentes.
 CREATE INDEX IF NOT EXISTS idx_snapshots_match        ON odds_snapshots(match_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_match_market ON odds_snapshots(match_id, market);
@@ -138,6 +173,12 @@ CREATE INDEX IF NOT EXISTS idx_verdicts_match         ON verdicts(match_id);
 CREATE INDEX IF NOT EXISTS idx_positions_verdict      ON positions(verdict_id);
 CREATE INDEX IF NOT EXISTS idx_evaluations_verdict    ON evaluations(verdict_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_match_target     ON collection_log(match_id, target_name);
+CREATE INDEX IF NOT EXISTS idx_ratings_sport           ON team_ratings(sport);
+CREATE INDEX IF NOT EXISTS idx_rating_history_team     ON rating_history(sport, team, game_date);
+-- Clé d'idempotence du rejeu : un match balldontlie ne peut être appliqué qu'une
+-- fois par équipe. Une seconde insertion lève, elle n'est jamais avalée.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rating_history_game
+    ON rating_history(sport, team, source_game_id);
 
 -- Garantie append-only : la base rejette physiquement toute modification/suppression
 -- d'un relevé de cotes existant, quelle que soit l'application ou l'outil.
@@ -802,6 +843,159 @@ def mark_target_served(
     except sqlite3.IntegrityError:
         # Déjà servi (normal si collecte précédente), skip silencieusement
         pass
+
+
+# ─────────────────── Notes de force Elo (chantier B5, lot 2) ───────────────────
+#
+# Tables DÉRIVÉES, reconstructibles depuis les résultats balldontlie : ni append-only,
+# ni protégées par trigger. Comme le reste de cette section, les fonctions reçoivent
+# une connexion ouverte et ne committent PAS — l'appelant décide.
+#
+# Aucun composant du pipeline ne lit ni n'écrit ces tables à ce jour : le rejeu
+# (backfill) et le branchement sur la décision sont des lots ultérieurs.
+
+
+def _normalized_team_key(value: str) -> str:
+    """Forme canonique d'une clé d'équipe : minuscules, espaces normalisés.
+
+    ⚠️ Doit rester **identique** à `evaluator.reconcile.normalize_team`. La logique
+    est dupliquée volontairement : `common/` ne peut pas importer `evaluator/` sans
+    inverser les couches. La duplication est verrouillée par un test qui compare les
+    deux implémentations sur un jeu d'entrées — si l'une dérive, il casse.
+    """
+    return " ".join(value.strip().lower().split())
+
+
+def _require_normalized_team(team: str) -> None:
+    """Refuse une clé d'équipe non normalisée, au point d'écriture.
+
+    Un contrat seulement documenté n'est pas un contrat : si le backfill et
+    l'évaluateur normalisaient différemment, la base contiendrait **deux lignes pour
+    la même équipe** et `UNIQUE(sport, team)` ne pourrait rien y faire — une note
+    scindée en deux, donc fausse des deux côtés, sans aucun signal. La garde coûte
+    une comparaison de chaînes et ferme la classe d'erreur.
+    """
+    expected = _normalized_team_key(team)
+    if team != expected:
+        raise ValueError(
+            f"Clé d'équipe non normalisée : {team!r} (attendu {expected!r}). "
+            f"Normaliser via `evaluator.reconcile.normalize_team` AVANT d'écrire — "
+            f"deux normalisations divergentes créeraient deux lignes pour la même "
+            f"équipe, que la contrainte d'unicité ne rattraperait pas."
+        )
+
+
+def get_team_rating(conn: sqlite3.Connection, sport: str, team: str) -> sqlite3.Row | None:
+    """Note d'une équipe, ou **None** si elle n'a jamais été notée.
+
+    `None` explicite (invariant 5) : c'est à l'appelant de décider qu'une équipe
+    inconnue démarre à `model.elo.initial_rating`. Renvoyer 1500 d'office masquerait
+    la différence entre « jamais vue » et « exactement à la note de départ ».
+    """
+    return conn.execute(
+        "SELECT * FROM team_ratings WHERE sport = ? AND team = ?", (sport, team)
+    ).fetchone()
+
+
+def get_team_ratings(conn: sqlite3.Connection, sport: str) -> list[sqlite3.Row]:
+    """Toutes les notes d'une ligue, de la plus forte à la plus faible.
+
+    Filtrage par `sport` obligatoire : la base est partagée entre ligues (§6.5), et
+    toute agrégation qui l'oublierait mélangerait des échelles Elo indépendantes.
+    """
+    return conn.execute(
+        "SELECT * FROM team_ratings WHERE sport = ? ORDER BY rating DESC", (sport,)
+    ).fetchall()
+
+
+def upsert_team_rating(
+    conn: sqlite3.Connection,
+    *,
+    sport: str,
+    team: str,
+    display_name: str,
+    rating: float,
+    games_played: int,
+    last_game_date: str | None,
+    updated_at: str,
+) -> None:
+    """Insère ou met à jour la note d'une équipe, sur la clé `(sport, team)`.
+
+    `team` doit être **déjà normalisé** — vérifié, pas seulement documenté.
+    `last_game_date` vaut `None` tant qu'aucun match n'a été intégré.
+    """
+    _require_normalized_team(team)
+    conn.execute(
+        """
+        INSERT INTO team_ratings
+            (sport, team, display_name, rating, games_played, last_game_date, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sport, team) DO UPDATE SET
+            display_name   = excluded.display_name,
+            rating         = excluded.rating,
+            games_played   = excluded.games_played,
+            last_game_date = excluded.last_game_date,
+            updated_at     = excluded.updated_at
+        """,
+        (sport, team, display_name, rating, games_played, last_game_date, updated_at),
+    )
+
+
+def insert_rating_history(
+    conn: sqlite3.Connection,
+    *,
+    sport: str,
+    team: str,
+    game_date: str,
+    source: str,
+    source_game_id: str | None,
+    match_id: str | None,
+    opponent: str,
+    is_home: bool,
+    rating_before: float,
+    rating_after: float,
+    expected_win: float,
+    created_at: str,
+) -> None:
+    """Enregistre une variation de note.
+
+    ⚠️ Laisse remonter `sqlite3.IntegrityError` sur doublon
+    `(sport, team, source_game_id)`, **contrairement à `mark_target_served`** qui
+    l'avale. La différence est délibérée : re-servir une cible de collecte est un
+    fonctionnement normal, alors qu'appliquer deux fois le même match à la même
+    équipe signifie que le rejeu a **double-compté** — un défaut qui fausserait
+    toutes les notes en aval et doit être bruyant (invariant 6).
+    """
+    _require_normalized_team(team)
+    conn.execute(
+        """
+        INSERT INTO rating_history
+            (sport, team, game_date, source, source_game_id, match_id, opponent,
+             is_home, rating_before, rating_after, expected_win, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (sport, team, game_date, source, source_game_id, match_id, opponent,
+         int(is_home), rating_before, rating_after, expected_win, created_at),
+    )
+
+
+def count_rating_history(
+    conn: sqlite3.Connection, sport: str, source: str | None = None
+) -> int:
+    """Nombre de variations enregistrées pour une ligue, éventuellement par source.
+
+    Sert au garde-fou « ce rejeu a-t-il déjà tourné ? » du script de backfill.
+    """
+    if source is None:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM rating_history WHERE sport = ?", (sport,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM rating_history WHERE sport = ? AND source = ?",
+            (sport, source),
+        ).fetchone()
+    return row["n"]
 
 
 def get_closing_markets_for_match(conn: sqlite3.Connection, match_id: str) -> list[str]:
