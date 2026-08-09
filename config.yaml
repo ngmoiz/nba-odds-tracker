@@ -164,6 +164,48 @@ results:
   pagination:
     max_pages: 50               # borne dure anti-boucle ; dépassement = erreur, jamais troncature
 
+# --- Backfill Elo (chantier B5, lot 3) — hors pipeline cron ---
+# Rejeu d'une saison complète depuis balldontlie pour mûrir les notes `team_ratings`
+# AVANT d'activer le modèle. Exécution manuelle, ponctuelle : aucun cron ne lit ce
+# bloc, et rien ici n'influence une décision.
+backfill:
+  # Cache disque des réponses balldontlie : un backfill se met au point en plusieurs
+  # passes, on ne paie le réseau qu'une fois. `data/` est déjà dans .gitignore.
+  cache_dir: data/cache/balldontlie
+  # Part finale de la saison réservée au test prédictif hold-out (notes gelées à la
+  # coupure, matchs postérieurs jamais vus par le modèle).
+  holdout_fraction: 0.2
+  # Bornes de saison par ligue. `start_date` est volontairement large : la borne ne
+  # coûte aucune requête supplémentaire (la pagination compte les matchs, pas les
+  # jours) et laisse la donnée révéler le vrai début de saison.
+  # Le script élargit encore d'un jour de chaque côté — sans la borne haute, les
+  # matchs du soir de la dernière journée, indexés au lendemain en UTC par
+  # balldontlie, seraient systématiquement perdus (réserve du journal 2026-08-08).
+  seasons:
+    basketball_wnba: {season: 2026, start_date: '2026-05-01'}
+    basketball_nba:  {season: 2025, start_date: '2025-10-01'}
+  # Alias de noms d'équipes : nom rendu par la source de résultats → nom canonique.
+  #
+  # LA CLÉ CANONIQUE DU PROJET EST LE NOM PORTÉ PAR `matches` (The Odds API). C'est
+  # lui qu'interrogera le read path du modèle, par égalité STRICTE. Tout producteur de
+  # notes — backfill comme write path de l'évaluateur — dérive sa clé par
+  # `evaluator.reconcile.build_canonical_resolver`, jamais autrement : deux
+  # producteurs qui normaliseraient différemment scinderaient une note en deux, et
+  # `UNIQUE(sport, team)` ne verrait rien.
+  #
+  # Motif ici : balldontlie renvoie un `city` VIDE pour les deux franchises créées en
+  # 2026, donc un `full_name` amputé de la ville (vérifié par appel réel le
+  # 2026-08-09 ; les 13 autres équipes s'apparient au caractère près). `teams_match`
+  # absorbe déjà ce cas côté évaluateur, mais par inclusion — une tolérance qui ne se
+  # propage pas à une égalité stricte.
+  #
+  # Le jour où la source renseignera la ville, ces alias cesseront simplement de se
+  # déclencher : la sonde les signalera comme inutilisés, rien ne cassera.
+  team_aliases:
+    basketball_wnba:
+      Fire:  Portland Fire
+      Tempo: Toronto Tempo
+
 # --- Évaluateur (étape 1.6) ---
 evaluator:
   lookback_days: 3            # fenêtre de rattrapage des matchs clos non encore évalués

@@ -151,12 +151,25 @@ class ResultsApiClient:
         )
 
     @classmethod
-    def from_config(cls, settings, config: dict) -> ResultsApiClient:
+    def from_config(
+        cls,
+        settings,
+        config: dict,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> ResultsApiClient:
         """Construit le client à partir de la configuration du projet.
-        
+
         Le chemin d'endpoint est dérivé automatiquement du sport configuré dans
         `api.sport` (règle 0.4.7). Si le sport n'a pas de chemin configuré, une
         erreur explicite est levée.
+
+        `transport` est un passe-plat vers le constructeur, **inerte par défaut**
+        (`None` = comportement inchangé). Il existe pour que le backfill Elo puisse
+        glisser un cache disque sous le client sans reconstruire à la main le routage
+        par ligue et les réglages d'étranglement : une seconde implémentation de cette
+        lecture divergerait de la production, ce qui est exactement le défaut trouvé
+        le 2026-08-07 (routage correct, parsing divergent).
         """
         sport = config["api"]["sport"]
         results = config["results"]
@@ -179,6 +192,7 @@ class ResultsApiClient:
             api_key=settings.balldontlie_api_key,
             base_url=results["base_url"],
             games_path=games_path,
+            transport=transport,
             # Facultatif ici : une ligue à dates calendaires (NBA) n'en a pas besoin.
             # L'absence ne se paie qu'au moment où une date-time se présente, et
             # `_game_date` lève alors explicitement plutôt que de retomber sur UTC.

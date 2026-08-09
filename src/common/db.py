@@ -998,6 +998,42 @@ def count_rating_history(
     return row["n"]
 
 
+def delete_backfill_ratings(conn: sqlite3.Connection, sport: str) -> tuple[int, int]:
+    """Purge le backfill d'une ligue : historique `source='backfill'` **et** ses notes.
+
+    Primitive de remplacement transactionnel que le lot 2 avait délibérément laissée à
+    son consommateur — une primitive écrite sans usage réel est une primitive non
+    testée. Elle arrive donc avec le script de backfill, bornée à ce dont il a besoin :
+    **un sport, et la seule source `backfill`**.
+
+    **Refuse s'il existe des lignes `source='evaluator'` pour ce sport.** `team_ratings`
+    porterait alors un état que le rejeu seul ne sait pas reconstruire : l'effacer
+    perdrait de la donnée en silence. Le jour où l'évaluateur alimentera les notes
+    (lot 4), un remplacement devra rejouer les deux sources, pas écraser l'une d'elles.
+
+    Ne committe pas : l'appelant décide, ce qui permet d'enchaîner purge et réécriture
+    dans une seule transaction. Renvoie `(lignes d'historique, notes)` supprimées.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM rating_history WHERE sport = ? AND source = 'evaluator'",
+        (sport,),
+    ).fetchone()
+    if row["n"]:
+        raise ValueError(
+            f"Refus de purger le backfill de '{sport}' : {row['n']} ligne(s) "
+            f"d'historique proviennent de l'évaluateur. Les notes courantes en "
+            f"dépendent et le rejeu seul ne les reconstruirait pas."
+        )
+
+    history = conn.execute(
+        "DELETE FROM rating_history WHERE sport = ? AND source = 'backfill'", (sport,)
+    ).rowcount
+    ratings = conn.execute(
+        "DELETE FROM team_ratings WHERE sport = ?", (sport,)
+    ).rowcount
+    return history, ratings
+
+
 def get_closing_markets_for_match(conn: sqlite3.Connection, match_id: str) -> list[str]:
     """Marchés des verdicts en attente pour un match (clôture H-0.25 per-match)."""
     rows = conn.execute(

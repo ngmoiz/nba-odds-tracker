@@ -26,7 +26,17 @@ from common.results_api_client import (
 from evaluator.clv import compute_clv
 from evaluator.evaluator import evaluate_pending
 from evaluator.grading import grade_verdict
-from evaluator.reconcile import find_result, normalize_team, tipoff_calendar_date
+from evaluator.reconcile import (
+    TeamContractError,
+    build_canonical_resolver,
+    canonical_team_key,
+    check_team_contract,
+    find_result,
+    normalize_team,
+    team_aliases,
+    teams_match,
+    tipoff_calendar_date,
+)
 from evaluator.reporting import EvalLine, format_daily_report, success_rate
 
 BOS, MIA = "Boston Celtics", "Miami Heat"
@@ -122,6 +132,155 @@ def test_find_result_flexible_matching_reversed_partial():
     r = find_result(games, home_team="Washington Mystics", away_team="Portland Fire",
                     tipoff_utc="2026-07-16T23:00:00Z", calendar_tz="America/New_York")
     assert r is not None and r.away_score == 82
+
+
+# ───────── contrat de clé d'équipe (B5 lot 3) ─────────
+#
+# Les deux tests d'inclusion ci-dessus montrent que `teams_match` absorbe DÉJÀ, et
+# volontairement, la divergence 'Fire'/'Tempo' — mais par une comparaison floue, pour
+# retrouver *un match*. Une note, elle, se clé par égalité stricte : `get_team_rating`
+# ne retrouverait jamais une ligne écrite sous 'tempo'. Ce qui suit verrouille la
+# passerelle entre les deux mondes, et surtout le fait qu'elle soit vérifiable au-delà
+# des deux cas connus du jour.
+
+WNBA_TEAMS = [
+    "Atlanta Dream", "Chicago Sky", "Connecticut Sun", "Dallas Wings",
+    "Golden State Valkyries", "Indiana Fever", "Las Vegas Aces", "Los Angeles Sparks",
+    "Minnesota Lynx", "New York Liberty", "Phoenix Mercury", "Portland Fire",
+    "Seattle Storm", "Toronto Tempo", "Washington Mystics",
+]
+# Ce que balldontlie renvoie réellement : `city` vide pour les franchises 2026.
+BDL_NAMES = [t for t in WNBA_TEAMS if t not in ("Portland Fire", "Toronto Tempo")] + \
+    ["Fire", "Tempo"]
+
+
+def test_config_declares_the_aliases_the_real_source_requires():
+    """Les alias viennent de la VRAIE `config.yaml` (règle 0.4.7, rien en dur).
+
+    Vérifié par appel réel le 2026-08-09 : balldontlie rend `full_name` = 'Fire' et
+    'Tempo', `city` étant vide pour les deux franchises créées en 2026.
+    """
+    aliases = team_aliases(load_config(), "basketball_wnba")
+    assert aliases["fire"] == "Portland Fire"
+    assert aliases["tempo"] == "Toronto Tempo"
+
+
+def test_canonical_key_maps_a_truncated_source_name_to_the_tracked_team():
+    aliases = team_aliases(load_config(), "basketball_wnba")
+    assert canonical_team_key("Tempo", aliases) == normalize_team("Toronto Tempo")
+    # Une équipe sans alias traverse inchangée, à la normalisation près.
+    assert canonical_team_key("  LAS VEGAS   ACES ", aliases) == "las vegas aces"
+
+
+def test_contract_holds_on_the_real_league_inventory():
+    """Inventaire complet des 15 équipes, dans les deux sens, sans erreur ni avertissement."""
+    report = check_team_contract(
+        source_names=BDL_NAMES,
+        aliases=team_aliases(load_config(), "basketball_wnba"),
+        known_teams=WNBA_TEAMS,
+    )
+    assert report.ok, report.errors
+    assert report.warnings == []
+
+
+def test_an_unaliased_divergence_is_caught_even_though_it_is_unknown_today():
+    """Le filet doit attraper une divergence FUTURE, pas seulement Fire et Tempo.
+
+    C'est le cœur de l'exigence : à la bascule NBA, d'autres `city` vides
+    apparaîtront. Le contrat doit échouer sans qu'on ait pensé à ce cas précis.
+    """
+    report = check_team_contract(
+        source_names=[n for n in BDL_NAMES if n != "Chicago Sky"] + ["Sky"],
+        aliases=team_aliases(load_config(), "basketball_wnba"),
+        known_teams=WNBA_TEAMS,
+    )
+    assert not report.ok
+    assert any("Sky" in error and "non résoluble" in error for error in report.errors)
+    # Et dans l'autre sens : Chicago Sky n'est plus produite par personne.
+    assert any("jamais produite" in error and "Chicago Sky" in error
+               for error in report.errors)
+
+
+def test_a_team_never_produced_by_the_source_fails_even_without_orphan():
+    """Second sens du contrôle, isolé : rien d'orphelin, mais une équipe manque.
+
+    Un échantillon trop court tombe dans ce cas — et c'est voulu : un contrat qu'on
+    n'a pas démontré ne vaut rien, il ne doit pas passer pour vérifié.
+    """
+    report = check_team_contract(
+        source_names=["Las Vegas Aces"],
+        aliases={},
+        known_teams=["Las Vegas Aces", "Seattle Storm"],
+    )
+    assert not report.ok
+    assert len(report.errors) == 1
+    assert "Seattle Storm" in report.errors[0]
+
+
+def test_a_dead_alias_is_an_error_never_an_omission():
+    """Un alias visant une équipe inexistante lève — une faute de frappe ne s'ignore pas."""
+    report = check_team_contract(
+        source_names=["Storm"],
+        aliases={"storm": "Seatle Storm"},      # faute de frappe volontaire
+        known_teams=["Seattle Storm"],
+    )
+    assert not report.ok
+    assert any("Alias mort" in error for error in report.errors)
+
+    with pytest.raises(TeamContractError, match="Alias mort"):
+        build_canonical_resolver(aliases={"storm": "Seatle Storm"},
+                                 known_teams=["Seattle Storm"])
+
+
+def test_an_alias_whose_source_disappeared_is_only_a_warning():
+    """Le jour où balldontlie renseignera la ville, l'alias devient inutile — pas fautif.
+
+    Il ne doit pas arrêter un backfill : c'est une bonne nouvelle, signalée pour qu'on
+    puisse nettoyer la configuration.
+    """
+    report = check_team_contract(
+        source_names=["Portland Fire"],
+        aliases={"fire": "Portland Fire"},
+        known_teams=["Portland Fire"],
+    )
+    assert report.ok
+    assert any("inutilisé" in warning for warning in report.warnings)
+
+
+def test_resolver_produces_the_key_the_read_path_will_query():
+    """La clé écrite doit être exactement celle que `get_team_rating` interrogera.
+
+    C'est la propriété qui manquait et qui aurait laissé deux franchises sur quinze
+    sans modèle, en silence : le read path interroge par nom The Odds API, en égalité
+    stricte.
+    """
+    resolve = build_canonical_resolver(
+        aliases=team_aliases(load_config(), "basketball_wnba"),
+        known_teams=WNBA_TEAMS,
+    )
+    assert resolve("Tempo") == normalize_team("Toronto Tempo")
+    assert resolve("Toronto Tempo") == normalize_team("Toronto Tempo")
+    assert resolve("Seattle Storm") == "seattle storm"
+
+
+def test_resolver_refuses_to_invent_a_key_for_an_unknown_team():
+    """Une note écrite sous une clé approximative serait invisible : pire qu'absente."""
+    resolve = build_canonical_resolver(aliases={}, known_teams=WNBA_TEAMS)
+    with pytest.raises(TeamContractError, match="non résoluble"):
+        resolve("Tempo")
+
+
+def test_resolver_is_stricter_than_teams_match_on_purpose():
+    """`teams_match` apparie par inclusion ; une clé primaire ne se déduit pas ainsi.
+
+    'Tempo' s'apparie bien à 'Toronto Tempo' pour retrouver un match, mais sans alias
+    déclaré il ne doit produire AUCUNE clé — sinon la clé dépendrait d'une comparaison
+    floue sur une table dont toute la protection est `UNIQUE(sport, team)`.
+    """
+    assert teams_match("Tempo", "Toronto Tempo")
+    resolve = build_canonical_resolver(aliases={}, known_teams=["Toronto Tempo"])
+    with pytest.raises(TeamContractError):
+        resolve("Tempo")
 
 
 # ─────────────────────────── client balldontlie ───────────────────────────

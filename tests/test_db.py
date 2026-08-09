@@ -13,6 +13,7 @@ import pytest
 from common.db import (
     _normalized_team_key,
     count_rating_history,
+    delete_backfill_ratings,
     get_connection,
     get_team_rating,
     get_team_ratings,
@@ -105,6 +106,79 @@ def test_foreign_key_is_enforced(db):
 # et le contrat de normalisation.
 
 WNBA, NBA = "basketball_wnba", "basketball_nba"
+
+
+def _history(db, **kwargs):
+    """Écrit une variation avec des valeurs par défaut plausibles."""
+    insert_rating_history(db, **{
+        "sport": WNBA, "team": "las vegas aces", "game_date": "2026-08-05",
+        "source": "backfill", "source_game_id": "1", "match_id": None,
+        "opponent": "Seattle Storm", "is_home": True, "rating_before": 1500.0,
+        "rating_after": 1512.0, "expected_win": 0.55,
+        "created_at": "2026-08-09T09:00:00Z", **kwargs,
+    })
+
+
+def test_delete_backfill_ratings_is_bounded_to_one_league(db):
+    """La purge ne touche jamais une autre ligue : deux échelles Elo indépendantes.
+
+    La base est partagée entre ligues ; une purge non bornée effacerait les notes NBA
+    en rejouant la WNBA, sans le moindre signal.
+    """
+    _rating(db, sport=WNBA, team="las vegas aces", display_name="Las Vegas Aces")
+    _rating(db, sport=NBA, team="boston celtics", display_name="Boston Celtics")
+    _history(db, sport=WNBA, source_game_id="1")
+    _history(db, sport=NBA, team="boston celtics", source_game_id="2")
+
+    history, ratings = delete_backfill_ratings(db, WNBA)
+    db.commit()
+
+    assert (history, ratings) == (1, 1)
+    assert count_rating_history(db, WNBA) == 0
+    assert count_rating_history(db, NBA) == 1
+    assert get_team_rating(db, NBA, "boston celtics") is not None
+    assert get_team_rating(db, WNBA, "las vegas aces") is None
+
+
+def test_delete_backfill_ratings_refuses_when_the_evaluator_contributed(db):
+    """Refus si l'évaluateur a alimenté l'historique (lot 4).
+
+    `team_ratings` porterait alors un état que le rejeu seul ne reconstruit pas :
+    l'effacer perdrait de la donnée en silence. Mieux vaut un refus bruyant qu'une
+    purge qui paraît réussir.
+    """
+    _rating(db, sport=WNBA, team="las vegas aces", display_name="Las Vegas Aces")
+    _history(db, source="evaluator", source_game_id="9")
+
+    with pytest.raises(ValueError, match="évaluateur"):
+        delete_backfill_ratings(db, WNBA)
+
+    # Rien n'a été supprimé : le refus précède toute écriture.
+    assert count_rating_history(db, WNBA) == 1
+    assert get_team_rating(db, WNBA, "las vegas aces") is not None
+
+
+def test_delete_backfill_ratings_on_an_empty_league_is_a_no_op(db):
+    assert delete_backfill_ratings(db, WNBA) == (0, 0)
+
+
+def test_a_purge_then_rewrite_cycle_leaves_no_duplicate(db):
+    """Le cycle réel de `--replace` : purge et réécriture dans la même transaction.
+
+    Sans la purge, la seconde écriture buterait sur l'index unique
+    `(sport, team, source_game_id)` — c'est cette contrainte qui rend le rejeu
+    idempotent, et la purge qui le rend rejouable.
+    """
+    _rating(db, display_name="Las Vegas Aces")
+    _history(db, source_game_id="1")
+
+    delete_backfill_ratings(db, WNBA)
+    _rating(db, display_name="Las Vegas Aces", rating=1530.0)
+    _history(db, source_game_id="1", rating_after=1530.0)
+    db.commit()
+
+    assert count_rating_history(db, WNBA, "backfill") == 1
+    assert get_team_rating(db, WNBA, "las vegas aces")["rating"] == 1530.0
 
 
 def _rating(db, **kwargs):
