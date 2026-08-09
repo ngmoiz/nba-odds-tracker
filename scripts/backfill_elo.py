@@ -452,22 +452,29 @@ def backup_database(db_path: Path, gate: Gate) -> Path | None:
 
 
 def write_ratings(conn: sqlite3.Connection, sport: str, states: dict, applications: list,
-                  gate: Gate, journal: dict, *, replace: bool) -> bool:
+                  gate: Gate, journal: dict, *, replace: bool, rebuild: bool = False) -> bool:
     """Écrit les deux tables dans une seule transaction, puis vérifie l'intact."""
     before = _census(conn)
     fingerprint_before = _evaluations_fingerprint(conn)
     print("  Recensement avant : " + ", ".join(f"{k}={v}" for k, v in before.items()))
 
     existing = db.count_rating_history(conn, sport, "backfill")
-    if existing and not replace:
-        gate.fail(f"Un backfill est déjà présent pour {sport} ({existing} lignes)",
-                  "relancer avec --replace pour le remplacer")
+    total = db.count_rating_history(conn, sport)
+    if total and not (replace or rebuild):
+        gate.fail(f"Des notes existent déjà pour {sport} ({total} lignes)",
+                  "relancer avec --replace (backfill seul) ou --rebuild (tout, après un trou)")
         return False
 
     stamp = datetime.now(timezone.utc).isoformat()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        if replace and existing:
+        if rebuild and total:
+            # Réparation après trou : on repart de zéro, toutes sources confondues. Sûr
+            # parce que ces tables sont dérivées — le rejeu les régénère intégralement.
+            history, ratings = db.delete_all_ratings(conn, sport)
+            print(f"  Reconstruction    : {history} historique(s), {ratings} note(s) purgés "
+                  f"(toutes sources)")
+        elif replace and existing:
             history, ratings = db.delete_backfill_ratings(conn, sport)
             print(f"  Purge préalable   : {history} historique(s), {ratings} note(s)")
 
@@ -616,7 +623,7 @@ def run(conn: sqlite3.Connection, config: dict, settings, args) -> int:
             db.init_db(Path(settings.database_path))
             print("  Schéma            : init_db appliqué (tables du lot 2 créées au besoin)")
             write_ratings(conn, sport, states, applications, gate, journal,
-                          replace=args.replace)
+                          replace=args.replace, rebuild=args.rebuild)
 
     print("\n" + "═" * WIDTH)
     if gate.failures:
@@ -645,6 +652,9 @@ def main() -> None:
                         help="écrit en base (sauvegarde horodatée créée et relue avant)")
     parser.add_argument("--replace", action="store_true",
                         help="purge le backfill précédent de cette ligue avant de réécrire")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="RÉPARATION : purge TOUTES les notes (backfill + évaluateur) "
+                             "puis rejoue la saison. À utiliser après un trou d'intégration.")
     parser.add_argument("--offline", action="store_true",
                         help="interdit tout accès réseau : échoue sur un défaut de cache")
     parser.add_argument("--cache-dir", default=None,

@@ -979,6 +979,94 @@ def insert_rating_history(
     )
 
 
+def get_known_teams(conn: sqlite3.Connection, sport: str) -> list[str]:
+    """Équipes suivies pour une ligue, telles que nommées par The Odds API.
+
+    C'est l'**autorité de la clé canonique** (contrat du lot 3) : le résolveur des
+    producteurs de notes se construit sur cette liste, et le read path interroge
+    `team_ratings` par égalité stricte sur la forme normalisée de ces noms.
+
+    Filtrage par `sport` obligatoire : la base est partagée entre ligues, et un
+    résolveur construit sur l'union des ligues accepterait une équipe NBA dans un
+    rejeu WNBA.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT home_team AS team FROM matches WHERE sport = ? "
+        "UNION SELECT DISTINCT away_team FROM matches WHERE sport = ? "
+        "ORDER BY team",
+        (sport, sport),
+    ).fetchall()
+    return [row["team"] for row in rows]
+
+
+def get_recent_game_dates(
+    conn: sqlite3.Connection, sport: str, team: str, *, since: str, until: str
+) -> list[str]:
+    """Dates de matchs d'une équipe dans `[since, until]` (bornes incluses).
+
+    Reconstruit `analyzer.ratings.TeamState.recent_dates`, qui n'est **pas** persisté.
+    La reconstruction est *exacte*, pas approchée, et la preuve tient en deux lignes :
+
+    - `ratings._advance` élague à chaque match sur `played >= game_date - 3 j` puis
+      ajoute la date du jour. Par récurrence, après le match du jour `L` le tuple vaut
+      exactement l'ensemble des dates de matchs de l'équipe dans `[L-3, L]` ;
+    - `ratings.rest_context`, appelé pour un match à venir en `d >= L`, refiltre de
+      toute façon sur `d-3 <= played <= d`.
+
+    Le tuple en mémoire ne porte donc aucune information que cette requête ne rende.
+    `rating_history` couvrant backfill **et** évaluateur, la fenêtre est reconstruite
+    sans trou à la jonction des deux sources.
+
+    `DISTINCT` par prudence : une équipe ne joue qu'une fois par jour, mais un doublon
+    gonflerait le comptage « 3 matchs en 4 nuits ». Les dates sont en ISO
+    `YYYY-MM-DD`, donc la comparaison lexicographique de SQLite est correcte.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT game_date FROM rating_history "
+        "WHERE sport = ? AND team = ? AND game_date >= ? AND game_date <= ? "
+        "ORDER BY game_date",
+        (sport, team, since, until),
+    ).fetchall()
+    return [row["game_date"] for row in rows]
+
+
+def get_latest_rating_history_date(conn: sqlite3.Connection, sport: str) -> str | None:
+    """Date du match le plus récent intégré aux notes, ou `None` si aucun.
+
+    Sert à **prouver** un trou d'intégration plutôt qu'à le soupçonner : si cette date
+    est antérieure au début de la fenêtre que l'évaluateur peut encore interroger, les
+    matchs de l'intervalle ne seront jamais appliqués — la fenêtre glissante est passée
+    devant eux. C'est le scénario « machine éteinte un week-end », et il est silencieux
+    par nature : les notes restent plausibles, simplement fausses.
+    """
+    row = conn.execute(
+        "SELECT MAX(game_date) AS latest FROM rating_history WHERE sport = ?", (sport,)
+    ).fetchone()
+    return row["latest"] if row and row["latest"] else None
+
+
+def rating_history_has_game(
+    conn: sqlite3.Connection, sport: str, source_game_id: str
+) -> bool:
+    """Ce match a-t-il déjà été intégré aux notes de cette ligue ?
+
+    Clé d'idempotence du write path : un match déjà appliqué ne doit **jamais** être
+    recompté, quelle que soit la source qui l'a intégré (le backfill et l'évaluateur
+    partagent l'espace de noms des identifiants balldontlie).
+
+    Pré-vérification de **contrôle de flux** — re-voir un match dans la fenêtre
+    glissante de l'évaluateur est un fonctionnement normal, pas une anomalie. La
+    contrainte `UNIQUE(sport, team, source_game_id)` reste le filet de dernier
+    recours : elle, elle est bruyante, parce qu'y arriver signifierait que cette
+    pré-vérification a été contournée.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM rating_history WHERE sport = ? AND source_game_id = ? LIMIT 1",
+        (sport, source_game_id),
+    ).fetchone()
+    return row is not None
+
+
 def count_rating_history(
     conn: sqlite3.Connection, sport: str, source: str | None = None
 ) -> int:
@@ -1027,6 +1115,35 @@ def delete_backfill_ratings(conn: sqlite3.Connection, sport: str) -> tuple[int, 
 
     history = conn.execute(
         "DELETE FROM rating_history WHERE sport = ? AND source = 'backfill'", (sport,)
+    ).rowcount
+    ratings = conn.execute(
+        "DELETE FROM team_ratings WHERE sport = ?", (sport,)
+    ).rowcount
+    return history, ratings
+
+
+def delete_all_ratings(conn: sqlite3.Connection, sport: str) -> tuple[int, int]:
+    """Purge **toutes** les notes d'une ligue, quelle qu'en soit la source.
+
+    Contrepartie assumée de `delete_backfill_ratings`, qui refuse d'effacer dès que
+    l'évaluateur a contribué — refus justifié pour un *remplacement de backfill*, qui
+    laisserait alors la base dans un état que le rejeu seul ne reconstruit pas.
+
+    Ici l'intention est l'inverse : **tout reconstruire**. C'est l'opération de
+    réparation après un trou d'intégration (évaluateur arrêté au-delà de la fenêtre
+    glissante), et elle est sûre pour une raison précise — ces deux tables sont
+    **dérivées** : les résultats balldontlie suffisent à les régénérer intégralement.
+    Aucune donnée n'est perdue, seulement recalculée.
+
+    Existe parce que la procédure de réparation doit être **exécutable** le jour du
+    trou. Une procédure seulement décrite se réinvente sous pression, c'est-à-dire mal.
+    Son consommateur est livré avec elle (`scripts/backfill_elo.py --rebuild`).
+
+    Ne committe pas : purge et réécriture doivent tenir dans une seule transaction.
+    Renvoie `(lignes d'historique, notes)` supprimées.
+    """
+    history = conn.execute(
+        "DELETE FROM rating_history WHERE sport = ?", (sport,)
     ).rowcount
     ratings = conn.execute(
         "DELETE FROM team_ratings WHERE sport = ?", (sport,)

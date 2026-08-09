@@ -15,6 +15,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+from analyzer import shadow
 from analyzer.preprocessing import preprocess
 from analyzer.rules import ALERT_RULES, ALL_RULES, parse_state_key
 from analyzer.scoring import evaluate_rules, movement_score
@@ -123,6 +124,28 @@ def analyze_match(conn: sqlite3.Connection, match: sqlite3.Row, config: dict, no
             logger.info("Verdict %s pour %s (score %d).", verdict_type, match_id, verdict.signal_score)
         elif match["status"] == "DECIDE":
             verdict_type = _redecide(conn, match_id, decide(data, results, config), now_iso)
+
+        # Mode shadow (B5 lot 4) : le modèle donne son avis APRÈS que la décision est
+        # écrite. Le placement n'est pas cosmétique — il rend l'innocuité structurelle
+        # plutôt que conventionnelle : le shadow lit un verdict déjà pris, il n'a aucun
+        # chemin par lequel l'influencer. Il n'écrit rien, et toute défaillance de sa
+        # part est absorbée ici : un modèle qui observe ne casse pas un outil qui décide.
+        if (config.get("model") or {}).get("shadow", False):
+            try:
+                current = db.get_current_verdict(conn, match_id)
+                logger.info(
+                    "%s",
+                    shadow.observe(
+                        conn, match, data, config,
+                        verdict_id=current["id"] if current else None,
+                        verdict=current["verdict"] if current else None,
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — observation seule, jamais bloquante
+                logger.exception(
+                    "Shadow Elo : calcul échoué pour %s (verdict et alertes intacts).",
+                    match_id,
+                )
 
     return {"alerts": alerts, "verdict": verdict_type, "score": movement_score(results)}
 

@@ -22,6 +22,7 @@ from common.logging_config import get_logger
 from common.results_api_client import ResultsApiClient
 from evaluator.clv import compute_clv
 from evaluator.grading import grade_verdict
+from evaluator.ratings_update import update_ratings_from_games
 from evaluator.reconcile import find_result, tipoff_calendar_date
 from evaluator.reporting import EvalLine, format_daily_report, format_degraded_report
 from evaluator.weekly import format_weekly_report
@@ -160,6 +161,29 @@ def evaluate_pending(
         db.update_match_status(conn, match["match_id"], "EVALUE")
 
     conn.commit()
+
+    # ── Notes Elo (B5 lot 4) ────────────────────────────────────────────────────
+    # Placé APRÈS le commit ci-dessus, délibérément : les évaluations, le CLV et les
+    # transitions CLOS → EVALUE sont durables avant qu'une seule note ne soit touchée.
+    # Une défaillance du modèle ne peut donc pas coûter un bilan — c'est la leçon du
+    # micro-lot §0, où une garde bien intentionnée avait supprimé le service qu'elle
+    # protégeait. Le filet large en est le corollaire : on logge et on continue.
+    #
+    # `summary` n'est PAS enrichi : sa forme sert de marqueur de non-régression d'un
+    # déploiement à l'autre (journal des 07/08/09-08). Les compteurs partent à part.
+    if (config.get("model") or {}).get("ratings_write_path", False):
+        try:
+            counters = update_ratings_from_games(
+                conn, config, games,
+                sport=config["api"]["sport"],
+                window_start=start_date,
+                now=now,
+            )
+            logger.info("Notes Elo mises à jour : %s", counters)
+        except Exception:  # noqa: BLE001 — jamais au prix du bilan quotidien
+            logger.exception(
+                "Mise à jour des notes Elo échouée — évaluations et bilan préservés."
+            )
 
     # Correctif 6 : Idempotence du bilan quotidien via clé meta daily_report_sent_YYYY-MM-DD.
     # Un bilan déjà envoyé pour une journée ne doit pas partir une seconde fois.

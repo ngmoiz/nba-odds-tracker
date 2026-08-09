@@ -91,22 +91,34 @@ decision:
 # ─────────────────────────────────────────────────────────────
 # --- Modèle de force Elo (V1.1, chantier B5) ---
 #
-# ⚠️ BLOC INERTE — AUCUN LECTEUR EN PRODUCTION tant que B5 n'est pas activé.
+# ⚠️ LU EN PRODUCTION DEPUIS LE LOT 4 — mais AUCUNE DÉCISION n'en dépend.
 #
-# Seul `analyzer/model.py` (fonctions pures) lit ces valeurs, et il n'est appelé
-# par aucun composant du pipeline : ni le collecteur, ni l'analyseur, ni le
-# notificateur, ni l'évaluateur. Aucune décision (verdict, alerte, score) ne
-# dépend de ce bloc aujourd'hui. Il est présent pour que `params_from_config`
-# soit testable sur la vraie configuration plutôt que sur un dict fabriqué.
+# Distinction à ne pas perdre, c'est tout l'enjeu de l'étape en cours :
+#   • l'évaluateur LIT ce bloc pour entretenir les notes (write path) ;
+#   • l'analyseur le LIT pour calculer et journaliser un edge (mode shadow) ;
+#   • aucun verdict, aucune alerte, aucun score ne le consulte.
+# Modifier une valeur ici change donc les notes et les lignes SHADOW des logs,
+# mais ne peut pas changer un verdict. `edge_threshold_prob` (τ) en particulier
+# n'a toujours AUCUN lecteur : comparer l'edge à un seuil est un acte de décision.
 #
-# Le branchement se fera en deux temps, dans des sessions ultérieures :
-#   1. mode shadow  — `edge` calculé et loggé, JAMAIS bloquant, logic_version inchangée
-#   2. activation   — règle hybride bloquante, bump DECISION_LOGIC_VERSION → 4, nouveau J0
-# Tant que ces sessions n'ont pas eu lieu, modifier une valeur ici ne change
-# RIEN au comportement de l'outil. Ne pas en déduire que le modèle tourne.
+# Il reste une étape avant que le modèle décide :
+#   activation — règle hybride bloquante, bump DECISION_LOGIC_VERSION → 4, nouveau J0.
 # ─────────────────────────────────────────────────────────────
 model:
-  enabled: false              # INERTE : aucun code ne lit ce drapeau pour l'instant
+  enabled: false              # INERTE : aucune DÉCISION ne dépend du modèle (activation = lot v4)
+  # ── Lot 4 : le modèle observe et s'entretient, il ne décide toujours pas ──
+  # Ces deux drapeaux sont volontairement SÉPARÉS de `enabled` : celui-ci signifie
+  # « le modèle influence les verdicts », et il doit rester à false pendant que les
+  # notes vivent et que l'edge s'observe. Les confondre reviendrait à ne pouvoir
+  # regarder le modèle qu'en lui donnant déjà le pouvoir.
+  shadow: true                # edge calculé et LOGGÉ au verdict ; aucune écriture, aucun effet
+  ratings_write_path: true    # l'évaluateur entretient les notes après chaque match terminé
+  ratings:
+    gap_warning_days: 3       # au-delà de N jours sans match intégré pour une équipe,
+                              # avertissement « trou probable » (une vraie coupure de
+                              # calendrier le déclenche aussi : c'est un « va regarder »,
+                              # pas un diagnostic). Le trou PROUVÉ au niveau de la ligue
+                              # est détecté séparément, sans seuil.
   elo:
     initial_rating: 1500      # note de départ d'une équipe inconnue
     k_factor: 20              # facteur d'apprentissage de base

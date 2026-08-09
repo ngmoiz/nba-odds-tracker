@@ -25,6 +25,8 @@ from analyzer.ratings import (
     replay,
     rest_context,
     sort_games,
+    forecast,
+    rest_window_start,
     unusable_reason,
 )
 from common.config import load_config
@@ -373,3 +375,49 @@ def test_a_tie_is_rejected_rather_than_graded():
     """
     with pytest.raises(ValueError, match="Marge de victoire nulle"):
         run([game("2026-05-02", HOME, AWAY, 80, 80)])
+
+
+# ──────────── primitive de pronostic partagée (B5 lot 4) ────────────
+
+
+def test_forecast_is_the_single_prediction_used_by_replay_and_holdout():
+    """`apply_game` et `predict_only` passent tous deux par `forecast`.
+
+    Le mode shadow appelle `forecast` directement : sans cette égalité, la probabilité
+    observée en production ne serait pas celle dont le lot 3 a mesuré la vraisemblance,
+    et les deux calculs pourraient dériver sans que rien ne le signale.
+    """
+    states, _ = run([game("2026-08-01", HOME, AWAY, 90, 80)])
+    prochain = game("2026-08-04", HOME, THIRD, 95, 90)
+    jour = date(2026, 8, 4)
+
+    attendu = forecast(states[normalize_team(HOME)],
+                       states.get(normalize_team(THIRD)) or TeamState.initial(P),
+                       jour, P)
+
+    _, application = apply_game(states, prochain, P, normalize=normalize_team)
+    _, holdout = predict_only(states, prochain, P, normalize=normalize_team)
+
+    assert application.expected_home == attendu.expected_home
+    assert application.home_advantage == attendu.home_advantage
+    assert holdout == attendu.expected_home
+
+
+def test_forecast_reports_the_rest_context_that_produced_it():
+    """Le contexte accompagne le pronostic : un `expected_home` surprenant reste lisible."""
+    states, _ = run([game("2026-08-03", HOME, AWAY, 90, 80)])
+
+    veille = forecast(states[normalize_team(HOME)], states[normalize_team(AWAY)],
+                      date(2026, 8, 4), P)
+    repos = forecast(states[normalize_team(HOME)], states[normalize_team(AWAY)],
+                     date(2026, 8, 10), P)
+
+    assert veille.home_days_rest == 1 and veille.away_days_rest == 1
+    assert repos.home_days_rest == 7
+    # Les deux équipes enchaînent : le malus s'annule, l'avantage terrain reste nominal.
+    assert veille.home_advantage == repos.home_advantage
+
+
+def test_rest_window_start_is_the_single_definition_of_the_four_night_window():
+    """La fenêtre a une seule définition, partagée avec la reconstruction en base."""
+    assert rest_window_start(date(2026, 8, 10)) == date(2026, 8, 7)

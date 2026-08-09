@@ -185,6 +185,17 @@ def sort_games(games: Iterable[GameResult]) -> list[GameResult]:
     return sorted(games, key=lambda game: (game.game_date, game.game_id or ""))
 
 
+def rest_window_start(game_date: date) -> date:
+    """Première date qui compte encore dans la fenêtre « 3 matchs en 4 nuits ».
+
+    Exposée parce que le write path doit **reconstruire** `TeamState.recent_dates`
+    depuis `rating_history` (la colonne n'est pas persistée). Lui faire refaire
+    l'arithmétique de son côté rouvrirait la possibilité que les deux fenêtres
+    divergent d'un jour, ce qu'aucun test d'un seul des deux côtés ne verrait.
+    """
+    return game_date - timedelta(days=_FOUR_NIGHT_WINDOW)
+
+
 def rest_context(state: TeamState, game_date: date) -> tuple[int | None, int | None]:
     """Jours de repos et nombre de matchs sur 4 nuits, pour un match à `game_date`.
 
@@ -207,14 +218,66 @@ def rest_context(state: TeamState, game_date: date) -> tuple[int | None, int | N
             f"chronologique, sans quoi les notes intègrent le futur."
         )
 
-    window_start = game_date - timedelta(days=_FOUR_NIGHT_WINDOW)
+    window_start = rest_window_start(game_date)
     previous = sum(1 for played in state.recent_dates if window_start <= played <= game_date)
     return (days_rest, previous + 1)
 
 
+@dataclass(frozen=True)
+class Forecast:
+    """Pronostic d'un match à venir, avec le contexte qui l'a produit.
+
+    Le contexte n'est pas décoratif : c'est lui qui permet de lire un `expected_home`
+    surprenant sans rouvrir le calcul (« l'avantage terrain est retombé à 12 parce que
+    l'équipe à domicile enchaîne un back-to-back »).
+    """
+
+    expected_home: float
+    home_advantage: float
+    home_days_rest: int | None
+    home_games_in_four_nights: int | None
+    away_days_rest: int | None
+    away_games_in_four_nights: int | None
+
+
+def forecast(
+    home_state: TeamState,
+    away_state: TeamState,
+    game_date: date,
+    params: EloParams,
+) -> Forecast:
+    """Probabilité de victoire à domicile, repos des deux équipes pris en compte.
+
+    Primitive **partagée** : `apply_game` (rejeu), `predict_only` (hold-out) et le mode
+    shadow de l'analyseur passent tous par ici. C'est ce qui garantit que la probabilité
+    observée en production est produite par le même calcul que celui dont le lot 3 a
+    mesuré la vraisemblance — une seconde implémentation, même fidèle le jour où elle
+    est écrite, dériverait ensuite sans que rien ne le signale.
+    """
+    home_rest, home_four = rest_context(home_state, game_date)
+    away_rest, away_four = rest_context(away_state, game_date)
+    advantage = contextual_home_advantage(
+        home_days_rest=home_rest,
+        home_games_in_four_nights=home_four,
+        away_days_rest=away_rest,
+        away_games_in_four_nights=away_four,
+        params=params,
+    )
+    return Forecast(
+        expected_home=expected_home_win(
+            home_state.rating, away_state.rating, home_advantage=advantage
+        ),
+        home_advantage=advantage,
+        home_days_rest=home_rest,
+        home_games_in_four_nights=home_four,
+        away_days_rest=away_rest,
+        away_games_in_four_nights=away_four,
+    )
+
+
 def _advance(state: TeamState, game_date: date, rating_after: float) -> TeamState:
     """État de l'équipe après le match : note, compteur, et fenêtre élaguée."""
-    window_start = game_date - timedelta(days=_FOUR_NIGHT_WINDOW)
+    window_start = rest_window_start(game_date)
     kept = tuple(played for played in state.recent_dates if played >= window_start)
     return replace(
         state,
@@ -255,16 +318,13 @@ def apply_game(
     home_state = states.get(home_key) or TeamState.initial(params)
     away_state = states.get(away_key) or TeamState.initial(params)
 
-    home_rest, home_four = rest_context(home_state, game_date)
-    away_rest, away_four = rest_context(away_state, game_date)
+    prediction = forecast(home_state, away_state, game_date, params)
+    home_rest = prediction.home_days_rest
+    home_four = prediction.home_games_in_four_nights
+    away_rest = prediction.away_days_rest
+    away_four = prediction.away_games_in_four_nights
+    advantage = prediction.home_advantage
 
-    advantage = contextual_home_advantage(
-        home_days_rest=home_rest,
-        home_games_in_four_nights=home_four,
-        away_days_rest=away_rest,
-        away_games_in_four_nights=away_four,
-        params=params,
-    )
     # Le régime accéléré vaut tant que l'une des deux notes est encore immature.
     k = k_for(min(home_state.games_played, away_state.games_played), params)
 
@@ -342,17 +402,7 @@ def predict_only(
     home_state = states.get(home_key) or TeamState.initial(params)
     away_state = states.get(away_key) or TeamState.initial(params)
 
-    home_rest, home_four = rest_context(home_state, game_date)
-    away_rest, away_four = rest_context(away_state, game_date)
-    advantage = contextual_home_advantage(
-        home_days_rest=home_rest,
-        home_games_in_four_nights=home_four,
-        away_days_rest=away_rest,
-        away_games_in_four_nights=away_four,
-        params=params,
-    )
-    expected = expected_home_win(home_state.rating, away_state.rating,
-                                 home_advantage=advantage)
+    expected = forecast(home_state, away_state, game_date, params).expected_home
 
     advanced = dict(states)
     advanced[home_key] = _advance(home_state, game_date, home_state.rating)
