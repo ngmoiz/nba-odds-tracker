@@ -434,12 +434,34 @@ des autres) est une **opinion chiffrée indépendante sur l'issue**, confrontée
 - B4 cooldown / anti-corrélation (1-2 expositions corrélées par soirée).
 - B5 **modèle de force baseline (Elo + marge de victoire + avantage terrain + repos/B2B) → `p_model`** ;
   décision **hybride** : `SIGNAL` seulement si `sign(move)` cohérent **ET** `|p_model − p_mkt| > τ`.
-  **Pré-requis backfill** : rejouer la **saison WNBA complète** via balldontlie (la base n'a qu'~1
-  semaine à mi-saison ; démarrer à 1500 rendrait `p_model` faux et `min_games_for_edge` jamais
-  satisfait). **Pré-requis endpoint levé** (2026-07-18, vérifié 2026-08-07) : le chemin balldontlie
-  est routé par ligue (`results.games_paths` ↔ `api.sport`), WNBA inclus. Réserves restantes du
-  backfill (rate limit 5 req/min, borne anti-boucle sur le curseur, `GameResult` sans `id`/`season`,
-  fuseau de la date WNBA, garde score `null`) : voir le journal du 2026-08-07.
+
+  > **STATUT AU 2026-08-09 — le plan ci-dessous reste la référence, mais il est déjà réalisé en
+  > partie.** Le détail de chaque lot, avec ses preuves, est au journal des décisions ; ce bloc
+  > n'en donne que l'état.
+  >
+  > | Lot | Contenu | État |
+  > |---|---|---|
+  > | Session 1 | `analyzer/model.py` — Elo pur (MOV, avantage terrain, repos), aucun appelant | ✅ livré |
+  > | Lot 1 | Client balldontlie durci : étranglement 5 req/min + retry 429, bornes de pagination, champs `id`/`season`/`postseason`, fuseau des dates | ✅ livré (1a `5eba224`, 1b `e90e931`) |
+  > | Lot 2 | Tables `team_ratings` / `rating_history` + accès, inertes | ✅ livré (`50f1eba`) |
+  > | Lot 3 | Backfill de la saison complète : 239 matchs rejoués, 15 notes, 478 lignes d'historique **en base**. Vraisemblance prouvée (walk-forward log-loss 0,6032 vs 0,6931, **−13 %** ; hold-out gelé −12,6 % ; contrôle négatif 0,8530) et classement validé contre le classement WNBA réel (**8 rangs sur 15 exacts**, aucun écart > 3) | ✅ livré (`15c97d5`) |
+  > | Lot 4 | Write path de l'évaluateur (mise à jour des notes à `CLOS → EVALUE`) + read path en **shadow** (edge loggé, jamais bloquant) + **rebuild d'image obligatoire** — les conteneurs tournent encore sur du code antérieur au lot 2 | 🔜 en cours |
+  > | Activation | Règle hybride **bloquante** : bump `DECISION_LOGIC_VERSION` → 4, **2ᵉ J0** | ⏳ à venir |
+  >
+  > **Aucune décision n'est influencée à ce jour** : `DECISION_LOGIC_VERSION` reste à `2` et
+  > `model.enabled` à `false`. Les notes existent, personne ne les lit encore.
+
+  **Pré-requis backfill — levé** : la saison WNBA 2026 complète a été rejouée via balldontlie
+  (lot 3). L'inquiétude d'origine — la base ne contenait qu'~1 semaine de matchs à mi-saison,
+  donc démarrer toutes les équipes à 1500 aurait rendu `p_model` faux pendant des semaines et
+  n'aurait jamais satisfait `min_games_for_edge` — ne s'applique plus : les 15 franchises portent
+  entre 30 et 34 matchs intégrés. **Pré-requis endpoint levé** (2026-07-18, vérifié 2026-08-07) :
+  le chemin balldontlie est routé par ligue (`results.games_paths` ↔ `api.sport`), WNBA inclus.
+  **Réserves du backfill traitées** (rate limit 5 req/min, borne anti-boucle sur le curseur,
+  `GameResult` sans `id`/`season`, fuseau de la date WNBA, garde score `null`) : voir le journal
+  des 2026-08-07 à 2026-08-09 — les quatre premières aux lots 1a/1b, la garde score `null` au
+  micro-lot §0 puis élargie au lot 3 (tout match nul déclaré terminé est écarté et nommé, cas
+  réel rencontré).
 
 **Séquencement des versions de logique** (évite de multiplier les resets de cohorte) :
 - **v3** = B1+B2+B3+B4 + code du kill-switch A3 → 1er J0.
