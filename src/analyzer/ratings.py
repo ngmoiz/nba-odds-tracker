@@ -410,6 +410,33 @@ def predict_only(
     return advanced, expected
 
 
+def mature_applications(
+    applications: Sequence[GameApplication], *, min_games: int
+) -> tuple[list[GameApplication], int]:
+    """Garde les matchs dont **les deux** équipes avaient des notes mûres. Rend `(gardés, écartés)`.
+
+    Raison d'être, et elle n'est pas cosmétique : en début de saison toutes les notes
+    valent `initial_rating`, si bien que `expected_win` ne mesure guère plus que
+    l'avantage du terrain. Inclure ces prédictions dans une mesure de calibration
+    aplatit la courbe vers 0,5 et **fabrique une sur-confiance apparente** dans les
+    tranches extrêmes — c'est exactement ce qui a faussé la première lecture du
+    2026-08-09, corrigée le lendemain (journal). Ce filtre porte donc une conclusion,
+    d'où son test dédié plutôt qu'une ligne enfouie dans un script.
+
+    Le seuil s'applique à la **moins mûre** des deux équipes (`min`), même règle que le
+    facteur K : une prédiction n'est fiable que si les deux notes le sont. Prendre le
+    `max` laisserait passer un match où une équipe fraîche est encore à 1500.
+
+    Fonction pure, sans base ni configuration : le seuil est un argument
+    (`model.decision.min_games_for_edge` côté appelant, règle 0.4.7).
+    """
+    gardes = [
+        app for app in applications
+        if min(app.home.games_played_before, app.away.games_played_before) >= min_games
+    ]
+    return gardes, len(applications) - len(gardes)
+
+
 def replay(
     games: Sequence[GameResult],
     params: EloParams,

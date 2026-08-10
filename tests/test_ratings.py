@@ -26,6 +26,7 @@ from analyzer.ratings import (
     rest_context,
     sort_games,
     forecast,
+    mature_applications,
     rest_window_start,
     unusable_reason,
 )
@@ -421,3 +422,70 @@ def test_forecast_reports_the_rest_context_that_produced_it():
 def test_rest_window_start_is_the_single_definition_of_the_four_night_window():
     """La fenêtre a une seule définition, partagée avec la reconstruction en base."""
     assert rest_window_start(date(2026, 8, 10)) == date(2026, 8, 7)
+
+
+# ──────── Filtre de maturité (B5 lot 4 — la logique qui a renversé une conclusion) ────────
+
+
+def _saison(n: int):
+    """`n` matchs alternés entre deux équipes : games_played_before vaut 0, 1, 2, …"""
+    return [game(f"2026-06-{jour + 1:02d}", HOME, AWAY, 90, 80) for jour in range(n)]
+
+
+def test_maturity_filter_excludes_predictions_made_on_fresh_ratings():
+    """Sous le seuil, la prédiction est écartée ; au-dessus, elle est gardée.
+
+    Ce filtre porte une conclusion : sans lui, les premières semaines — où toutes les
+    notes valent 1500 et où `expected_win` ne mesure guère que l'avantage du terrain —
+    aplatissent la courbe de calibration et fabriquent une sur-confiance apparente.
+    C'est ce qui a faussé la lecture du 2026-08-09.
+    """
+    _, applications = run(_saison(6))
+
+    gardes, ecartes = mature_applications(applications, min_games=3)
+
+    assert ecartes == 3 and len(gardes) == 3
+    # Les trois écartés sont bien les premiers : 0, 1 puis 2 matchs au compteur.
+    assert [a.home.games_played_before for a in gardes] == [3, 4, 5]
+
+
+def test_maturity_filter_moves_predictably_with_the_threshold():
+    """Monter le seuil ne peut que réduire l'ensemble retenu, et d'autant."""
+    _, applications = run(_saison(10))
+
+    tailles = {
+        seuil: len(mature_applications(applications, min_games=seuil)[0])
+        for seuil in (0, 3, 5, 10, 11)
+    }
+
+    assert tailles == {0: 10, 3: 7, 5: 5, 10: 0, 11: 0}
+
+
+def test_maturity_filter_gates_on_the_least_mature_of_the_two_teams():
+    """Une équipe mûre affrontant une équipe fraîche : la prédiction est écartée.
+
+    C'est le point de sémantique qui compte, et c'est la même règle que le facteur K :
+    une prédiction ne vaut que si **les deux** notes valent quelque chose. Prendre le
+    `max` laisserait passer un match où l'adversaire est encore à `initial_rating`.
+    """
+    # HOME et AWAY jouent 5 fois ; THIRD n'a jamais joué avant son premier match.
+    states, _ = run(_saison(5))
+    _, applications = run([game("2026-06-20", HOME, THIRD, 95, 90)], states=states)
+    application = applications[0]
+
+    assert application.home.games_played_before == 5
+    assert application.away.games_played_before == 0
+
+    gardes, ecartes = mature_applications(applications, min_games=3)
+
+    assert gardes == [] and ecartes == 1
+
+
+def test_maturity_filter_keeps_the_order_and_the_objects_untouched():
+    """Le filtre sélectionne, il ne transforme pas : mêmes objets, même ordre."""
+    _, applications = run(_saison(6))
+
+    gardes, _ = mature_applications(applications, min_games=2)
+
+    assert gardes == [a for a in applications if a.home.games_played_before >= 2]
+    assert all(garde is original for garde, original in zip(gardes, applications[2:]))

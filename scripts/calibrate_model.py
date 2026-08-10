@@ -45,7 +45,7 @@ from analyzer.metrics import (
     shuffled,
 )
 from analyzer.model import params_from_config
-from analyzer.ratings import replay, sort_games, unusable_reason
+from analyzer.ratings import mature_applications, replay, sort_games, unusable_reason
 from analyzer.ratings_store import build_resolver, replay_range
 from common.config import load_config, load_settings
 from common.http_cache import CachingTransport, unthrottled
@@ -101,18 +101,15 @@ def gather(client, conn, config: dict, sport: str, resolve, min_games: int):
     params = params_from_config(config, sport=sport)
     _, applications = replay(sort_games(kept), params, normalize=resolve)
 
-    # Filtre de maturité : les premières semaines, toutes les équipes sont à 1500 et
-    # `expected_win` ne mesure guère plus que l'avantage du terrain. Les inclure
-    # aplatirait la courbe vers 0,5 et masquerait le défaut qu'on cherche.
-    mures, immatures = [], 0
-    for app in applications:
-        if min(app.home.games_played_before, app.away.games_played_before) < min_games:
-            immatures += 1
-            continue
-        mures.append(
-            # `home_won` vient du score réel, pas du signe de la variation de note.
-            Prediction(probability=app.expected_home, home_won=app.home_won)
-        )
+    # Filtre de maturité — la logique vit dans `analyzer.ratings` et y est testée :
+    # c'est elle qui a renversé la lecture du 2026-08-09, elle ne peut pas rester
+    # dans un script hors couverture.
+    retenues, immatures = mature_applications(applications, min_games=min_games)
+    mures = [
+        # `home_won` vient du score réel, pas du signe de la variation de note.
+        Prediction(probability=app.expected_home, home_won=app.home_won)
+        for app in retenues
+    ]
 
     journal = {
         "bruts": len(games), "retenus": len(applications),
