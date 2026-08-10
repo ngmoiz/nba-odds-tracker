@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable, Iterable
-from datetime import date
+from datetime import date, timedelta
 
 from analyzer.model import EloParams
 from analyzer.ratings import GameApplication, TeamState, rest_window_start
@@ -57,6 +57,79 @@ def display_names(conn: sqlite3.Connection, sport: str) -> dict[str, str]:
     dernier. Le libellé n'est pas la clé, mais un rapport illisible reste un défaut.
     """
     return {normalize_team(team): team for team in db.get_known_teams(conn, sport)}
+
+
+def known_match_horizon(conn: sqlite3.Connection, sport: str) -> str | None:
+    """Date du dernier match **connu** d'une ligue, ou `None` si la base est vide.
+
+    Sert de borne haute à toute plage rejouée. Utiliser « aujourd'hui » à la place
+    ferait changer la plage — donc la clé de cache — **chaque jour**, ce qui condamne
+    le mode hors ligne dès le lendemain : c'est le défaut constaté au premier run du
+    write path (2026-08-10), où `--offline` a échoué sur un cache pourtant complet.
+
+    Deux sources, et la première est ce qui rend la borne sûre :
+
+    - `matches.tipoff_utc` — le **calendrier découvert par le collecteur**, donc
+      indépendant de ce qui a été intégré aux notes. C'est essentiel : une borne
+      dérivée du seul `rating_history` couvrirait exactement ce qui est déjà en base,
+      et la comparaison de population du vérificateur deviendrait tautologique — un
+      match joué mais jamais intégré tomberait hors plage et resterait invisible,
+      précisément le trou qu'on cherche à détecter ;
+    - `rating_history.game_date` — filet si un match a été intégré sans jamais avoir
+      été suivi (le write path applique aussi les matchs non suivis, §D2 du lot 4).
+
+    La date de `matches` est prise en UTC, donc au plus tard d'un jour par rapport au
+    calendrier US. C'est volontaire : une borne **haute** doit surcouvrir, jamais
+    l'inverse.
+
+    Limite à connaître : un match qu'aucune des deux tables ne connaît (collecteur ET
+    évaluateur arrêtés) tombe hors horizon. C'est le trou que `detect_league_gap`
+    signale à l'exécution, et sa réparation exige de toute façon d'aller chercher les
+    matchs manquants sur le réseau.
+    """
+    row = conn.execute(
+        """
+        SELECT MAX(horizon) AS horizon FROM (
+            SELECT MAX(date(tipoff_utc)) AS horizon FROM matches WHERE sport = ?
+            UNION ALL
+            SELECT MAX(game_date) FROM rating_history WHERE sport = ?
+        )
+        """,
+        (sport, sport),
+    ).fetchone()
+    return row["horizon"] if row and row["horizon"] else None
+
+
+def replay_range(
+    conn: sqlite3.Connection,
+    config: dict,
+    sport: str,
+    *,
+    today: date | None = None,
+) -> tuple[str, str]:
+    """Plage de dates à rejouer pour une ligue : `(début, fin)` en ISO.
+
+    Élargie d'un jour de chaque côté. Sans la borne haute élargie, les matchs du soir
+    de la dernière journée — indexés au lendemain en UTC par balldontlie — seraient
+    perdus, et un rejeu de contrôle paraîtrait diverger alors qu'il serait incomplet.
+
+    **La borne haute est adossée au dernier match connu, PAS à l'horloge.** Une plage
+    qui se termine à la date du jour change d'URL — donc de clé de cache — toutes les
+    24 h, ce qui condamne le mode hors ligne dès le lendemain : défaut constaté au
+    premier run du write path (2026-08-10), où `--offline` a échoué sur un cache
+    pourtant complet, et dont la procédure de réparation documentée héritait — au pire
+    moment, celui de l'incident.
+
+    `today` n'est utilisé **que** si la ligue ne contient aucun match : il n'y a alors
+    aucun horizon à interroger. C'est le seul chemin par lequel l'horloge entre, et un
+    test l'exerce pour prouver que l'invariance du chemin nominal n'est pas vacante.
+    """
+    season = config["backfill"]["seasons"][sport]
+    start = date.fromisoformat(season["start_date"]) - timedelta(days=1)
+
+    horizon = known_match_horizon(conn, sport)
+    last_known = date.fromisoformat(horizon) if horizon else (today or date.today())
+    return start.isoformat(), (last_known + timedelta(days=1)).isoformat()
 
 
 def load_team_state(

@@ -34,13 +34,11 @@ import argparse
 import sqlite3
 import sys
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from analyzer.model import params_from_config
 from analyzer.ratings import replay, sort_games, unusable_reason
-from analyzer.ratings_store import build_resolver
+from analyzer.ratings_store import build_resolver, replay_range
 from common.config import load_config, load_settings
 from common.http_cache import CachingTransport, unthrottled
 from common.logging_config import configure_logging
@@ -57,22 +55,9 @@ def _section(title: str) -> None:
     print("─" * WIDTH)
 
 
-def _season_range(config: dict, sport: str, now: datetime) -> tuple[str, str]:
-    """Plage de la saison, élargie d'un jour de chaque côté (même règle que le backfill).
-
-    Sans la borne haute élargie, les matchs du soir de la dernière journée — indexés au
-    lendemain en UTC par balldontlie — seraient perdus, et le rejeu de contrôle
-    paraîtrait diverger alors que c'est lui qui serait incomplet.
-    """
-    season = config["backfill"]["seasons"][sport]
-    start = date.fromisoformat(season["start_date"]) - timedelta(days=1)
-    end = now.astimezone(ZoneInfo(config["results"]["calendar_timezone"])).date() + timedelta(days=1)
-    return start.isoformat(), end.isoformat()
-
-
-def collect(client, config: dict, sport: str, now: datetime, resolve) -> tuple[list, Counter]:
+def collect(client, conn, config: dict, sport: str, resolve) -> tuple[list, Counter]:
     """Matchs de la saison retenus pour le rejeu de contrôle, et le décompte des exclusions."""
-    start, end = _season_range(config, sport, now)
+    start, end = replay_range(conn, config, sport)
     print(f"Plage interrogée      : {start} → {end}")
     games = client.get_games(start, end)
     expected_season = int(config["backfill"]["seasons"][sport]["season"])
@@ -178,7 +163,6 @@ def compare_ratings(conn, sport: str, states: dict) -> list[str]:
 
 def run(conn: sqlite3.Connection, config: dict, settings, args) -> int:
     sport = config["api"]["sport"]
-    now = datetime.now(timezone.utc)
     params = params_from_config(config, sport=sport)
 
     _section(f"Cohérence des notes Elo — {sport}")
@@ -194,7 +178,7 @@ def run(conn: sqlite3.Connection, config: dict, settings, args) -> int:
         settings, config if args.online else unthrottled(config), transport=transport
     )
     try:
-        kept, journal = collect(client, config, sport, now, resolve)
+        kept, journal = collect(client, conn, config, sport, resolve)
     except ResultsApiError as exc:
         print(f"Récupération impossible : {exc}", file=sys.stderr)
         return EXIT_ABORT

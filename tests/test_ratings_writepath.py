@@ -541,3 +541,82 @@ def test_the_repair_restores_exactly_what_the_write_path_had_built(conn):
 
     apres = {r["team"]: (r["rating"], r["games_played"]) for r in db.get_team_ratings(conn, SPORT)}
     assert apres == avant
+
+
+# ──────────── Stabilité de la clé de cache (horizon des matchs connus) ────────────
+
+
+def test_replay_range_is_identical_on_two_different_days(conn):
+    """La plage rejouée — donc la clé de cache — ne bouge pas d'un jour à l'autre.
+
+    Défaut réel du 2026-08-10 : la borne haute valait « aujourd'hui + 1 », si bien que
+    l'URL interrogée changeait toutes les 24 h. `--offline` ratait dès le lendemain sur
+    un cache pourtant complet, et la procédure de réparation documentée en héritait —
+    au pire moment, celui de l'incident.
+    """
+    import analyzer.ratings_store as store
+
+    _apply(conn, [_game("2026-08-02", "Las Vegas Aces", "Seattle Storm", 90, 80, "g1")])
+
+    veille = store.replay_range(conn, CFG, SPORT, today=date(2026, 8, 10))
+    quinze_jours_plus_tard = store.replay_range(conn, CFG, SPORT, today=date(2026, 8, 25))
+
+    assert veille == quinze_jours_plus_tard
+
+
+def test_replay_range_does_depend_on_the_clock_when_no_match_is_known(conn):
+    """Calibration du test précédent : l'horloge EST atteignable par cette fonction.
+
+    Sans ce contre-exemple, l'égalité ci-dessus pourrait tenir simplement parce que
+    `today` n'est jamais lu — un test vacant. Ici la ligue est vide, il n'y a donc
+    aucun horizon, et la plage doit suivre l'horloge : les deux jours diffèrent.
+    """
+    import analyzer.ratings_store as store
+
+    a = store.replay_range(conn, CFG, "basketball_nba", today=date(2026, 8, 10))
+    b = store.replay_range(conn, CFG, "basketball_nba", today=date(2026, 8, 25))
+
+    assert a != b
+
+
+def test_replay_range_covers_the_last_known_match(conn):
+    """La borne haute dépasse d'un jour le dernier match connu (matchs du soir en UTC)."""
+    import analyzer.ratings_store as store
+
+    conn.execute(
+        "INSERT INTO matches VALUES ('tard',?,'Chicago Sky','Phoenix Mercury',"
+        "'2026-08-30T23:00:00Z','SUIVI','2026-08-29T09:00:00Z')", (SPORT,),
+    )
+    conn.commit()
+
+    _, fin = store.replay_range(conn, CFG, SPORT, today=date(2026, 8, 10))
+
+    assert fin == "2026-08-31"
+
+
+def test_known_horizon_covers_matches_never_integrated(conn):
+    """L'horizon vient du CALENDRIER, pas de ce qui est déjà intégré.
+
+    Point de conception décisif : une borne dérivée du seul `rating_history`
+    couvrirait exactement ce qui est en base, et la comparaison de population du
+    vérificateur deviendrait tautologique — un match joué mais jamais intégré
+    tomberait hors plage, c'est-à-dire précisément le trou qu'on cherche.
+    """
+    import analyzer.ratings_store as store
+
+    _apply(conn, [_game("2026-08-02", "Las Vegas Aces", "Seattle Storm", 90, 80, "g1")])
+    # Un match programmé bien plus tard, découvert par le collecteur, jamais intégré.
+    conn.execute(
+        "INSERT INTO matches VALUES ('futur',?,'Chicago Sky','Phoenix Mercury',"
+        "'2026-08-30T23:00:00Z','SUIVI','2026-08-29T09:00:00Z')", (SPORT,),
+    )
+    conn.commit()
+
+    assert store.known_match_horizon(conn, SPORT) == "2026-08-30"
+
+
+def test_known_horizon_is_none_on_an_empty_league(conn):
+    """Ligue vide : pas d'horizon inventé, l'appelant décide du repli."""
+    import analyzer.ratings_store as store
+
+    assert store.known_match_horizon(conn, "basketball_nba") is None
