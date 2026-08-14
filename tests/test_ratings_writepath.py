@@ -620,3 +620,43 @@ def test_known_horizon_is_none_on_an_empty_league(conn):
     import analyzer.ratings_store as store
 
     assert store.known_match_horizon(conn, "basketball_nba") is None
+
+
+def test_gap_threshold_is_silent_on_the_normal_wnba_rhythm(conn):
+    """Le seuil de production ne se déclenche pas sur le rythme normal de la ligue.
+
+    Verrouille le RAISONNEMENT, pas seulement la valeur. Le seuil a été porté de 3 à 5
+    le 2026-08-14 sur la distribution observée des écarts entre matchs (493 transitions,
+    saison complète) : 2 j ×240, 3 j ×130, 4 j ×54, 5 j ×20, 6 j et + ×34. À 3, l'alerte
+    couvrait 22 % des transitions — une sur cinq, donc une alerte qu'on cesse d'ouvrir,
+    et la fatigue d'alerte aurait fini par noyer un vrai trou.
+
+    Si quelqu'un ramène le seuil sous 5, ce test casse en nommant la raison.
+    """
+    seuil = int(CFG["model"]["ratings"]["gap_warning_days"])
+
+    for rythme in (1, 2, 3, 4, 5):   # 444 des 493 transitions observées
+        assert not detect_team_gap(rythme, seuil), (
+            f"un écart de {rythme} j est un rythme WNBA courant : il ne doit pas alerter"
+        )
+    for anormal in (6, 8, 12):
+        assert detect_team_gap(anormal, seuil), (
+            f"un écart de {anormal} j sort de la distribution normale : il doit alerter"
+        )
+
+
+def test_a_real_integration_hole_is_still_caught_after_raising_the_threshold(conn):
+    """Relever le seuil ne doit pas aveugler la détection d'un vrai trou.
+
+    Contrepartie du test précédent : la garde reste utile. Un arrêt machine prolongé
+    produit des écarts bien au-delà du rythme normal, et le trou de LIGUE — prouvé par
+    arithmétique, sans seuil — reste le filet principal.
+    """
+    _apply(conn, [_game("2026-08-02", "Las Vegas Aces", "Seattle Storm", 90, 80, "g1")])
+
+    compteurs = _apply(conn, [_game("2026-08-14", "Las Vegas Aces", "Seattle Storm", 88, 85, "g2")])
+    # 12 jours d'écart, et les DEUX équipes sont concernées : le compteur vaut 2.
+    assert compteurs["team_gap"] == 2
+
+    # Et le trou de ligue ne dépend d'aucun seuil.
+    assert detect_league_gap("2026-08-02", "2026-08-14") is not None

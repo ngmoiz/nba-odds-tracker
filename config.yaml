@@ -114,11 +114,23 @@ model:
   shadow: true                # edge calculé et LOGGÉ au verdict ; aucune écriture, aucun effet
   ratings_write_path: true    # l'évaluateur entretient les notes après chaque match terminé
   ratings:
-    gap_warning_days: 3       # au-delà de N jours sans match intégré pour une équipe,
-                              # avertissement « trou probable » (une vraie coupure de
-                              # calendrier le déclenche aussi : c'est un « va regarder »,
-                              # pas un diagnostic). Le trou PROUVÉ au niveau de la ligue
-                              # est détecté séparément, sans seuil.
+    gap_warning_days: 5       # au-delà de N jours sans match intégré pour une équipe,
+                              # avertissement « trou probable ». C'est un « va regarder »,
+                              # pas un diagnostic : une vraie coupure de calendrier le
+                              # déclenche aussi.
+                              #
+                              # Valeur choisie sur la DISTRIBUTION observée des écarts
+                              # entre matchs (493 transitions, saison WNBA 2026 complète,
+                              # relevé du 2026-08-14) : 2 j ×240, 3 j ×130, 4 j ×54,
+                              # 5 j ×20, 6 j et + ×34. À 3, l'alerte se déclenchait sur
+                              # 22 % des transitions — une sur cinq, donc une alerte qu'on
+                              # cesse d'ouvrir. À 5, elle tombe à ~7 %.
+                              #
+                              # Ce seuil peut se permettre d'être discret : le trou de
+                              # LIGUE, lui, est prouvé par arithmétique et SANS seuil
+                              # (`detect_league_gap`) — c'est lui le vrai filet en cas
+                              # d'arrêt machine. L'alerte par équipe ne couvre que le
+                              # cas résiduel d'un historique cassé sans trou de ligue.
   elo:
     initial_rating: 1500      # note de départ d'une équipe inconnue
     k_factor: 20              # facteur d'apprentissage de base
