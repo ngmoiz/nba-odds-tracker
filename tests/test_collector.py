@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from collector.collector import (
+    _check_reserve,
+    _maybe_lift_reserve,
     META_CREDITS_REMAINING,
     META_RESERVE_ALERTED,
     ConfigurationError,
@@ -1382,3 +1384,75 @@ def test_closing_served_for_round_minute_tipoffs(conn):
         ct = datetime.fromisoformat(r["collected_at"])
         delta_min = (tip - ct).total_seconds() / 60
         assert 0 < delta_min < 25, f"{mid} : clôture à {delta_min:.0f} min du tip-off"
+
+
+def test_priority1_collection_lifts_the_reserve_guard(conn):
+    """Une collecte priorité 1 qui rafraîchit le quota LÈVE la garde.
+
+    Défaut réel (relevé le 2026-08-18) : `_maybe_lift_reserve` n'était appelée qu'après
+    les collectes du matin et forcées, pas après celles de la boucle de vague. Or les
+    cibles de priorité 1 traversent la garde. Le scénario reproduit ici :
+
+      garde armée (quota périmé et bas) → une cible priorité 1 collecte quand même →
+      le quota rafraîchi redevient sain → mais le drapeau restait `true`,
+      donc les cibles de priorité 2 continuaient d'être sautées jusqu'à la collecte
+      du matin suivante, alors que le quota ne le justifiait plus.
+
+    Le mécanisme de levée existait ; c'est sa symétrie entre les quatre sites de
+    `_persist_credits` qui manquait.
+    """
+    db.insert_match(
+        conn, match_id="m1", sport="basketball_wnba", home_team="A", away_team="B",
+        tipoff_utc=in_hours(2), status="SUIVI", created_at=in_hours(12),
+    )
+    # Garde ARMÉE, sur un quota bas et périmé.
+    db.set_meta(conn, META_CREDITS_REMAINING, "30")
+    db.set_meta(conn, META_RESERVE_ALERTED, "true")
+    conn.commit()
+
+    config_priority1 = {
+        "quota": {"reserve": 50},
+        "collector": {"targets": [
+            {"name": "verdict", "hours_before": 2.0, "markets": ["h2h"], "priority": 1}
+        ]},
+    }
+
+    # Le FakeClient annonce 480 crédits : le quota redevient sain pendant la collecte.
+    summary = run_collection(
+        conn, FakeClient([make_event("m1", in_hours(2))]),
+        "basketball_wnba", config_priority1, force=False,
+    )
+
+    assert summary["targets_collected"] == 1          # priorité 1 : collectée
+    assert db.get_meta(conn, META_CREDITS_REMAINING) == "480"
+    assert db.get_meta(conn, META_RESERVE_ALERTED) == "false", (
+        "le quota est redevenu sain : la garde doit être levée, sinon les cibles de "
+        "priorité 2 resteraient bloquées jusqu'au lendemain matin"
+    )
+
+
+def test_the_guard_can_fire_again_after_being_lifted(conn):
+    """Une garde levée doit pouvoir se redéclencher — sinon elle devient muette.
+
+    C'est la propriété qui compte vraiment : une garde qui n'alerte qu'une fois dans la
+    vie de la base ne protège rien. On enchaîne pénurie → levée → pénurie, et la
+    seconde pénurie doit réarmer le drapeau.
+    """
+    db.set_meta(conn, META_CREDITS_REMAINING, "30")
+    conn.commit()
+
+    # 1. Pénurie : la garde s'arme.
+    assert _check_reserve(conn, CONFIG) is False
+    assert db.get_meta(conn, META_RESERVE_ALERTED) == "true"
+
+    # 2. Le quota remonte : la garde se lève.
+    db.set_meta(conn, META_CREDITS_REMAINING, "480")
+    conn.commit()
+    _maybe_lift_reserve(conn, CONFIG)
+    assert db.get_meta(conn, META_RESERVE_ALERTED) == "false"
+
+    # 3. Nouvelle pénurie : elle doit se réarmer, pas rester muette.
+    db.set_meta(conn, META_CREDITS_REMAINING, "12")
+    conn.commit()
+    assert _check_reserve(conn, CONFIG) is False
+    assert db.get_meta(conn, META_RESERVE_ALERTED) == "true"

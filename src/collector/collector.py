@@ -948,6 +948,11 @@ def run_collection(
                     
                     # Persiste crédits après chaque collecte
                     _persist_credits(conn, client)
+                    # Le quota vient d'être rafraîchi : si une cible de priorité 1 a
+                    # collecté malgré la garde active, c'est ici qu'on la lève —
+                    # sinon les cibles de priorité 2 resteraient bloquées jusqu'à la
+                    # collecte du matin, alors que le quota est redevenu sain.
+                    _maybe_lift_reserve(conn, config, settings, telegram_client)
             else:
                 # Cible sur earliest : collecte groupée
                 markets = target.get("markets", ["h2h", "spreads", "totals"])
@@ -972,6 +977,11 @@ def run_collection(
                 
                 # Persiste crédits après chaque collecte
                 _persist_credits(conn, client)
+                # Le quota vient d'être rafraîchi : si une cible de priorité 1 a
+                # collecté malgré la garde active, c'est ici qu'on la lève —
+                # sinon les cibles de priorité 2 resteraient bloquées jusqu'à la
+                # collecte du matin, alors que le quota est redevenu sain.
+                _maybe_lift_reserve(conn, config, settings, telegram_client)
     
     conn.commit()
     
