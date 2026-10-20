@@ -217,6 +217,7 @@ def find_result(
     tipoff_utc: str,
     calendar_tz: str,
     max_day_gap: int = 1,
+    aliases: dict[str, str] | None = None,
 ) -> GameResult | None:
     """Trouve le résultat correspondant au match, ou None.
 
@@ -225,14 +226,21 @@ def find_result(
     on prend le plus proche en date.
     
     Le matching flexible gère les incohérences entre APIs (ex: "Toronto Tempo" vs "Tempo").
+    L'inclusion ne suffit pas toujours : balldontlie nomme 'LA Clippers' ce que The Odds
+    API appelle 'Los Angeles Clippers' (aucun des deux ne contient l'autre). Les noms de
+    la source passent donc d'abord par les alias déclarés (`backfill.team_aliases`),
+    les mêmes que ceux du contrat de clé.
     """
     target = tipoff_calendar_date(tipoff_utc, calendar_tz)
+    aliases = aliases or {}
 
     best: GameResult | None = None
     best_gap = timedelta(days=max_day_gap + 1)
     for game in games:
         # Matching flexible : accepte correspondance exacte ou partielle
-        if not (teams_match(game.home_team, home_team) and teams_match(game.away_team, away_team)):
+        game_home = canonical_team(game.home_team, aliases)
+        game_away = canonical_team(game.away_team, aliases)
+        if not (teams_match(game_home, home_team) and teams_match(game_away, away_team)):
             continue
         gap = abs(date.fromisoformat(game.game_date) - target)
         if gap <= timedelta(days=max_day_gap) and gap < best_gap:

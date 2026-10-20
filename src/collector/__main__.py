@@ -3,6 +3,7 @@
 Usage :
     uv run python -m collector                        # tick anonyme (auto-ordonnancement)
     uv run python -m collector --morning              # force collecte du matin (usage manuel)
+    uv run python -m collector --discover             # découverte immédiate, heure réelle (usage manuel)
     uv run python -m collector --sport basketball_wnba  # surcharge ponctuelle du sport
     uv run python -m collector --now "2026-07-18T09:00:00+00:00"  # injection de l'heure (tests)
     uv run python -m collector --no-sync              # skip analyseur + notificateur (tests)
@@ -47,6 +48,15 @@ def main() -> None:
         help="Force la collecte du matin (usage manuel, bypass idempotence quotidienne).",
     )
     parser.add_argument(
+        "--discover",
+        action="store_true",
+        help=(
+            "Découverte immédiate (usage manuel) : une collecte complète horodatée à "
+            "l'heure RÉELLE (3 crédits). À préférer à --morning hors du créneau du "
+            "matin, qui ramène l'heure à 09:00 et fausserait l'horodatage des relevés."
+        ),
+    )
+    parser.add_argument(
         "--now",
         help="TESTS UNIQUEMENT : Injecte l'heure actuelle (format ISO UTC). INTERDIT en production (snapshots faussement horodatés).",
     )
@@ -68,6 +78,13 @@ def main() -> None:
         validate_collector_config(config)
     except ConfigurationError as exc:
         logger.error("Configuration collecteur invalide : %s", exc)
+        import sys
+        sys.exit(1)
+
+    if args.discover and args.morning:
+        # --morning ramène l'heure à 09:00 : combiné à --discover, la découverte serait
+        # horodatée de travers — exactement ce que --discover existe pour éviter.
+        logger.error("--discover et --morning sont exclusifs : choisir l'un des deux.")
         import sys
         sys.exit(1)
 
@@ -115,7 +132,10 @@ def main() -> None:
         )
         with client:
             try:
-                result = run_collection(conn, client, sport, config, settings=settings, now=now)
+                result = run_collection(
+                    conn, client, sport, config,
+                    force=args.discover, settings=settings, now=now,
+                )
             except Exception as exc:
                 # Attrape ConfigurationError (et autres exceptions métier)
                 if isinstance(exc, ConfigurationError):

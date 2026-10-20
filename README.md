@@ -94,6 +94,11 @@ uv run python -m collector
 # Forcer un autre sport SANS toucher config.yaml (utile hors-saison NBA)
 uv run python -m collector --sport basketball_wnba
 
+# Découvrir immédiatement les matchs à venir, hors créneau du matin (3 crédits,
+# relevés horodatés à l'heure réelle). Ne PAS utiliser --morning pour cela :
+# il ramène l'heure à 09:00 et fausserait l'horodatage.
+docker compose run --rm --no-deps collector python -m collector --discover
+
 # Rejouer uniquement l'envoi Telegram des alertes/verdicts en attente
 # (utile après un incident réseau ; sans effet si Telegram n'est pas configuré)
 uv run python -m notifier

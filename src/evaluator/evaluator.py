@@ -23,7 +23,7 @@ from common.results_api_client import ResultsApiClient
 from evaluator.clv import compute_clv
 from evaluator.grading import grade_verdict
 from evaluator.ratings_update import update_ratings_from_games
-from evaluator.reconcile import find_result, tipoff_calendar_date
+from evaluator.reconcile import find_result, team_aliases, tipoff_calendar_date
 from evaluator.reporting import EvalLine, format_daily_report, format_degraded_report
 from evaluator.weekly import format_weekly_report
 from notifier.direct import send_direct
@@ -70,6 +70,7 @@ def evaluate_pending(
             results_client.close()
 
     now_iso = now.isoformat()
+    aliases = team_aliases(config, config["api"]["sport"])
     lines: list[EvalLine] = []
     for match in matches:
         result = find_result(
@@ -78,6 +79,7 @@ def evaluate_pending(
             away_team=match["away_team"],
             tipoff_utc=match["tipoff_utc"],
             calendar_tz=calendar_tz,
+            aliases=aliases,
         )
         if result is None or not result.is_final:
             # Pas (encore) de résultat : on réessaie demain, sauf si le match est trop

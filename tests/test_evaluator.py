@@ -1616,3 +1616,36 @@ def test_clv_ignores_post_tipoff_snapshot(conn):
     # PAS 1.02 (T3, post-tip-off, live).
     assert closing_odds is not None
     assert abs(closing_odds - 1.85) < 0.01  # clôture = T1, pas T3
+
+
+def test_find_result_without_alias_misses_la_clippers():
+    """Bascule NBA (2026-10-20) : 'LA Clippers' (balldontlie) et 'Los Angeles Clippers'
+    (The Odds API) ne se contiennent pas l'un l'autre — l'inclusion seule échoue."""
+    games = [_game("2026-10-21", "LA Clippers", "Sacramento Kings", 112, 104)]
+    assert find_result(games, home_team="Los Angeles Clippers", away_team="Sacramento Kings",
+                       tipoff_utc="2026-10-22T02:40:00Z",
+                       calendar_tz="America/New_York") is None
+
+
+def test_find_result_applies_aliases_to_source_names():
+    games = [_game("2026-10-21", "LA Clippers", "Sacramento Kings", 112, 104)]
+    r = find_result(games, home_team="Los Angeles Clippers", away_team="Sacramento Kings",
+                    tipoff_utc="2026-10-22T02:40:00Z", calendar_tz="America/New_York",
+                    aliases={"la clippers": "Los Angeles Clippers"})
+    assert r is not None and r.home_score == 112
+
+
+def test_find_result_alias_does_not_confuse_the_lakers():
+    """L'alias Clippers ne doit pas faire apparier l'autre franchise de Los Angeles."""
+    games = [_game("2026-10-21", "Los Angeles Lakers", "Sacramento Kings", 99, 98)]
+    assert find_result(games, home_team="Los Angeles Clippers", away_team="Sacramento Kings",
+                       tipoff_utc="2026-10-22T02:40:00Z", calendar_tz="America/New_York",
+                       aliases={"la clippers": "Los Angeles Clippers"}) is None
+
+
+def test_config_yaml_declares_the_nba_clippers_alias():
+    from common.config import load_config
+    from evaluator.reconcile import team_aliases
+    assert team_aliases(load_config(), "basketball_nba") == {
+        "la clippers": "Los Angeles Clippers"
+    }
