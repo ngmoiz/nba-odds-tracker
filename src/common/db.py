@@ -324,12 +324,13 @@ ACTIVE_STATUSES = ("DECOUVERT", "SUIVI", "DECIDE")
 # calcul du verdict, pour distinguer les cohortes dans les stats/calibration.
 #   1 = décision figée à la 1ʳᵉ collecte de la fenêtre (pré-correctif H-1)
 #   2 = re-décision à chaque collecte jusqu'au tip-off (décision « à H-1 »)
+#   3 = planchers d'ampleur sur R3/R4 (bascule NBA, journal 2026-10-20)
 # Constante de données (pas de construction de verdict) : elle vit dans la couche
 # données car elle est lue par l'évaluateur (ségrégation des cohortes) et écrite
 # par l'analyseur (estampillage des verdicts). Déplacée depuis analyzer/verdict.py
 # lors de la revue externe (M2) pour supprimer la dépendance evaluator→analyzer
 # sur une simple constante.
-DECISION_LOGIC_VERSION = 2
+DECISION_LOGIC_VERSION = 3
 
 
 def get_match(conn: sqlite3.Connection, match_id: str) -> sqlite3.Row | None:

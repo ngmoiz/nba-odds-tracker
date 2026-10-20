@@ -210,7 +210,8 @@ def test_format_weekly_report_empty():
 def test_format_weekly_report_guardrail_on_v2_cohort():
     """55 cumul dont 15 v2 → garde-fou actif (la cohorte de calibration est sous 50)."""
     rows = [_row(1, 2, "spreads", '["R1"]', "won", 0.02)]
-    msg = format_weekly_report("7 jours", rows, [], total_evals=55, v2_evals=15)
+    msg = format_weekly_report("7 jours", rows, [], total_evals=55, v2_evals=15,
+                                calibration_version=2)
     assert "bruit statistique" in msg
     assert "55 évaluations cumulées, dont 15 en logique v2" in msg
 
@@ -218,7 +219,8 @@ def test_format_weekly_report_guardrail_on_v2_cohort():
 def test_format_weekly_report_no_guardrail_when_v2_above_50():
     """55 cumul dont 55 v2 → garde-fou inactif."""
     rows = [_row(1, 2, "spreads", '["R1"]', "won", 0.02)]
-    msg = format_weekly_report("7 jours", rows, [], total_evals=55, v2_evals=55)
+    msg = format_weekly_report("7 jours", rows, [], total_evals=55, v2_evals=55,
+                                calibration_version=2)
     assert "bruit statistique" not in msg
     assert "55 évaluations cumulées, dont 55 en logique v2" in msg
 
@@ -345,3 +347,18 @@ def test_run_weekly_report_no_telegram_returns_false(conn):
 
     result = run_weekly_report(conn, _settings(), CONFIG, telegram_client=_Unconfigured(), now=now)
     assert result is False
+
+def test_format_weekly_report_footer_names_the_current_cohort():
+    """Bascule v3 (2026-10-20) : le pied de page nommait « v2 » en dur alors que le
+    compteur suit DECISION_LOGIC_VERSION — un cumul v3 se serait affiché sous v2."""
+    from common.db import DECISION_LOGIC_VERSION
+    rows = [_row(1, DECISION_LOGIC_VERSION, "spreads", '["R1"]', "won", 0.02)]
+    msg = format_weekly_report("7 jours", rows, [], total_evals=70, v2_evals=12)
+    assert f"70 évaluations cumulées, dont 12 en logique v{DECISION_LOGIC_VERSION}" in msg
+    assert f"En dessous de 50 évaluations en logique v{DECISION_LOGIC_VERSION}" in msg
+
+
+def test_cohort_label_names_v3():
+    rows = [_row(1, 3, "spreads", '["R1"]', "won", 0.02)]
+    msg = format_weekly_report("7 jours", rows, [], total_evals=1, v2_evals=1)
+    assert "Logique v3 (planchers R3/R4)" in msg

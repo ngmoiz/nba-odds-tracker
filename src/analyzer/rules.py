@@ -69,6 +69,52 @@ def _longest_monotonic_run(values: list[float]) -> int:
     return best
 
 
+def _move_floor(params: dict, market: str) -> float:
+    """Plancher d'ampleur d'une règle pour un marché (logique v3, journal 2026-10-20).
+
+    Points de ligne pour `spreads`, fraction de probabilité ailleurs. Absent de la
+    config → 0, soit le comportement v2 (tout mouvement au-dessus de _EPS compte).
+    """
+    if market == "spreads":
+        return float(params.get("min_move_line", 0.0))
+    return float(params.get("min_move_prob", 0.0))
+
+
+def _moved(delta: float, floor: float) -> int:
+    """Comme `_direction`, mais un mouvement d'ampleur < `floor` compte pour stable.
+
+    En dessous du plancher, c'est du bruit d'équilibrage de book, pas de l'argent
+    informé. À `floor = 0`, strictement identique à `_direction` (comportement v2).
+    """
+    if abs(delta) < floor - _EPS:
+        return 0
+    return _direction(delta)
+
+
+def _longest_qualifying_run(values: list[float], floor: float) -> int:
+    """Plus longue série strictement monotone dont l'ampleur cumulée atteint `floor`.
+
+    Sans plancher, identique à `_longest_monotonic_run`. Avec plancher, une suite de
+    micro-oscillations dans le même sens ne suffit plus : le mouvement total sur la
+    série doit être réel. Renvoie 0 si aucune série ne l'atteint.
+    """
+    if floor <= 0:
+        return _longest_monotonic_run(values)
+    best = 0
+    start = 0
+    previous_dir = 0
+    for k in range(1, len(values)):
+        direction = _direction(values[k] - values[k - 1])
+        if direction == 0:
+            start, previous_dir = k, 0
+            continue
+        if direction != previous_dir:
+            start, previous_dir = k - 1, direction
+        if abs(values[k] - values[start]) >= floor - _EPS:
+            best = max(best, k - start + 1)
+    return best
+
+
 # ─────────────────── Helpers de formatage des mouvements ───────────────────
 # Les données existent dans les séries de consensus (ConsensusPoint) : ces helpers
 # ne font que du **formatage** — aucun nouveau calcul de règle. Ils enrichissent
@@ -331,7 +377,7 @@ def evaluate_r3(data: MatchData, config: dict) -> RuleResult:
             values = [getattr(point, metric) for point in series]
             if any(value is None for value in values):
                 continue
-            run = _longest_monotonic_run(values)
+            run = _longest_qualifying_run(values, _move_floor(params, market))
             if run >= need:
                 negligible_prob = config["rules"].get("movement_negligible_prob", _NEGLIGIBLE_PROBA)
                 negligible_line = config["rules"].get("movement_negligible_line", _NEGLIGIBLE_LINE)
@@ -351,6 +397,7 @@ def evaluate_r4(data: MatchData, config: dict) -> RuleResult:
 
     for market in data.markets():
         metric = "line" if market == "spreads" else "prob"
+        floor = _move_floor(params, market)
         for selection in data.selections(market):
             up = down = 0
             for bookmaker in data.bookmakers(market, selection):
@@ -358,7 +405,7 @@ def evaluate_r4(data: MatchData, config: dict) -> RuleResult:
                 values = [getattr(quote, metric) for quote in series]
                 if len(values) < 2 or any(value is None for value in values):
                     continue
-                direction = _direction(values[-1] - values[0])
+                direction = _moved(values[-1] - values[0], floor)
                 if direction > 0:
                     up += 1
                 elif direction < 0:

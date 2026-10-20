@@ -153,6 +153,78 @@ def test_r4_ignores_when_only_three_books_agree():
     assert not evaluate_r4(_data(rows), CONFIG).triggered
 
 
+# ──────────────────── Planchers d'ampleur R3/R4 (logique v3) ────────────────────
+
+FLOORED = {
+    "rules": {
+        **CONFIG["rules"],
+        "R3_sustained_trend": {"min_consecutive_snapshots": 3, "score": 2,
+                               "min_move_line": 1.0, "min_move_prob": 0.02},
+        "R4_multi_bookmaker_sync": {"min_bookmakers": 4, "score": 3,
+                                    "min_move_line": 1.0, "min_move_prob": 0.02},
+    }
+}
+
+
+def _four_books_spread_move(start, end):
+    rows = []
+    for book in ("a", "b", "c", "d"):
+        rows += fx.spreads(book, "Home", "Away", start, 1.91, 1.91, fx.T[0])
+        rows += fx.spreads(book, "Home", "Away", end, 1.91, 1.91, fx.T[1])
+    return _data(rows)
+
+
+def test_r4_half_point_moves_count_without_floor_only():
+    """4 books à −0,5 pt : synchro en v2, bruit d'équilibrage sous un plancher de 1,0."""
+    data = _four_books_spread_move(-1.5, -2.0)
+    assert evaluate_r4(data, CONFIG).triggered
+    assert not evaluate_r4(data, FLOORED).triggered
+
+
+def test_r4_floor_keeps_real_moves():
+    data = _four_books_spread_move(-1.5, -2.5)  # exactement 1,0 pt : compte
+    result = evaluate_r4(data, FLOORED)
+    assert result.triggered and result.points == 3
+
+
+def test_r3_floor_rejects_a_sustained_but_tiny_trend():
+    rows = (
+        fx.spreads("dk", "Home", "Away", -1.5, 1.91, 1.91, fx.T[0])
+        + fx.spreads("dk", "Home", "Away", -1.75, 1.91, 1.91, fx.T[1])
+        + fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[2])  # 0,5 pt en tout
+    )
+    assert evaluate_r3(_data(rows), CONFIG).triggered
+    assert not evaluate_r3(_data(rows), FLOORED).triggered
+
+
+def test_r3_floor_keeps_a_real_sustained_trend():
+    rows = (
+        fx.spreads("dk", "Home", "Away", -1.5, 1.91, 1.91, fx.T[0])
+        + fx.spreads("dk", "Home", "Away", -2.0, 1.91, 1.91, fx.T[1])
+        + fx.spreads("dk", "Home", "Away", -2.5, 1.91, 1.91, fx.T[2])  # 1,0 pt
+    )
+    assert evaluate_r3(_data(rows), FLOORED).triggered
+
+
+def test_floor_helpers_use_line_for_spreads_and_prob_elsewhere():
+    from analyzer.rules import _move_floor, _moved
+    params = {"min_move_line": 1.0, "min_move_prob": 0.02}
+    assert _move_floor(params, "spreads") == 1.0
+    assert _move_floor(params, "h2h") == 0.02
+    assert _move_floor(params, "totals") == 0.02
+    assert _move_floor({}, "h2h") == 0.0  # absent → comportement v2
+    assert _moved(0.019, 0.02) == 0 and _moved(-0.021, 0.02) == -1
+    assert _moved(1e-6, 0.0) == 1  # sans plancher : identique à _direction
+
+
+def test_config_yaml_declares_r3_r4_floors():
+    from common.config import load_config
+    rules = load_config()["rules"]
+    for key in ("R3_sustained_trend", "R4_multi_bookmaker_sync"):
+        assert rules[key]["min_move_line"] == 1.0
+        assert rules[key]["min_move_prob"] == 0.02
+
+
 # ────────────────────────────── Scoring ──────────────────────────────
 
 def test_scoring_sums_triggered_rules():

@@ -46,11 +46,20 @@ rules:
     threshold_prob_pct: 5.0   # variation de probabilité implicite ≥ 5 %
     window_hours: 3           # sur une fenêtre ≤ 3 h
     score: 3
+  # Planchers d'ampleur R3/R4 (logique v3, journal 2026-10-20). Sans eux, tout
+  # mouvement au-dessus du bruit flottant comptait : R4 s'alertait sur 167 des 170
+  # matchs WNBA et R3+R4 figuraient dans 100 % des SIGNAL. Rejeu de la saison WNBA :
+  # à 1,0 pt / 2 pts de proba, R3 et R4 ne s'activent plus que sur 56 % des matchs
+  # (contre 80 % et 94 %). Valeurs WNBA, à revoir sur données NBA (règle 11).
   R3_sustained_trend:
     min_consecutive_snapshots: 3  # même direction sur ≥ 3 relevés consécutifs
+    min_move_line: 1.0        # … ET ampleur cumulée de la série ≥ 1,0 pt de ligne (spreads)
+    min_move_prob: 0.02       # … ou ≥ 2 pts de proba dé-margée (h2h/totals)
     score: 2
   R4_multi_bookmaker_sync:
     min_bookmakers: 4         # ≥ 4 bookmakers sur 5 dans le même sens
+    min_move_line: 1.0        # un book ne compte que s'il a bougé d'au moins 1,0 pt de ligne
+    min_move_prob: 0.02       # … ou de 2 pts de proba dé-margée (h2h/totals)
     score: 3
   R5_cross_market_coherence:  # confirmation : spread ET moneyline bougent dans le même sens
     min_spread_move_points: 1.0  # mouvement du spread consensus depuis l'ouverture ≥ 1.0 pt

@@ -39,6 +39,7 @@ import html
 import json
 from dataclasses import dataclass, field
 
+from common.db import DECISION_LOGIC_VERSION
 from common.logging_config import get_logger
 from evaluator.clv_format import format_signed
 from evaluator.grading import LOST, PUSH, WON
@@ -284,6 +285,8 @@ def _format_nobet_section(stats: NoBetStats) -> list[str]:
 
 
 def _cohort_label(logic_version: int) -> str:
+    if logic_version == 3:
+        return "Logique v3 (planchers R3/R4)"
     if logic_version == 2:
         return "Logique v2 (décision H-1)"
     if logic_version == 1:
@@ -291,12 +294,17 @@ def _cohort_label(logic_version: int) -> str:
     return f"Logique v{logic_version}"
 
 
-def _guardrail_footer(total_evals: int, v2_evals: int) -> str:
-    """Pied de page : cumul global + cumul v2 + garde-fou sur la cohorte de calibration."""
-    footer = f"{total_evals} évaluations cumulées, dont {v2_evals} en logique v2."
+def _guardrail_footer(total_evals: int, v2_evals: int, calibration_version: int) -> str:
+    """Pied de page : cumul global + cumul de la cohorte de calibration + garde-fou.
+
+    `v2_evals` est le cumul de la cohorte **courante** (nom historique) : le libellé
+    doit nommer la même version, sinon un comptage v3 s'afficherait sous « v2 ».
+    """
+    label = f"logique v{calibration_version}"
+    footer = f"{total_evals} évaluations cumulées, dont {v2_evals} en {label}."
     if v2_evals < _MIN_EVALS_FOR_TRUST:
         footer += (
-            f" ⚠️ En dessous de {_MIN_EVALS_FOR_TRUST} évaluations en logique v2, "
+            f" ⚠️ En dessous de {_MIN_EVALS_FOR_TRUST} évaluations en {label}, "
             "les taux restent du bruit statistique — aucun seuil ne doit être modifié "
             "(règle 11)."
         )
@@ -309,6 +317,7 @@ def format_weekly_report(
     nobet_rows: list,
     total_evals: int,
     v2_evals: int,
+    calibration_version: int = DECISION_LOGIC_VERSION,
 ) -> str:
     """Compose le rapport hebdomadaire (HTML léger pour Telegram).
 
@@ -317,7 +326,8 @@ def format_weekly_report(
         signal_rows: lignes brutes `get_weekly_signal_evals` (toutes cohortes).
         nobet_rows: lignes brutes `get_weekly_nobet_evals` (toutes cohortes).
         total_evals: cumul global d'évaluations (information).
-        v2_evals: cumul d'évaluations en logique v2 (garde-fou règle 11).
+        v2_evals: cumul d'évaluations de la cohorte de calibration (garde-fou règle 11).
+        calibration_version: version de logique de cette cohorte (défaut : la courante).
     """
     header = f"📊 <b>Rapport hebdomadaire — {html.escape(week_label)}</b>"
 
@@ -328,7 +338,7 @@ def format_weekly_report(
     )
 
     if not versions:
-        return f"{header}\nAucune évaluation sur la période.\n\n{_guardrail_footer(total_evals, v2_evals)}"
+        return f"{header}\nAucune évaluation sur la période.\n\n{_guardrail_footer(total_evals, v2_evals, calibration_version)}"
 
     body: list[str] = []
     for lv in versions:
@@ -353,4 +363,4 @@ def format_weekly_report(
             body.extend(_format_nobet_section(nobet))
         body.append("")
 
-    return header + "\n" + "\n".join(body) + "\n" + _guardrail_footer(total_evals, v2_evals)
+    return header + "\n" + "\n".join(body) + "\n" + _guardrail_footer(total_evals, v2_evals, calibration_version)
